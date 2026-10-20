@@ -29,7 +29,7 @@ async def test_loopback_authenticated(monkeypatch, tmp_path):
             return {'method': method}
     stub = Stub()
     token = 's' * 44
-    server = await asyncio.start_server(lambda r, w: serve_connection(stub, r, w, token), '127.0.0.1', 0)
+    server = await asyncio.start_server(\n        lambda r, w: serve_connection(stub, r, w, token), '127.0.0.1', 0\n    )
     endpoint = tmp_path / 'endpoint.json'
     write_endpoint(endpoint, server.sockets[0].getsockname()[1], token)
     assert read_endpoint(endpoint)[1] == token
@@ -37,7 +37,7 @@ async def test_loopback_authenticated(monkeypatch, tmp_path):
     monkeypatch.setattr(ipc, 'endpoint_path', lambda: endpoint)
     try:
         assert await ipc.request('ping') == {'method': 'ping'}
-        reader, writer = await asyncio.open_connection('127.0.0.1', server.sockets[0].getsockname()[1])
+        reader, writer = await asyncio.open_connection(\n            '127.0.0.1', server.sockets[0].getsockname()[1]\n        )
         writer.write(b'{"method":"stop","token":"wrong","args":{}}\n')
         await writer.drain()
         assert json.loads(await reader.readline())['ok'] is False
