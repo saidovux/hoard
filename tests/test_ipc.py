@@ -1,9 +1,12 @@
+import os
+import pytest
 import asyncio
 import json
 
 from hoard.service import serve_connection
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Unix sockets require Linux/macOS")
 async def test_socket_dispatch(tmp_path):
     class Stub:
         async def handle(self, method, args):
