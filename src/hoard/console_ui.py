@@ -473,7 +473,7 @@ class HoardCLI:
                 if msvcrt.kbhit():
                     char = msvcrt.getwch()
                     # Ignore special-key scan codes (arrows, function keys).
-                    if char in ("\\x00", "\\xe0"):
+                    if char in ("\x00", "\xe0"):
                         msvcrt.getwch()
                         return None
                     return char.lower()
@@ -523,7 +523,7 @@ class HoardCLI:
                     if char is None:
                         key_wait()
                         continue
-                    if char in ("q", "\\x1b", "\\x03", "\\x04"):
+                    if char in ("q", "\x1b", "\x03", "\x04"):
                         break
                     if char in ("p", "s", "r"):
                         command = {"p": "pause", "s": "stop", "r": "start"}[char]
