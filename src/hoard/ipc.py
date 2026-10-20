@@ -13,15 +13,20 @@ from .platform_support import is_windows, read_endpoint
 async def request(method: str, args: dict | None = None, timeout: float = 12) -> dict:
     if is_windows():
         port, token = read_endpoint(endpoint_path())
-        reader, writer = await asyncio.wait_for(\n            asyncio.open_connection("127.0.0.1", port), timeout\n        )
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection("127.0.0.1", port), timeout
+        )
     else:
         token = None
-        reader, writer = await asyncio.wait_for(\n            asyncio.open_unix_connection(str(socket_path())), timeout\n        )
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_unix_connection(str(socket_path())), timeout
+        )
     try:
         payload = {"method": method, "args": args or {}}
         if token is not None:
             payload["token"] = token
-        writer.write((json.dumps(payload, ensure_ascii=False) + "\n").encode())
+        writer.write((json.dumps(payload, ensure_ascii=False) + "
+").encode())
         await writer.drain()
         line = await asyncio.wait_for(reader.readline(), timeout)
         if not line:
