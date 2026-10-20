@@ -5,6 +5,7 @@ import argparse
 import asyncio
 import json
 import sys
+from pathlib import Path
 
 from .ipc import ensure_daemon, request
 
@@ -13,6 +14,21 @@ async def run_command(args: argparse.Namespace):
     if args.command == "daemon":
         from .service import run_daemon
         await run_daemon()
+        return
+    if args.command == "telegram" and args.telegram_command == "report":
+        from .catalog import build_catalog_from_db
+        from .paths import db_path
+
+        report = await asyncio.to_thread(
+            build_catalog_from_db,
+            db_path(),
+            archive_root=Path(args.archive).expanduser() if args.archive else None,
+        )
+        data = {"message": f"HTML-каталог обновлён: {report}", "catalog": str(report)}
+        if args.json:
+            print(json.dumps(data, ensure_ascii=False, indent=2))
+        else:
+            print(data["message"])
         return
     # shutdown/status stop are harmless if daemon exists; otherwise spawn service.
     if args.command in {"stop", "shutdown", "status"}:
@@ -26,7 +42,9 @@ async def run_command(args: argparse.Namespace):
             )
     else:
         await ensure_daemon()
-        if args.command == "add":
+        if args.command == "telegram":
+            data = await request("telegram_enrich")
+        elif args.command == "add":
             data = await request("source_add", {"url": args.url, "output": args.output,
                                                 "interval": args.interval})
         elif args.command == "retry":
@@ -50,6 +68,17 @@ def main():
     a.add_argument("--interval", type=int, default=120)
     retry = sub.add_parser("retry", help="Повторить неудачное задание")
     retry.add_argument("id", type=int)
+    telegram = sub.add_parser("telegram", help="Telegram-архив и локальный каталог")
+    telegram_sub = telegram.add_subparsers(dest="telegram_command", required=True)
+    report = telegram_sub.add_parser("report", help="Пересобрать HTML-каталог без Telegram")
+    report.add_argument("--archive", help="Корневой каталог архива")
+    report.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
+                        help=argparse.SUPPRESS)
+    enrich = telegram_sub.add_parser(
+        "enrich", help="Поставить метаданные постов и фотографии профилей в очередь"
+    )
+    enrich.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
+                        help=argparse.SUPPRESS)
     p.add_argument("--json", action="store_true", help="Машинный вывод (для команд без TUI)")
     # argparse normally accepts parent options only before the subcommand.
     # Keep `hoard --json status` AND `hoard status --json` usable.

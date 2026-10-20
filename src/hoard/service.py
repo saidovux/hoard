@@ -1,4 +1,4 @@
-"""Local supervisor and IPC; no browser or Telegram logic in the control plane."""
+"""Local supervisor and IPC; no HTTP server and no Telegram client in the UI."""
 from __future__ import annotations
 
 import asyncio
@@ -8,7 +8,10 @@ import os
 import secrets
 import shutil
 import signal
+from functools import partial
 
+from .archive_paths import telegram_catalog_dir
+from .catalog import build_catalog_from_db
 from .config import read_credentials, write_credentials
 from .integrations.media import download, validate_media
 from .integrations.rclone import upload, validate_upload
@@ -25,9 +28,14 @@ class Service:
         self.store = store or Store(db_path())
         self.progress: dict = {}
         self._telegram_lock = asyncio.Lock()
+        self._report_lock = asyncio.Lock()
         self.engine = engine or TelegramEngine(self.store, self._progress)
         self.runner = JobRunner(self.store, {
             "telegram.scan": self._telegram_scan,
+            "telegram.enrich_source": self._telegram_enrich_source,
+            "telegram.post_media": self._telegram_post_media,
+            "telegram.profile_photos": self._telegram_profile_photos,
+            "telegram.report": self._telegram_report,
             "cloud.copy": self._cloud_copy,
             "media.download": self._media_download,
         }, parallel=int(os.environ.get("HOARD_MAX_JOBS", "3")))
@@ -40,6 +48,14 @@ class Service:
 
     def _progress(self, value: dict) -> None:
         self.progress = value
+
+    def _source(self, source_id: int) -> dict | None:
+        return next((item for item in self.store.sources() if item["id"] == source_id), None)
+
+    def _queue_report(self) -> int:
+        return self.store.enqueue(
+            "telegram.report", {}, unique_key="telegram-report"
+        )
 
     @staticmethod
     def _scan_error(exc: Exception) -> str:
@@ -61,7 +77,7 @@ class Service:
 
     async def _telegram_scan(self, payload: dict) -> str:
         source_id = int(payload["source_id"])
-        source = next((s for s in self.store.sources() if s["id"] == source_id), None)
+        source = self._source(source_id)
         if source is None or not source["enabled"]:
             return "Источник отключён"
         try:
@@ -92,6 +108,59 @@ class Service:
             return result
         finally:
             self.progress = {}
+            if self.store.telegram.catalog_dirty():
+                self._queue_report()
+
+    async def _telegram_enrich_source(self, payload: dict) -> str:
+        source = self._source(int(payload["source_id"]))
+        if source is None:
+            return "Источник не найден"
+        try:
+            async with self._telegram_lock:
+                return await self.engine.enrich_source(source)
+        finally:
+            if self.store.telegram.catalog_dirty():
+                self._queue_report()
+
+    async def _telegram_post_media(self, payload: dict) -> str:
+        source = self._source(int(payload["source_id"]))
+        if source is None:
+            return "Источник не найден"
+        try:
+            async with self._telegram_lock:
+                return await self.engine.download_post_media(source)
+        finally:
+            if self.store.telegram.catalog_dirty():
+                self._queue_report()
+
+    async def _telegram_profile_photos(self, payload: dict) -> str:
+        author_id = int(payload["author_id"])
+        try:
+            async with self._telegram_lock:
+                return await self.engine.refresh_profile_photos(author_id)
+        finally:
+            if self.store.telegram.catalog_dirty():
+                self._queue_report()
+
+    async def _telegram_report(self, payload: dict) -> str:
+        async with self._report_lock:
+            preferred = payload.get("archive_root")
+            report = None
+            # A Telegram job may write while the snapshot is being built. The dirty
+            # marker makes the build converge without regenerating after each message.
+            for _ in range(3):
+                report = await asyncio.to_thread(
+                    partial(
+                        build_catalog_from_db,
+                        self.store.filename,
+                        archive_root=preferred,
+                    )
+                )
+                if not self.store.telegram.catalog_dirty():
+                    break
+            assert report is not None
+            self.store.event("ok", f"HTML-каталог обновлён: {report}")
+            return f"HTML-каталог обновлён: {report}"
 
     async def _cloud_copy(self, payload: dict) -> str:
         result = await upload(payload["source"], payload["destination"])
@@ -139,6 +208,7 @@ class Service:
             auth_state = self.engine.authorization_step
             if not configured:
                 auth_state = AuthState.API_REQUIRED
+            archive_root = self.store.telegram.archive_root()
             return {
                 "running": self.running,
                 "collector_state": self.collector_state,
@@ -151,6 +221,8 @@ class Service:
                 "downloads": self.store.recent_downloads(),
                 "jobs": self.store.recent_jobs(),
                 "events": self.store.recent_events(),
+                "archive_root": str(archive_root),
+                "catalog": str(telegram_catalog_dir(archive_root) / "index.html"),
                 "integrations": {
                     "telegram": True,
                     "rclone": shutil.which("rclone") is not None,
@@ -222,6 +294,31 @@ class Service:
         if method == "source_remove":
             self.store.remove_source(int(args["id"]))
             return {"message": "Источник отключён; файлы не удалены"}
+        if method == "telegram_report":
+            result = await self._telegram_report(
+                {"archive_root": str(args.get("archive_root") or "") or None}
+            )
+            return {"message": result}
+        if method == "telegram_enrich":
+            jobs = 0
+            for source in self.store.sources():
+                self.store.enqueue(
+                    "telegram.enrich_source",
+                    {"source_id": source["id"]},
+                    unique_key=f"telegram-enrich:{source['id']}",
+                )
+                jobs += 1
+            for author_id in self.store.telegram.profile_ids():
+                if self.store.telegram.profile_photo_due(author_id):
+                    self.store.enqueue(
+                        "telegram.profile_photos",
+                        {"author_id": author_id},
+                        unique_key=f"telegram-profile-photos:{author_id}",
+                    )
+                    jobs += 1
+            self.runner.wakeup()
+            suffix = "" if self.running else "; запусти обработчик"
+            return {"message": f"Telegram enrichment в очереди: {jobs}{suffix}"}
         if method == "cloud_upload":
             # Validate synchronously, then enqueue. rclone installation is optional.
             source, destination = validate_upload(str(args.get("source", "")),

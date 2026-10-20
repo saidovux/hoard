@@ -1,3 +1,4 @@
+from hoard.models import Post
 from hoard.service import Service
 from hoard.storage import Store
 from hoard.telegram import AuthFlowError, AuthState
@@ -54,4 +55,17 @@ async def test_expected_auth_errors_are_structured_for_ui(tmp_path):
         "error_code": "code_invalid",
         "retryable": True,
     }
+    store.close()
+
+
+async def test_service_builds_report_while_collector_is_stopped(tmp_path):
+    store = Store(tmp_path / "db.sqlite")
+    store.add_source(Post("channelx", 7), str(tmp_path / "archive"))
+    service = Service(store=store, engine=FakeEngine())
+
+    result = await service.handle("telegram_report", {})
+
+    assert "HTML-каталог обновлён" in result["message"]
+    assert (tmp_path / "archive" / "telegram" / "index.html").is_file()
+    assert service.running is False
     store.close()

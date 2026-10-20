@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Hoard — Telegram archive</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="topbar">
+    <button class="brand plain-button" id="home" type="button">hoard<span>.</span></button>
+    <div>
+      <h1 id="title">Telegram archive</h1>
+      <p id="summary" class="muted">Локальный каталог</p>
+    </div>
+  </header>
+  <main>
+    <noscript>Для просмотра локального каталога включите JavaScript.</noscript>
+    <section class="toolbar" aria-label="Поиск и сортировка">
+      <label class="search"><span>Поиск</span><input id="query" type="search"
+        placeholder="Имя, @username, ID, канал или пост" autocomplete="off"></label>
+      <label><span>Сортировка</span><select id="sort"></select></label>
+      <button id="direction" type="button" title="Поменять направление">↓</button>
+      <div class="switcher" role="group" aria-label="Раздел">
+        <button id="show-posts" class="active" type="button">Посты</button>
+        <button id="show-profiles" type="button">Все профили</button>
+      </div>
+    </section>
+    <div id="notice" class="notice" hidden></div>
+    <section id="content" aria-live="polite"></section>
+    <nav id="pager" class="pager" aria-label="Страницы" hidden>
+      <button id="previous" type="button">Назад</button>
+      <span id="page-label"></span>
+      <button id="next" type="button">Дальше</button>
+    </nav>
+  </main>
+  <footer><span id="generated"></span> · только локальные данные</footer>
+  <script src="data.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

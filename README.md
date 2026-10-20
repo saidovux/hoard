@@ -1,8 +1,9 @@
-# Hoard 0.3.0
+# Hoard 0.4.0
 
-Hoard is a local-first Linux and Windows archiver for Telegram video notes posted in a channel post's
-comments. It uses Telethon, SQLite and a small inline Rich/InquirerPy interface. A private
-background daemon performs all Telegram work; closing the interface does not stop downloads.
+Hoard is a local-first Linux and Windows archive for Telegram posts, profiles and video notes
+found in a channel post's comments. It uses Telethon, SQLite, an autonomous offline HTML catalog
+and a small inline Rich/InquirerPy interface. A private background daemon performs all Telegram
+work; closing the interface does not stop downloads.
 
 This release exposes only the working Telegram archiver. The project has no web server,
 Redis, Docker, Electron or fullscreen dashboard.
@@ -75,21 +76,63 @@ Choose **Источники и посты** → **Добавить пост**. T
 4. uses a 120-second interval or lets you enter 30–86400 seconds;
 5. saves the source and offers to start an immediate scan.
 
-Hoard reads the linked comment thread and stores only Telegram round video messages. Each
-MP4 gets a JSON sidecar containing the source post, comment link, message ID, date and the
-public sender name/username and ID when available. It does not collect profile photos,
-stories, hidden account data or unrelated message history.
+Hoard reads the linked comment thread and stores Telegram round video messages. Each MP4 gets a
+JSON sidecar containing the source post, comment link, message ID, date and the visible sender
+name/username and ID when available. Profile identity is keyed by Telegram ID, so a username
+change does not split one account into multiple catalog entries. Observation dates are labels for
+when Hoard saw a username, not claims about the exact time it changed.
 
-Downloads are stored under:
+New objects use stable ID-based paths under the selected archive root:
 
 ```text
-<archive>/<channel>/<post>/<author-id>/msg_<comment-id>.mp4
-<archive>/<channel>/<post>/<author-id>/msg_<comment-id>.json
+<archive>/telegram/
+├── index.html
+├── style.css
+├── app.js
+├── data.js
+└── objects/
+    ├── video_notes/source_<id>/author_<id>/message_<id>.mp4
+    ├── profiles/author_<id>/photos/photo_<id>.jpg
+    └── posts/source_<id>/media_<id>.<ext>
 ```
 
 SQLite checkpoints and file-size checks prevent duplicate downloads and recover missing or
 truncated archive files. The progress view reports the current file, real byte count, real
 percentage when Telegram supplies a total, measured speed, queue state and recent errors.
+
+Existing pre-0.4 paths are not moved, copied or deleted. Their SQLite records and safe JSON
+sidecars are migrated in place and referenced by the catalog. Existing source cursors are kept.
+
+## Offline HTML catalog
+
+Choose **Обновить HTML-каталог** in the terminal interface or run:
+
+```bash
+hoard telegram report
+hoard telegram report --archive ~/Videos/hoard
+```
+
+The command reads SQLite and rebuilds the snapshot without starting the daemon, connecting to
+Telegram or requiring internet access. Open `<archive>/telegram/index.html` directly in Firefox,
+Chromium or another local browser. The catalog uses bundled `data.js`; it has no web server,
+`fetch`, CDN, analytics or external font dependency. Search and sorting work locally across posts,
+IDs, current and observed usernames, display names and channels. Media uses lazy loading,
+pagination and `<video controls preload="none">`.
+
+The source template is packaged at `src/hoard/templates/telegram/`. Each report refreshes its
+HTML/CSS/JS while preserving `objects/`. SQLite remains the source of truth.
+
+Optional enrichment obtains post text/media and up to 30 latest profile photos visible to the
+authorized account:
+
+```bash
+hoard telegram enrich
+```
+
+Enrichment is queued separately from video-note scans, respects Telegram privacy and FloodWait,
+deduplicates media IDs and does not stop the primary scan when a profile photo is unavailable.
+Start the collector first if it is stopped. Stories, hidden data and unrelated message history
+are not requested. The offline report remains usable without enrichment.
 
 ## Background operation
 
@@ -114,6 +157,8 @@ hoard start
 hoard stop
 hoard scan
 hoard add https://t.me/examplechannel/123 --output ~/Videos/hoard --interval 120
+hoard telegram report
+hoard telegram enrich
 hoard shutdown
 ```
 
@@ -124,12 +169,14 @@ The interactive wizard additionally performs the live access check.
 
 - `~/.config/hoard/config.json` — API credentials, mode `0600`
 - `~/.local/share/hoard/telegram.session` — Telethon session
-- `~/.local/share/hoard/hoard.sqlite3` — sources, downloads, jobs and events
+- `~/.local/share/hoard/hoard.sqlite3` — sources, Telegram metadata, downloads, jobs and events
 - `~/.local/state/hoard/hoard.sock` — private IPC socket
 - `~/.local/state/hoard/daemon.log` — daemon diagnostics
 
 The standard `XDG_CONFIG_HOME`, `XDG_DATA_HOME` and `XDG_STATE_HOME` variables override
-these roots. Never publish the files above or a personal archive.
+these roots. On Windows the equivalent roots are under `%APPDATA%` and `%LOCALAPPDATA%`.
+`HOARD_ARCHIVE_HOME` can provide the initial archive root. Never publish the files above, the
+generated catalog or a personal archive: profiles and media are personal local data.
 
 ## Diagnostics and verification
 
@@ -139,11 +186,13 @@ tail -n 100 ~/.local/state/hoard/daemon.log
 python -m compileall -q src tests
 ruff check .
 pytest -q
+python -m pip wheel . --no-deps -w dist
 ```
 
 Set `HOARD_DEBUG=1` only while diagnosing a local daemon problem; normal IPC errors omit
 exception class details. Automated tests use fake Telegram clients and require no account,
 code or network access. Live login and downloads still require your own authorized Telegram
-account and content you are permitted to archive.
+account and content you are permitted to archive. Automated browser verification is attempted
+when a compatible browser is available; generation and security behavior are covered without one.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for implementation details.

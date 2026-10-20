@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hoard-local"
-version = "0.3.0"
-description = "Local Telegram video-note archiver with minimal black/orange terminal UI"
+version = "0.4.0"
+description = "Local Telegram archive with an autonomous offline HTML catalog"
 readme = "README.md"
 requires-python = ">=3.11"
 license = {text = "MIT"}
@@ -23,6 +23,7 @@ hoard = "hoard.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/hoard"]
+artifacts = ["src/hoard/templates/**"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

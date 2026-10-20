@@ -126,7 +126,7 @@ def test_exit_menu_does_not_issue_stop(monkeypatch):
     app.run()
     assert prompts.menus[0]["choices"][0]["value"] == "sources"
     assert set(c["value"] for c in prompts.menus[0]["choices"]) == {
-        "sources", "downloads", "scan", "control", "telegram", "exit"
+        "sources", "downloads", "catalog", "scan", "enrich", "control", "telegram", "exit"
     }
 
 
@@ -221,6 +221,7 @@ def test_main_menu_hides_collector_actions_without_sources(monkeypatch):
     assert [item["value"] for item in prompts.menus[0]["choices"]] == [
         "sources",
         "downloads",
+        "catalog",
         "telegram",
         "exit",
     ]

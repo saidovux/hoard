@@ -210,7 +210,7 @@ class HoardCLI:
     def print_header(self, status: dict) -> None:
         self.console.print(
             Text("hoard.", style=f"bold {ORANGE}"),
-            Text(" v0.3.0", style=DIM),
+            Text(" v0.4.0", style=DIM),
             sep="",
         )
         stats = status.get("stats") or {}
@@ -376,7 +376,10 @@ class HoardCLI:
             Text(str(checked.get("title") or post.username), style=WHITE),
             sep="",
         )
-        target = self.text("Каталог", default="~/Videos/hoard")
+        status = self.get_status()
+        target = self.text(
+            "Каталог", default=str(status.get("archive_root") or "~/Videos/hoard")
+        )
         if not target:
             self.console.print(Text("Каталог не должен быть пустым", style=ORANGE))
             return
@@ -584,10 +587,12 @@ class HoardCLI:
                 choices = [
                     {"name": "Источники и посты", "value": "sources"},
                     {"name": "Загрузки и прогресс", "value": "downloads"},
+                    {"name": "Обновить HTML-каталог", "value": "catalog"},
                 ]
                 if (status.get("stats") or {}).get("sources", 0):
                     choices.extend([
                         {"name": "Проверить новые комментарии", "value": "scan"},
+                        {"name": "Дополнить данные из Telegram", "value": "enrich"},
                         {"name": control, "value": "control"},
                     ])
                 choices.extend([
@@ -622,6 +627,17 @@ class HoardCLI:
                                 continue
                             self.call("start")
                         self.call("scan")
+                elif action == "catalog":
+                    result = self.call("telegram_report", timeout=90)
+                    if result:
+                        self.console.print(
+                            Text(str(status.get("catalog") or ""), style=WHITE)
+                        )
+                elif action == "enrich":
+                    if self.connect_telegram(quiet_if_authorized=True):
+                        if not status.get("running"):
+                            self.call("start")
+                        self.call("telegram_enrich")
                 elif action == "control":
                     self.control_menu(status)
                 elif action == "telegram":

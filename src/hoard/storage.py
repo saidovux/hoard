@@ -8,10 +8,12 @@ from pathlib import Path
 
 from .models import Post
 from .paths import ensure_private
+from .telegram_storage import TelegramStorage, utc_now
 
 
 class Store:
-    def __init__(self, filename: Path):
+    def __init__(self, filename: Path, *, migrate_legacy: bool = True):
+        self.filename = filename
         ensure_private(filename.parent)
         self.db = sqlite3.connect(filename)
         # SQLite creates files using the process umask; explicitly restrict data.
@@ -68,6 +70,7 @@ class Store:
             if name not in columns:
                 self.db.execute(f"ALTER TABLE sources ADD COLUMN {name} {declaration}")
         self.db.commit()
+        self.telegram = TelegramStorage(self.db, migrate_legacy=migrate_legacy)
 
     def close(self) -> None:
         self.db.close()
@@ -113,6 +116,8 @@ class Store:
             "SELECT id FROM sources WHERE username=? AND post_id=?",
             (post.username, post.message_id),
         ).fetchone()
+        self.telegram.ensure_archive_root(directory)
+        self.telegram.set_catalog_dirty()
         return int(row["id"])
 
     def sources(self) -> list[dict]:
@@ -140,6 +145,7 @@ class Store:
                                 (int(enabled), source_id))
             if c.rowcount == 0:
                 raise ValueError("Источник не найден")
+        self.telegram.set_catalog_dirty()
 
     def remove_source(self, source_id: int) -> None:
         # Explicitly avoid deleting downloaded files or historic DB records.
@@ -147,6 +153,7 @@ class Store:
             c = self.db.execute("UPDATE sources SET enabled=0 WHERE id=?", (source_id,))
             if c.rowcount == 0:
                 raise ValueError("Источник не найден")
+        self.telegram.set_catalog_dirty()
 
     def schedule(
         self,
@@ -161,6 +168,7 @@ class Store:
                 last_result=? WHERE id=?""",
                 (time.time() + seconds, error[:500], result[:500], source_id),
             )
+        self.telegram.set_catalog_dirty()
 
     def recorded_download_size(self, source_id: int, message_id: int) -> int | None:
         row = self.db.execute("SELECT size FROM downloads WHERE source_id=? AND message_id=?",
@@ -174,8 +182,11 @@ class Store:
             (source_id,),
         ):
             path = Path(row["file_path"])
-            if (not path.is_file() or path.stat().st_size != row["size"] or
-                    not path.with_suffix(".json").is_file()):
+            try:
+                available = path.is_file() and path.stat().st_size == row["size"]
+            except OSError:
+                available = False
+            if not available:
                 return int(row["message_id"])
         return None
 
@@ -187,23 +198,40 @@ class Store:
         if row is None:
             return False
         file = Path(row["file_path"])
-        return (file.is_file() and file.stat().st_size == row["size"] and
-                row["size"] > 0 and file.with_suffix(".json").is_file())
+        try:
+            return file.is_file() and file.stat().st_size == row["size"] and row["size"] > 0
+        except OSError:
+            return False
 
     def checkpoint(self, source_id: int, message_id: int, video: dict | None = None) -> None:
         # Store media record and checkpoint atomically, only AFTER successful write.
+        payload = dict(video or {})
+        if payload:
+            payload.setdefault("observed_at", utc_now())
+            payload.setdefault("state", "saved")
         with self.db:
-            if video is not None:
+            if payload:
                 self.db.execute("""INSERT INTO downloads(source_id,message_id,author_id,
-                    author_username,author_name,date,media_url,file_path,size)
+                    author_username,author_name,date,media_url,file_path,size,observed_at,state)
                     VALUES(:source_id,:message_id,:author_id,:author_username,:author_name,
-                    :date,:media_url,:file_path,:size)
+                    :date,:media_url,:file_path,:size,:observed_at,:state)
                     ON CONFLICT(source_id,message_id) DO UPDATE SET
                       author_id=excluded.author_id, author_username=excluded.author_username,
                       author_name=excluded.author_name, file_path=excluded.file_path,
-                      size=excluded.size""", video)
+                      size=excluded.size,observed_at=excluded.observed_at,
+                      state=excluded.state""", payload)
             self.db.execute("""UPDATE sources SET last_id=MAX(last_id,?) WHERE id=?""",
                             (message_id, source_id))
+        if payload:
+            self.telegram.set_catalog_dirty()
+            if payload.get("author_id") is not None:
+                self.telegram.observe_profile(
+                    author_id=int(payload["author_id"]),
+                    username=str(payload.get("author_username") or ""),
+                    display_name=str(payload.get("author_name") or ""),
+                    observed_at=str(payload["observed_at"]),
+                    source_id=source_id,
+                )
 
     def recent_downloads(self, count: int = 40) -> list[dict]:
         return [dict(r) for r in self.db.execute("""SELECT downloads.*,
@@ -218,10 +246,7 @@ class Store:
     def stats(self) -> dict:
         source_count = self.db.execute("SELECT COUNT(*) FROM sources WHERE enabled=1").fetchone()[0]
         downloaded = self.db.execute("SELECT COUNT(*) FROM downloads").fetchone()[0]
-        authors = self.db.execute(
-            "SELECT COUNT(DISTINCT author_id) FROM downloads "
-            "WHERE author_id IS NOT NULL"
-        ).fetchone()[0]
+        authors = self.db.execute("SELECT COUNT(*) FROM tg_profiles").fetchone()[0]
         return {"sources": source_count, "downloads": downloaded, "authors": authors}
 
     def queue_stats(self) -> dict[str, int]:

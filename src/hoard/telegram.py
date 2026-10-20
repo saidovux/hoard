@@ -8,9 +8,11 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
+from .archive_paths import post_media_path, profile_photo_path, video_note_path
 from .config import read_credentials
 from .models import Post, iso_date, post_comment_link
 from .paths import ensure_private, session_path
+from .telegram_storage import utc_now
 
 
 class AuthState(StrEnum):
@@ -397,6 +399,81 @@ class TelegramEngine:
             "title": str(getattr(entity, "title", "") or post.username),
         }
 
+    @staticmethod
+    def _sender_identity(sender, sender_id: int | None) -> dict[str, Any]:
+        name = " ".join(
+            filter(
+                None,
+                [getattr(sender, "first_name", ""), getattr(sender, "last_name", "")],
+            )
+        ) or getattr(sender, "title", "")
+        return {
+            "author_id": int(sender_id) if sender_id is not None else None,
+            "author_name": str(name or ""),
+            "author_username": str(getattr(sender, "username", "") or ""),
+        }
+
+    async def _message_identity(self, msg) -> dict[str, Any]:
+        sender = getattr(msg, "sender", None)
+        if sender is None:
+            try:
+                sender = await msg.get_sender()
+            except Exception:
+                sender = None
+        return self._sender_identity(sender, getattr(msg, "sender_id", None))
+
+    @staticmethod
+    def _post_media_descriptor(message) -> tuple[str, str, str] | None:
+        photo = getattr(message, "photo", None)
+        if photo is not None and getattr(photo, "id", None) is not None:
+            return str(photo.id), "image", ".jpg"
+        document = getattr(message, "document", None)
+        if document is None or getattr(document, "id", None) is None:
+            return None
+        mime = str(getattr(document, "mime_type", "") or "").lower()
+        if mime.startswith("video/"):
+            kind, suffix = "video", ".mp4"
+        elif mime in {"image/jpeg", "image/jpg"}:
+            kind, suffix = "image", ".jpg"
+        elif mime == "image/png":
+            kind, suffix = "image", ".png"
+        elif mime == "image/webp":
+            kind, suffix = "image", ".webp"
+        else:
+            kind, suffix = "file", ".bin"
+        return str(document.id), kind, suffix
+
+    def _record_post(self, source: dict, entity, original) -> None:
+        self.store.telegram.record_post_metadata(
+            int(source["id"]),
+            channel_title=str(getattr(entity, "title", "") or source.get("title") or ""),
+            post_text=str(
+                getattr(original, "message", "") or getattr(original, "text", "") or ""
+            ),
+            published_at=iso_date(getattr(original, "date", None)),
+        )
+        descriptor = self._post_media_descriptor(original)
+        if descriptor is not None:
+            media_id, _, _ = descriptor
+            current = self.store.telegram.post_media(int(source["id"]), media_id)
+            valid = False
+            if current is not None:
+                try:
+                    path = Path(str(current["file_path"]))
+                    valid = (
+                        path.is_file()
+                        and int(current["size"]) > 0
+                        and path.stat().st_size == int(current["size"])
+                    )
+                except (OSError, TypeError, ValueError):
+                    valid = False
+            if not valid:
+                self.store.enqueue(
+                    "telegram.post_media",
+                    {"source_id": int(source["id"])},
+                    unique_key=f"telegram-post-media:{int(source['id'])}",
+                )
+
     async def scan(self, source: dict) -> tuple[int, int]:
         """Walk linked-post comments from the last checkpoint, oldest first.
 
@@ -414,6 +491,7 @@ class TelegramEngine:
         original = await client.get_messages(entity, ids=post.message_id)
         if original is None:
             raise ValueError("Пост не найден или нет доступа")
+        self._record_post(source, entity, original)
         cursor = int(source["last_id"])
         missing = self.store.earliest_missing_download(source["id"])
         if missing is not None:
@@ -428,8 +506,24 @@ class TelegramEngine:
                                      "percent": 0, "file": ""}
             self.report_progress(self.progress.copy())
             if getattr(msg, "video_note", None) is not None:
+                identity = await self._message_identity(msg)
+                if identity["author_id"] is not None:
+                    author_id = int(identity["author_id"])
+                    self.store.telegram.observe_profile(
+                        author_id=author_id,
+                        username=identity["author_username"],
+                        display_name=identity["author_name"],
+                        observed_at=iso_date(getattr(msg, "date", None)),
+                        source_id=int(source["id"]),
+                    )
+                    if self.store.telegram.profile_photo_due(author_id):
+                        self.store.enqueue(
+                            "telegram.profile_photos",
+                            {"author_id": author_id},
+                            unique_key=f"telegram-profile-photos:{author_id}",
+                        )
                 if not self.store.seen(source["id"], msg.id):
-                    video = await self.download_one(client, post, source, msg)
+                    video = await self.download_one(client, post, source, msg, identity)
                     self.store.checkpoint(source["id"], msg.id, video)
                     downloaded += 1
                     self.store.event("ok", f"Сохранён кружок {post.name} / {msg.id}")
@@ -441,30 +535,26 @@ class TelegramEngine:
         self.report_progress({})
         return checked, downloaded
 
-    async def download_one(self, client, post: Post, source: dict, msg) -> dict:
-        sender = msg.sender
-        if sender is None:
-            try:
-                sender = await msg.get_sender()
-            except Exception:
-                sender = None
-        ident = msg.sender_id
-        name = " ".join(
-            filter(
-                None,
-                [getattr(sender, "first_name", ""), getattr(sender, "last_name", "")],
-            )
-        ) or getattr(sender, "title", "")
-        username = getattr(sender, "username", "") or ""
-        folder = (
-            Path(source["output"])
-            / post.username
-            / str(post.message_id)
-            / str(ident or "unknown")
+    async def download_one(
+        self,
+        client,
+        post: Post,
+        source: dict,
+        msg,
+        identity: dict[str, Any] | None = None,
+    ) -> dict:
+        identity = identity or await self._message_identity(msg)
+        ident = identity["author_id"]
+        name = identity["author_name"]
+        username = identity["author_username"]
+        output = video_note_path(
+            self.store.telegram.archive_root(),
+            int(source["id"]),
+            ident,
+            int(msg.id),
         )
-        ensure_private(folder)
-        output = folder / f"msg_{msg.id}.mp4"
-        partial = folder / f"msg_{msg.id}.mp4.part"
+        ensure_private(output.parent)
+        partial = output.with_suffix(".mp4.part")
         video = {
             "source_id": source["id"], "message_id": msg.id,
             "author_id": ident, "author_name": name, "author_username": username,
@@ -506,7 +596,7 @@ class TelegramEngine:
                 partial.unlink(missing_ok=True)
                 raise
         video["size"] = output.stat().st_size
-        # One JSON file per submission, no unrelated profile/history collection.
+        # The sidecar remains a portable record alongside every video note.
         metadata = {
             "post_url": post.link, "comment_url": video["media_url"],
             "comment_id": msg.id, "date": video["date"],
@@ -524,3 +614,160 @@ class TelegramEngine:
         finally:
             tmp.unlink(missing_ok=True)
         return video
+
+    async def enrich_source(self, source: dict) -> str:
+        """Fetch optional post metadata without being required by report generation."""
+        client = await self.connect()
+        if not await client.is_user_authorized():
+            raise RuntimeError("Telegram не подключён")
+        entity = await client.get_entity(str(source["username"]))
+        original = await client.get_messages(entity, ids=int(source["post_id"]))
+        if original is None:
+            self.store.telegram.record_post_metadata(
+                int(source["id"]),
+                channel_title=str(source.get("title") or source["username"]),
+                post_text="",
+                published_at="",
+                status="unavailable",
+                error="Пост недоступен",
+            )
+            return "Пост недоступен; сохранённые данные оставлены без изменений"
+        self._record_post(source, entity, original)
+        return f"Метаданные поста {source['username']}/{source['post_id']} обновлены"
+
+    async def download_post_media(self, source: dict) -> str:
+        client = await self.connect()
+        if not await client.is_user_authorized():
+            raise RuntimeError("Telegram не подключён")
+        entity = await client.get_entity(str(source["username"]))
+        original = await client.get_messages(entity, ids=int(source["post_id"]))
+        if original is None:
+            return "Медиа поста недоступно"
+        self._record_post(source, entity, original)
+        descriptor = self._post_media_descriptor(original)
+        if descriptor is None:
+            return "У поста нет доступного медиа"
+        media_id, kind, suffix = descriptor
+        current = self.store.telegram.post_media(int(source["id"]), media_id)
+        if current is not None:
+            current_path = Path(str(current["file_path"]))
+            try:
+                if (
+                    current_path.is_file()
+                    and int(current["size"]) > 0
+                    and current_path.stat().st_size == int(current["size"])
+                ):
+                    return "Медиа поста уже сохранено"
+            except (OSError, TypeError, ValueError):
+                pass
+        output = post_media_path(
+            self.store.telegram.archive_root(), int(source["id"]), media_id, suffix
+        )
+        ensure_private(output.parent)
+        partial = output.with_name(f"{output.name}.part")
+        partial.unlink(missing_ok=True)
+        try:
+            with partial.open("wb") as stream:
+                result = await client.download_media(original, file=stream)
+                stream.flush()
+                os.fsync(stream.fileno())
+            if result is None or not partial.is_file() or partial.stat().st_size == 0:
+                raise OSError("Telegram не вернул медиаданные поста")
+            os.replace(partial, output)
+        except BaseException as exc:
+            partial.unlink(missing_ok=True)
+            self.store.telegram.record_post_media(
+                int(source["id"]),
+                media_id,
+                kind=kind,
+                file_path=str(output),
+                size=0,
+                status="failed",
+                error=str(exc),
+            )
+            raise
+        self.store.telegram.record_post_media(
+            int(source["id"]),
+            media_id,
+            kind=kind,
+            file_path=str(output),
+            size=output.stat().st_size,
+        )
+        return f"Медиа поста сохранено: {output.name}"
+
+    async def refresh_profile_photos(self, author_id: int) -> str:
+        """Save at most 30 visible photos; privacy and limits are final authority."""
+        if not self.store.telegram.profile_photo_due(author_id):
+            return "Фотографии профиля недавно проверялись"
+        try:
+            client = await self.connect()
+            if not await client.is_user_authorized():
+                raise RuntimeError("Telegram не подключён")
+            entity = await client.get_entity(int(author_id))
+            identity = self._sender_identity(entity, int(author_id))
+            self.store.telegram.observe_profile(
+                author_id=int(author_id),
+                username=identity["author_username"],
+                display_name=identity["author_name"],
+                observed_at=utc_now(),
+            )
+            saved = 0
+            async for photo in client.iter_profile_photos(entity, limit=30):
+                photo_id = str(getattr(photo, "id", ""))
+                if not photo_id:
+                    continue
+                existing = self.store.telegram.profile_photo(author_id, photo_id)
+                if existing is not None:
+                    path = Path(str(existing["file_path"]))
+                    try:
+                        if (
+                            path.is_file()
+                            and int(existing["size"]) > 0
+                            and path.stat().st_size == int(existing["size"])
+                        ):
+                            continue
+                    except (OSError, TypeError, ValueError):
+                        pass
+                output = profile_photo_path(
+                    self.store.telegram.archive_root(), int(author_id), photo_id
+                )
+                ensure_private(output.parent)
+                partial = output.with_name(f"{output.name}.part")
+                partial.unlink(missing_ok=True)
+                try:
+                    with partial.open("wb") as stream:
+                        result = await client.download_media(photo, file=stream)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    if result is None or not partial.is_file() or partial.stat().st_size == 0:
+                        raise OSError("Telegram не вернул фотографию профиля")
+                    os.replace(partial, output)
+                except BaseException:
+                    partial.unlink(missing_ok=True)
+                    raise
+                self.store.telegram.record_profile_photo(
+                    int(author_id),
+                    photo_id,
+                    file_path=str(output),
+                    size=output.stat().st_size,
+                    photo_date=iso_date(getattr(photo, "date", None)),
+                )
+                saved += 1
+        except Exception as exc:
+            retry = 6 * 60 * 60
+            try:
+                from telethon.errors import FloodWaitError
+
+                if isinstance(exc, FloodWaitError):
+                    retry = max(60, int(exc.seconds) + 3)
+                    message = f"Telegram ограничил фотографии; повтор через {exc.seconds} с."
+                else:
+                    message = "Фотографии профиля недоступны или скрыты настройками приватности"
+            except ImportError:
+                message = "Фотографии профиля сейчас недоступны"
+            self.store.telegram.finish_profile_photo_check(
+                int(author_id), error=message, retry_after=retry
+            )
+            return message
+        self.store.telegram.finish_profile_photo_check(int(author_id))
+        return f"Фотографии профиля обновлены; новых: {saved}"

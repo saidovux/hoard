@@ -1,8 +1,10 @@
 """No Telegram credentials / network needed for these tests."""
 import asyncio
 from datetime import UTC, datetime
+from pathlib import Path
 from types import SimpleNamespace
 
+from hoard.archive_paths import video_note_path
 from hoard.models import Post
 from hoard.storage import Store
 from hoard.telegram import TelegramEngine
@@ -28,9 +30,10 @@ class FakeClient:
             if m.id > min_id:
                 yield m
 
-    async def download_media(self, msg, file, progress_callback):
+    async def download_media(self, msg, file, progress_callback=None):
         file.write(b"mock-video")
-        progress_callback(10, 10)
+        if progress_callback:
+            progress_callback(10, 10)
         return file
 
 
@@ -69,7 +72,7 @@ async def test_missing_download_is_recovered(tmp_path):
     fake = FakeClient([FakeMessage(21, False), FakeMessage(22, True), FakeMessage(23, True)])
     engine.connect = lambda: asyncio.sleep(0, result=fake)
     assert await engine.scan(store.sources()[0]) == (3, 2)
-    missing = tmp_path / "channelx" / "7" / "101" / "msg_22.mp4"
+    missing = video_note_path(tmp_path, sid, 101, 22)
     missing.unlink()
     assert store.earliest_missing_download(sid) == 22
     assert await engine.scan(store.sources()[0]) == (2, 1)
@@ -84,7 +87,7 @@ async def test_truncated_download_is_replaced(tmp_path):
     fake = FakeClient([FakeMessage(22, True)])
     engine.connect = lambda: asyncio.sleep(0, result=fake)
     assert await engine.scan(store.sources()[0]) == (1, 1)
-    file = tmp_path / "channelx" / "7" / "101" / "msg_22.mp4"
+    file = video_note_path(tmp_path, store.sources()[0]["id"], 101, 22)
     file.write_bytes(b"x")
     assert await engine.scan(store.sources()[0]) == (1, 1)
     assert file.read_bytes() == b"mock-video"
@@ -105,4 +108,110 @@ async def test_source_is_resolved_before_being_saved(tmp_path):
         "post_id": 7,
         "title": "Channel X",
     }
+    store.close()
+
+
+class ProfileClient(FakeClient):
+    def __init__(self, photos, *, unavailable=False):
+        super().__init__([])
+        self.photos = photos
+        self.unavailable = unavailable
+        self.photo_downloads = 0
+
+    async def get_entity(self, username):
+        return SimpleNamespace(
+            broadcast=True,
+            title="Channel X",
+            username="current_name",
+            first_name="Profile",
+            last_name="User",
+        )
+
+    async def iter_profile_photos(self, entity, limit):
+        if self.unavailable:
+            raise RuntimeError("private")
+        for photo in self.photos[:limit]:
+            yield photo
+
+    async def download_media(self, msg, file, progress_callback=None):
+        self.photo_downloads += 1
+        file.write(f"photo-{msg.id}".encode())
+        return file
+
+
+async def test_profile_photos_are_limited_deduplicated_and_independent(tmp_path):
+    store = Store(tmp_path / "db.sqlite")
+    store.telegram.observe_profile(author_id=101, username="old", display_name="Old")
+    photos = [
+        SimpleNamespace(id=index, date=datetime(2026, 1, 1, tzinfo=UTC))
+        for index in range(35)
+    ]
+    fake = ProfileClient(photos)
+    engine = TelegramEngine(store)
+    engine.connect = lambda: asyncio.sleep(0, result=fake)
+
+    assert "новых: 30" in await engine.refresh_profile_photos(101)
+    assert fake.photo_downloads == 30
+    assert store.db.execute("SELECT COUNT(*) FROM tg_profile_photos").fetchone()[0] == 30
+    store.db.execute("UPDATE tg_profiles SET photos_retry_at=0 WHERE author_id=101")
+    store.db.commit()
+    assert "новых: 0" in await engine.refresh_profile_photos(101)
+    assert fake.photo_downloads == 30
+    profile = store.db.execute("SELECT * FROM tg_profiles WHERE author_id=101").fetchone()
+    assert profile["current_username"] == "current_name"
+    store.close()
+
+
+async def test_unavailable_profile_photo_does_not_raise(tmp_path):
+    store = Store(tmp_path / "db.sqlite")
+    store.telegram.observe_profile(author_id=101, username=None, display_name="Private")
+    fake = ProfileClient([], unavailable=True)
+    engine = TelegramEngine(store)
+    engine.connect = lambda: asyncio.sleep(0, result=fake)
+
+    result = await engine.refresh_profile_photos(101)
+
+    assert "недоступны" in result
+    row = store.db.execute("SELECT photo_error FROM tg_profiles").fetchone()
+    assert row["photo_error"]
+    store.close()
+
+
+class PostMediaClient(FakeClient):
+    def __init__(self):
+        super().__init__([])
+        self.original = SimpleNamespace(
+            id=7,
+            message="Post text",
+            date=datetime(2026, 2, 1, tzinfo=UTC),
+            photo=SimpleNamespace(id=555),
+            document=None,
+        )
+        self.media_downloads = 0
+
+    async def get_messages(self, entity, ids):
+        return self.original
+
+    async def download_media(self, msg, file, progress_callback=None):
+        self.media_downloads += 1
+        file.write(b"post-photo")
+        return file
+
+
+async def test_post_metadata_and_media_are_enriched_without_duplicates(tmp_path):
+    store = Store(tmp_path / "db.sqlite")
+    store.add_source(Post("channelx", 7), str(tmp_path / "archive"), 120)
+    source = store.sources()[0]
+    fake = PostMediaClient()
+    engine = TelegramEngine(store)
+    engine.connect = lambda: asyncio.sleep(0, result=fake)
+
+    assert "обновлены" in await engine.enrich_source(source)
+    assert store.db.execute("SELECT post_text FROM tg_post_metadata").fetchone()[0] == "Post text"
+    assert "сохранено" in await engine.download_post_media(source)
+    assert "уже сохранено" in await engine.download_post_media(source)
+    assert fake.media_downloads == 1
+    media = store.db.execute("SELECT * FROM tg_post_media").fetchone()
+    assert media["media_id"] == "555"
+    assert Path(media["file_path"]).read_bytes() == b"post-photo"
     store.close()

@@ -10,8 +10,12 @@ background service.
 - `ipc.py` starts the daemon detached when required and sends one JSON request per private
   Unix-socket connection.
 - `service.py` owns the database, job runner and the sole `TelegramEngine`. An asyncio lock
-  serializes login, validation and scans so one Telethon session is never opened by competing
-  clients.
+  serializes login, validation, scans and enrichment so one Telethon session is never opened by
+  competing clients.
+- `telegram_storage.py` owns Telegram-specific tables and migrations while `storage.py` retains
+  the shared source, job and event primitives for future modules.
+- `catalog.py` opens SQLite independently and generates a static browser snapshot without owning a
+  Telegram client. The template lives in the installed `hoard.templates.telegram` package.
 - The socket and all XDG state directories are user-only. There is no TCP/HTTP listener.
 
 Closing or cancelling the interface does not signal the service. Collector pause/stop cancels
@@ -36,18 +40,50 @@ not credentials or an authorized session.
 After login, scans reuse the connected client immediately. If the process is restarted during
 login, the transient challenge is intentionally lost and a new code must be requested.
 
-## Persistence and scheduling
+## Persistence, migration and scheduling
 
-`storage.py` owns a synchronous SQLite connection inside the daemon event loop. The schema
-keeps sources, downloads, durable jobs and a bounded event history. Version 0.3 adds source
-title/last-check metadata with additive `ALTER TABLE` operations; existing rows and downloads
-are preserved.
+`storage.py` owns a synchronous SQLite connection inside the daemon event loop. Shared tables keep
+sources, downloads, durable jobs and a bounded event history. Telegram adds versioned,
+idempotently-created tables:
+
+- `tg_profiles`, keyed only by stable Telegram `author_id`;
+- `tg_username_history` with first/last observation timestamps per ID and username;
+- `tg_profile_sources`, linking one profile to any number of source posts;
+- `tg_profile_photos`, storing photo IDs, status, size and local paths;
+- `tg_post_metadata` and `tg_post_media` for the parent posts;
+- `tg_settings`, `tg_archive_roots` and `schema_versions` for archive configuration, safe access to
+  earlier roots and migrations.
+
+The migration only adds tables/columns. Its one-time legacy pass reads existing `downloads` and
+safe JSON sidecars inside configured archive roots, backfills profile links and file state, and
+leaves files and `sources.last_id` untouched. Unique constraints make the operation repeatable.
+Old media may stay outside `telegram/`; the report emits a relative path or a `file:` URI when
+Windows drives differ. It never creates an implicit second media archive.
 
 Enabled sources become unique `telegram.scan` jobs when due. Telegram scans are serialized,
-while the generic queue retains extension points for dormant adapters. A source checkpoint is
-advanced after each processed comment. Media records are committed only after an MP4 is fully
-written, fsynced, atomically renamed and accompanied by its JSON sidecar. Missing or size-
-mismatched files move the scan cursor back to the earliest affected message.
+while the generic queue retains extension points for other modules. Profile photos, post metadata,
+post media and report generation are separate deduplicated job kinds. A source checkpoint is
+advanced after each processed comment. Media records are committed only after a file is fully
+written, fsynced and atomically renamed. Missing or size-mismatched video notes move the scan
+cursor back to the earliest affected message. A missing legacy JSON sidecar alone does not trigger
+a network re-download because SQLite already has the required catalog metadata.
+
+Profile photo enumeration is capped at 30 per check. Saved Telegram photo IDs prevent duplicate
+downloads. Privacy/RPC failures and FloodWait retry times are recorded on the profile and do not
+fail the source scan.
+
+## Offline catalog
+
+`<archive>/telegram/index.html` loads local `data.js` before `app.js`, which works under `file://`
+without CORS-sensitive `fetch`. The generator takes a normalized SQLite snapshot, validates media
+paths against configured archive roots, escapes script-sensitive characters, stages all four
+generated files and rolls back replacements on an error. The user-owned `objects/` tree is never
+replaced. A dirty marker coalesces changes so a report is generated after a scan or enrichment
+operation rather than after every message.
+
+The browser uses DOM construction and `textContent`, never HTML interpolation. Original links are
+restricted to HTTPS `t.me`; local media URLs accept only relative or `file:` references produced by
+the generator. Pagination limits rows to 80, images are lazy, and videos use `preload=none`.
 
 ## Progress and errors
 
@@ -59,7 +95,7 @@ is explicitly enabled.
 
 ## Current scope
 
-The interactive product is the Telegram video-note archiver. Optional media/rclone adapters
-remain dormant code paths and are not presented as user-facing tools. Browser, AI, web UI,
-multi-user infrastructure and additional personal-data collection are outside the current
-scope.
+The interactive product is the Telegram archive and its static local catalog. Optional
+media/rclone adapters remain dormant code paths and are not presented as user-facing tools. There
+is no browser service, AI, web UI, multi-user infrastructure or collection beyond source posts,
+video-note authors and the visible profile photos explicitly requested for this module.
