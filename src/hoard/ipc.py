@@ -25,8 +25,7 @@ async def request(method: str, args: dict | None = None, timeout: float = 12) ->
         payload = {"method": method, "args": args or {}}
         if token is not None:
             payload["token"] = token
-        writer.write((json.dumps(payload, ensure_ascii=False) + "
-").encode())
+        writer.write((json.dumps(payload, ensure_ascii=False) + "\n").encode())
         await writer.drain()
         line = await asyncio.wait_for(reader.readline(), timeout)
         if not line:
