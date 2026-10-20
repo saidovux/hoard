@@ -21,11 +21,8 @@ def single_instance(path: Path) -> Iterator[None]:
         if is_windows():
             import msvcrt
 
-            lock.seek(0)
-            if not lock.read(1):
-                lock.seek(0)
-                lock.write(b"1")
-                lock.flush()
+            # Lock the first byte directly; reading a byte locked by another
+            # process raises PermissionError on Windows before we can test the lock.
             lock.seek(0)
             try:
                 msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
