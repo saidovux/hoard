@@ -9,9 +9,7 @@ import asyncio
 import os
 import select
 import sys
-import termios
 import time
-import tty
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +21,7 @@ from rich.text import Text
 
 from .ipc import ensure_daemon, request
 from .models import parse_post_url
+from .platform_support import is_windows
 
 ORANGE = "#F79646"
 WHITE = "#F0F0F0"
@@ -467,10 +466,45 @@ class HoardCLI:
         if not sys.stdin.isatty():
             self.console.print(Text("Для просмотра нужен интерактивный терминал", style=GRAY))
             return
-        fd = sys.stdin.fileno()
-        old_settings = termios.tcgetattr(fd)
-        try:
+        if is_windows():
+            import msvcrt
+
+            def read_key() -> str | None:
+                if msvcrt.kbhit():
+                    char = msvcrt.getwch()
+                    # Ignore special-key scan codes (arrows, function keys).
+                    if char in ("\\x00", "\\xe0"):
+                        msvcrt.getwch()
+                        return None
+                    return char.lower()
+                return None
+
+            def key_wait() -> None:
+                time.sleep(0.1)
+
+            def restore() -> None:
+                pass
+        else:
+            import termios
+            import tty
+
+            fd = sys.stdin.fileno()
+            old_settings = termios.tcgetattr(fd)
             tty.setcbreak(fd)
+
+            def read_key() -> str | None:
+                ready, _, _ = select.select([fd], [], [], 0.15)
+                if not ready:
+                    return None
+                return os.read(fd, 1).decode("utf-8", errors="ignore").lower()
+
+            def key_wait() -> None:
+                pass
+
+            def restore() -> None:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+        try:
             with Live(progress_view(self.get_status()), console=self.console,
                       screen=False, auto_refresh=False, transient=True) as live:
                 next_poll = 0.0
@@ -485,22 +519,18 @@ class HoardCLI:
                                 refresh=True,
                             )
                         next_poll = time.monotonic() + 0.6
-                    ready, _, _ = select.select([fd], [], [], 0.15)
-                    if not ready:
+                    char = read_key()
+                    if char is None:
+                        key_wait()
                         continue
-                    char = os.read(fd, 1)
-                    if char in (b"q", b"Q", b"\x1b", b"\x03", b"\x04"):
+                    if char in ("q", "\\x1b", "\\x03", "\\x04"):
                         break
-                    if char in (b"p", b"P", b"s", b"S", b"r", b"R"):
-                        command = {
-                            b"p": "pause",
-                            b"s": "stop",
-                            b"r": "start",
-                        }[char.lower()]
+                    if char in ("p", "s", "r"):
+                        command = {"p": "pause", "s": "stop", "r": "start"}[char]
                         self.call(command)
                         next_poll = 0.0
         finally:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+            restore()
 
     def control_menu(self, status: dict) -> None:
         state = status.get("collector_state")
