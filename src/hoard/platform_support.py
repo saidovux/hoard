@@ -5,8 +5,8 @@ import contextlib
 import json
 import os
 import secrets
-from pathlib import Path
 from collections.abc import Iterator
+from pathlib import Path
 
 
 def is_windows() -> bool:
