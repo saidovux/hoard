@@ -15,13 +15,13 @@ def config_dir() -> Path:
 
 def state_dir() -> Path:
     if is_windows():
-        return Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData/Local") / "Hoard" / "state"
+        return (Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData/Local")\n                / "Hoard" / "state")
     return Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "hoard"
 
 
 def data_dir() -> Path:
     if is_windows():
-        return Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData/Local") / "Hoard" / "data"
+        return (Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData/Local")\n                / "Hoard" / "data")
     return Path(os.environ.get("XDG_DATA_HOME", Path.home() / ".local/share")) / "hoard"
 
 
