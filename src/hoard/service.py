@@ -5,9 +5,9 @@ import asyncio
 import contextlib
 import json
 import os
+import secrets
 import shutil
 import signal
-import secrets
 
 from .config import read_credentials, write_credentials
 from .integrations.media import download, validate_media
