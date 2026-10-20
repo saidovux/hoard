@@ -3,18 +3,19 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import fcntl
 import json
 import os
 import shutil
 import signal
+import secrets
 
 from .config import read_credentials, write_credentials
 from .integrations.media import download, validate_media
 from .integrations.rclone import upload, validate_upload
 from .jobs import JobRunner
 from .models import parse_post_url
-from .paths import db_path, ensure_private, socket_path, state_dir
+from .paths import db_path, endpoint_path, ensure_private, socket_path, state_dir
+from .platform_support import is_windows, remove_endpoint_if_owned, single_instance, write_endpoint
 from .storage import Store
 from .telegram import AuthFlowError, AuthState, TelegramEngine
 
@@ -259,12 +260,16 @@ class Service:
 
 
 async def serve_connection(service: Service, reader: asyncio.StreamReader,
-                           writer: asyncio.StreamWriter):
+                           writer: asyncio.StreamWriter, auth_token: str | None = None):
     try:
         line = await asyncio.wait_for(reader.readline(), timeout=20)
         if len(line) > 64 * 1024:
             raise ValueError("Слишком длинный запрос")
         req = json.loads(line)
+        if auth_token is not None:
+            provided = req.get("token", "") if isinstance(req, dict) else ""
+            if not isinstance(provided, str) or not secrets.compare_digest(provided, auth_token):
+                raise ValueError("Доступ к службе запрещён")
         if not isinstance(req, dict) or not isinstance(req.get("args", {}), dict):
             raise ValueError("Неверный запрос")
         result = await service.handle(req.get("method", ""), req.get("args", {}))
@@ -285,31 +290,38 @@ async def serve_connection(service: Service, reader: asyncio.StreamReader,
 
 async def run_daemon():
     ensure_private(state_dir())
-    lock_file = state_dir() / "service.lock"
-    lock_file.touch(mode=0o600, exist_ok=True)
-    lock_file.chmod(0o600)
-    with lock_file.open("a+") as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            raise SystemExit("Hoard уже запущен") from None
-        sock = socket_path()
-        sock.unlink(missing_ok=True)
+    with single_instance(state_dir() / "service.lock"):
         service = Service()
         server = None
+        token = None
+        sock = socket_path()
         try:
-            server = await asyncio.start_unix_server(
-                lambda r, w: serve_connection(service, r, w), path=str(sock), limit=65536)
-            sock.chmod(0o600)
+            if is_windows():
+                token = secrets.token_urlsafe(32)
+                server = await asyncio.start_server(
+                    lambda r, w: serve_connection(service, r, w, token),
+                    host="127.0.0.1", port=0, limit=65536,
+                )
+                write_endpoint(endpoint_path(), server.sockets[0].getsockname()[1], token)
+            else:
+                sock.unlink(missing_ok=True)
+                server = await asyncio.start_unix_server(
+                    lambda r, w: serve_connection(service, r, w), path=str(sock), limit=65536,
+                )
+                sock.chmod(0o600)
             loop = asyncio.get_running_loop()
-            for signum in (signal.SIGTERM, signal.SIGINT):
-                with contextlib.suppress(NotImplementedError):
-                    loop.add_signal_handler(signum, service.stop_requested.set)
+            if not is_windows():
+                for signum in (signal.SIGTERM, signal.SIGINT):
+                    with contextlib.suppress(NotImplementedError, RuntimeError):
+                        loop.add_signal_handler(signum, service.stop_requested.set)
             await service.stop_requested.wait()
-            await service.stop()
         finally:
             if server is not None:
                 server.close()
                 await server.wait_closed()
+            await service.stop()
             service.store.close()
-            sock.unlink(missing_ok=True)
+            if token is not None:
+                remove_endpoint_if_owned(endpoint_path(), token)
+            else:
+                sock.unlink(missing_ok=True)
