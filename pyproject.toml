@@ -1,0 +1,35 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hoard-local"
+version = "0.3.0"
+description = "Local Telegram video-note archiver with minimal black/orange terminal UI"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+dependencies = [
+  "telethon>=1.45,<2",
+  "rich>=13.7,<15",
+  "InquirerPy>=0.3.4,<0.4",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-asyncio>=0.24", "ruff>=0.9"]
+
+[project.scripts]
+hoard = "hoard.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/hoard"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]

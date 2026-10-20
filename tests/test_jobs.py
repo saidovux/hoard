@@ -1,0 +1,85 @@
+import asyncio
+
+from hoard.jobs import JobRunner
+from hoard.storage import Store
+
+
+async def wait_for(predicate, seconds=3):
+    async with asyncio.timeout(seconds):
+        while not predicate():
+            await asyncio.sleep(0.02)
+
+
+async def test_queue_executes_generic_tasks_and_persists(tmp_path):
+    store = Store(tmp_path / "hoard.sqlite3")
+    calls = []
+
+    async def example(payload):
+        calls.append(payload)
+        return "ok"
+
+    jid = store.enqueue("demo", {"hello": "world"})
+    runner = JobRunner(store, {"demo": example})
+    await runner.start()
+    await wait_for(lambda: store.recent_jobs()[0]["state"] == "done")
+    await runner.stop()
+    assert calls == [{"hello": "world"}]
+    assert store.recent_jobs()[0]["attempts"] == 1
+    store.close()
+    again = Store(tmp_path / "hoard.sqlite3")
+    assert again.recent_jobs()[0]["id"] == jid
+    again.close()
+
+
+async def test_interrupted_job_is_retried_not_lost(tmp_path):
+    store = Store(tmp_path / "test.sqlite3")
+    started = asyncio.Event()
+
+    async def hanging(payload):
+        started.set()
+        await asyncio.Future()
+
+    store.enqueue("sleep", {})
+    runner = JobRunner(store, {"sleep": hanging})
+    await runner.start()
+    await asyncio.wait_for(started.wait(), 3)
+    await runner.stop()
+    assert store.recent_jobs()[0]["state"] == "queued"
+    calls = []
+
+    async def ok(payload):
+        calls.append(1)
+        return "done"
+
+    runner2 = JobRunner(store, {"sleep": ok})
+    await runner2.start()
+    await wait_for(lambda: store.recent_jobs()[0]["state"] == "done")
+    await runner2.stop()
+    assert calls == [1] and store.recent_jobs()[0]["attempts"] == 2
+    store.close()
+
+
+async def test_deduplicates_same_source_while_queued(tmp_path):
+    store = Store(tmp_path / "test.sqlite3")
+    a = store.enqueue("telegram.scan", {"source_id": 4}, unique_key="telegram:4")
+    b = store.enqueue("telegram.scan", {"source_id": 4}, unique_key="telegram:4")
+    assert a == b
+    store.mark_running(a)
+    assert store.enqueue("telegram.scan", {"source_id": 4}, unique_key="telegram:4") == a
+    store.finish_job(a, "done", "ok")
+    assert store.enqueue("telegram.scan", {"source_id": 4}, unique_key="telegram:4") != a
+    store.close()
+
+
+async def test_failed_job_requires_explicit_retry(tmp_path):
+    store = Store(tmp_path / "test.sqlite3")
+    async def bad(_):
+        raise ValueError("intentional")
+    jid = store.enqueue("fake", {})
+    runner = JobRunner(store, {"fake": bad})
+    await runner.start()
+    await wait_for(lambda: store.recent_jobs()[0]["state"] == "failed")
+    await runner.stop()
+    store.retry_job(jid)
+    assert store.recent_jobs()[0]["state"] == "queued"
+    store.close()
