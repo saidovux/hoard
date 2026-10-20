@@ -47,3 +47,23 @@ async def test_loopback_authenticated(monkeypatch, tmp_path):
     finally:
         server.close()
         await server.wait_closed()
+
+
+async def test_detached_daemon_start_and_shutdown(monkeypatch, tmp_path):
+    for key, directory in {
+        'XDG_STATE_HOME': 'state', 'XDG_DATA_HOME': 'data',
+        'XDG_CONFIG_HOME': 'config', 'APPDATA': 'roaming',
+        'LOCALAPPDATA': 'local',
+    }.items():
+        monkeypatch.setenv(key, str(tmp_path / directory))
+    await ipc.ensure_daemon()
+    assert (await ipc.request('status'))['running'] is False
+    assert 'завершает' in (await ipc.request('shutdown'))['message']
+    for _ in range(60):
+        try:
+            await ipc.request('status', timeout=0.25)
+        except (OSError, RuntimeError, TimeoutError, ValueError):
+            break
+        await asyncio.sleep(0.1)
+    else:
+        pytest.fail('Daemon remains reachable after shutdown')
