@@ -1,6 +1,6 @@
 # Hoard 0.3.0
 
-Hoard is a local-first Linux archiver for Telegram video notes posted in a channel post's
+Hoard is a local-first Linux and Windows archiver for Telegram video notes posted in a channel post's
 comments. It uses Telethon, SQLite and a small inline Rich/InquirerPy interface. A private
 background daemon performs all Telegram work; closing the interface does not stop downloads.
 
@@ -27,6 +27,24 @@ For development, install the test tools with `python -m pip install -e '.[dev]'`
 An upgrade keeps the existing XDG configuration, database, Telegram session and archive.
 If an older daemon is still running, execute `hoard shutdown` before starting the upgraded
 installation.
+
+## Windows installation (PowerShell)
+
+Install Python 3.11+ and Git; open Windows Terminal:
+
+```powershell
+git clone https://github.com/saidovux/hoard.git
+cd hoard
+py -3 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -e .
+.\.venv\Scripts\hoard.exe
+```
+
+No PowerShell execution policy changes are needed. Windows stores credentials in
+`%APPDATA%\Hoard` and data and service state under `%LOCALAPPDATA%\Hoard`.
+The background service binds only to 127.0.0.1 using a random port and a
+per-start token saved in `state\endpoint.json`. Keep the token file private.
+Use `hoard shutdown` to fully close the service. Windows CI does not test live Telegram.
 
 ## First launch and Telegram login
 
@@ -75,7 +93,7 @@ percentage when Telegram supplies a total, measured speed, queue state and recen
 
 ## Background operation
 
-The UI communicates with one user-owned daemon over a mode-`0600` Unix socket. Selecting
+The UI communicates with one user-owned daemon over a mode-`0600` Unix socket on Linux (Windows uses authenticated loopback IPC). Selecting
 **Выход**, pressing Ctrl+C at a menu, or closing the terminal closes only the interface.
 The collector continues until it is paused, stopped or the daemon is shut down.
 
