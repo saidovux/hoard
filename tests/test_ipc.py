@@ -1,7 +1,8 @@
-import os
-import pytest
 import asyncio
 import json
+import os
+
+import pytest
 
 from hoard.service import serve_connection
 
