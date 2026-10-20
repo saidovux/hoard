@@ -10,6 +10,7 @@ jobs:
         os: [ubuntu-latest, windows-latest]
         python-version: ['3.11', '3.13']
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 6
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -18,4 +19,7 @@ jobs:
       - run: python -m pip install -e '.[dev]'
       - run: python -m compileall -q src tests
       - run: ruff check .
-      - run: pytest -q
+      - name: Install diagnostic timeout
+        run: python -m pip install pytest-timeout
+      - name: Run tests with stack diagnostics
+        run: python -m pytest -vv -s --timeout=35 --timeout-method=thread -o faulthandler_timeout=20
