@@ -1,8 +1,10 @@
 import asyncio
 import json
+
 import pytest
+
 from hoard import ipc, paths
-from hoard.platform_support import write_endpoint, read_endpoint, single_instance
+from hoard.platform_support import read_endpoint, single_instance, write_endpoint
 from hoard.service import serve_connection
 
 
