@@ -1,7 +1,4 @@
 import asyncio
-import sys
-
-import pytest
 
 from hoard.ai import AIMessage, AIRequest
 from hoard.ai.executor import AICore
@@ -10,13 +7,6 @@ from hoard.ai.provider import AIProvider
 from hoard.service import Service
 from hoard.storage import Store
 from hoard.telegram import AuthState
-
-if sys.platform == "win32" and sys.version_info < (3, 12):
-
-    @pytest.fixture(scope="module", autouse=True)
-    def event_loop_policy():
-        """Avoid the Python 3.11 Proactor stall exercised by this job-runner module."""
-        return asyncio.WindowsSelectorEventLoopPolicy()
 
 
 async def wait_for(predicate, seconds=3):
