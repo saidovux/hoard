@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 
 @pytest.fixture(scope="module", autouse=True)
 def load_textual_after_existing_async_tests():
-    """Avoid importing Textual during collection on Windows 3.11's Proactor loop."""
+    """Keep Textual initialization local to its own headless test module."""
     from textual.widgets import Input as InputClass
     from textual.widgets import OptionList as OptionListClass
     from textual.widgets import Static as StaticClass
