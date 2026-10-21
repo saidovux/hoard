@@ -1,4 +1,4 @@
-# Hoard 0.4.0.1
+# Hoard 0.4.0.2
 
 Hoard is a local-first Linux and Windows archive for Telegram posts, profiles and video notes
 found in a channel post's comments. It uses Telethon, SQLite, an autonomous offline HTML catalog
@@ -157,7 +157,9 @@ The collector continues until it is paused, stopped or the daemon is shut down.
 
 The interface is inline, does not enter the alternate screen and refreshes only while the
 progress view is open. The terminal supplies the black background; Hoard uses orange
-`#F79646`, white primary text and gray secondary text.
+`#F79646`, white primary text and gray secondary text. Its centered workspace expands up to
+112 columns, collapses cleanly on narrow terminals and replaces the previous view after every
+completed prompt, so navigation does not leave duplicate menus on screen.
 Lists support both arrow keys and Vim navigation: `j`/`k` move, `l` or Enter selects, and `h`
 returns to the parent menu. The same `h` shortcut leaves the live progress view.
 

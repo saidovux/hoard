@@ -13,12 +13,15 @@ import time
 from pathlib import Path
 from typing import Any
 
+from rich.cells import cell_len, set_cell_size
 from rich.console import Console, Group
 from rich.live import Live
+from rich.padding import Padding
 from rich.progress import BarColumn, Progress, TextColumn
 from rich.table import Table
 from rich.text import Text
 
+from . import __version__
 from .ipc import ensure_daemon, request
 from .models import parse_post_url
 from .platform_support import is_windows
@@ -28,6 +31,8 @@ WHITE = "#F0F0F0"
 GRAY = "#929292"
 DIM = "#777777"
 SEPARATOR = "#292929"
+LAYOUT_MAX_WIDTH = 112
+LAYOUT_MIN_WIDTH = 44
 
 SELECT_KEYBINDINGS = {
     "down": [{"key": "down"}, {"key": "c-n"}, {"key": "j"}],
@@ -87,21 +92,32 @@ def collector_label(status: dict) -> str:
     return "остановлен"
 
 
-def progress_view(status: dict) -> Group:
+def progress_view(status: dict, width: int = 72) -> Group:
     progress = status.get("progress") or {}
     stats = status.get("stats") or {}
     queue = status.get("queue") or {}
-    header = Text("hoard / downloads", style=f"bold {ORANGE}")
-    state = Text(f"Сборщик: {collector_label(status)}", style=WHITE)
-    pieces: list[Any] = [header, Text(""), state]
+    width = max(24, width)
+    heading = Table.grid(padding=0)
+    heading.width = width
+    heading.add_column(ratio=1)
+    heading.add_column(ratio=1, justify="right")
+    heading.add_row(
+        Text("ЗАГРУЗКИ", style=f"bold {ORANGE}"),
+        Text(f"Сборщик  {collector_label(status)}", style=WHITE),
+    )
+    pieces: list[Any] = [heading, Text("─" * width, style=SEPARATOR), Text("")]
     if progress:
-        pieces.extend([Text(""), Text(progress_text(status), style=WHITE)])
+        pieces.append(Text(progress_text(status), style=WHITE))
         total = progress.get("total")
         if progress.get("file") and total:
             bar = Progress(
                 TextColumn(""),
-                BarColumn(bar_width=32, style=SEPARATOR, complete_style=ORANGE,
-                          finished_style=ORANGE),
+                BarColumn(
+                    bar_width=max(10, width - 8),
+                    style=SEPARATOR,
+                    complete_style=ORANGE,
+                    finished_style=ORANGE,
+                ),
                 TextColumn("{task.percentage:>3.0f}%", style=ORANGE),
                 expand=False, transient=False,
             )
@@ -112,20 +128,30 @@ def progress_view(status: dict) -> Group:
             )
             pieces.append(bar)
     else:
-        pieces.extend([Text(""), Text("Нет активной загрузки", style=GRAY)])
-    pieces.extend([
-        Text(""),
-        Text(f"Сохранено: {stats.get('downloads', 0)}    "
-             f"Авторы: {stats.get('authors', 0)}    "
-             f"Источники: {stats.get('sources', 0)}", style=GRAY),
-        Text(
-            f"Очередь: {queue.get('queued', 0)}    "
-            f"В работе: {queue.get('running', 0)}    "
-            f"Ошибки: {queue.get('failed', 0)}",
-            style=GRAY,
-        ),
-        Text(""),
-    ])
+        pieces.append(Text("Нет активной загрузки", style=GRAY))
+    counters = Table.grid(padding=0)
+    counters.width = width
+    archive_stats = Text(
+        f"{stats.get('downloads', 0)} кружков  ·  "
+        f"{stats.get('authors', 0)} профилей  ·  "
+        f"{stats.get('sources', 0)} источников",
+        style=GRAY,
+    )
+    queue_stats = Text(
+        f"Очередь: {queue.get('queued', 0)}    "
+        f"В работе: {queue.get('running', 0)}    "
+        f"Ошибки: {queue.get('failed', 0)}",
+        style=GRAY,
+    )
+    if width < 84:
+        counters.add_column()
+        counters.add_row(archive_stats)
+        counters.add_row(queue_stats)
+    else:
+        counters.add_column(ratio=1)
+        counters.add_column(ratio=1, justify="right")
+        counters.add_row(archive_stats, queue_stats)
+    pieces.extend([Text(""), counters, Text("")])
     if status.get("running"):
         pieces.append(Text("h/q — назад   p — пауза   s — остановить", style=DIM))
     elif status.get("collector_state") == "paused":
@@ -146,6 +172,62 @@ class HoardCLI:
         self.console = console or Console(highlight=False, color_system="auto")
         self._prompts = prompts
         self._style = None
+        self._notice: tuple[str, bool] | None = None
+
+    @property
+    def content_width(self) -> int:
+        available = max(1, self.console.width - 2)
+        if available < LAYOUT_MIN_WIDTH:
+            return available
+        return min(LAYOUT_MAX_WIDTH, available)
+
+    @property
+    def content_margin(self) -> int:
+        return max(0, (self.console.width - self.content_width) // 2)
+
+    def clear_view(self) -> None:
+        """Clear the primary screen between views without using an alternate screen."""
+        if self.console.is_terminal:
+            self.console.clear(home=True)
+
+    def print_content(self, renderable: Any = "") -> None:
+        margin = self.content_margin
+        self.console.print(
+            Padding(renderable, (0, margin, 0, margin), expand=False),
+            soft_wrap=False,
+        )
+
+    @staticmethod
+    def _fit(text: str, width: int) -> str:
+        if width <= 0:
+            return ""
+        if cell_len(text) <= width:
+            return text
+        if width == 1:
+            return "…"
+        return set_cell_size(text, width - 1).rstrip() + "…"
+
+    def _format_choice(self, title: str, hint: str = "") -> str:
+        width = max(1, self.content_width - 3)
+        if not hint:
+            return self._fit(title, width)
+        title_width = cell_len(title)
+        hint_width = cell_len(hint)
+        if title_width + hint_width + 3 <= width:
+            return f"{title}{' ' * (width - title_width - hint_width)}{hint}"
+        remaining = width - title_width - 3
+        if remaining >= 10:
+            return f"{title} · {self._fit(hint, remaining)}"
+        return self._fit(title, width)
+
+    def feedback(self, message: str, *, error: bool = False) -> None:
+        self._notice = (message, error)
+        self.print_content(Text(message, style=ORANGE if error else GRAY))
+
+    def render_page(self, status: dict, name: str, description: str = "") -> None:
+        self.clear_view()
+        self.print_header(status)
+        self.print_section(name, description)
 
     def _ensure_prompts(self):
         if self._prompts is None:
@@ -172,19 +254,30 @@ class HoardCLI:
 
     def select(self, message: str, choices: list[dict[str, str]]) -> str:
         prompts = self._ensure_prompts()
+        margin = " " * self.content_margin
+        display_choices = []
+        for choice in choices:
+            display = dict(choice)
+            display["name"] = self._format_choice(
+                str(choice.get("name", "")), str(choice.get("hint", ""))
+            )
+            display.pop("hint", None)
+            display_choices.append(display)
         try:
-            return prompts.select(
-                message=message,
-                choices=choices,
+            result = prompts.select(
+                message=f"{margin}{message}",
+                choices=display_choices,
                 style=self._style,
-                pointer="❯",
+                pointer=f"{margin}›",
                 qmark="",
                 amark="",
                 border=False,
-                instruction="(j/k или ↑/↓ · l/Enter выбрать · h назад)",
+                instruction="  j/k перемещение · l/Enter открыть · h назад",
                 keybindings=SELECT_KEYBINDINGS,
                 cycle=False,
+                show_cursor=False,
             ).execute()
+            return str(result)
         except KeyboardInterrupt:
             values = {str(choice.get("value", "")) for choice in choices}
             if "back" in values:
@@ -192,26 +285,44 @@ class HoardCLI:
             if "exit" in values:
                 return "exit"
             raise
+        finally:
+            self.clear_view()
 
     def text(self, message: str, default: str = "") -> str:
-        return str(self._ensure_prompts().text(
-            message=message, default=default, style=self._style,
-            qmark="", amark="",
-        ).execute()).strip()
+        try:
+            return str(self._ensure_prompts().text(
+                message=f"{' ' * self.content_margin}{message}",
+                default=default,
+                style=self._style,
+                qmark="",
+                amark="",
+            ).execute()).strip()
+        finally:
+            self.clear_view()
 
     def secret(self, message: str) -> str:
-        return str(self._ensure_prompts().secret(
-            message=message,
-            style=self._style,
-            qmark="",
-            amark="",
-            transformer=lambda _: "[скрыто]",
-        ).execute())
+        try:
+            return str(self._ensure_prompts().secret(
+                message=f"{' ' * self.content_margin}{message}",
+                style=self._style,
+                qmark="",
+                amark="",
+                transformer=lambda _: "[скрыто]",
+            ).execute())
+        finally:
+            self.clear_view()
 
     def confirm(self, message: str, default: bool = False) -> bool:
-        return bool(self._ensure_prompts().confirm(
-            message=message, default=default, style=self._style, qmark="", amark="",
-        ).execute())
+        try:
+            return bool(self._ensure_prompts().confirm(
+                message=f"{' ' * self.content_margin}{message}",
+                default=default,
+                style=self._style,
+                qmark="",
+                amark="",
+            ).execute())
+        finally:
+            self.clear_view()
 
     @staticmethod
     def api(method: str, args: dict | None = None, timeout: float = 30) -> dict:
@@ -245,7 +356,14 @@ class HoardCLI:
     ) -> dict:
         return asyncio.run(self._api_with_activity_async(method, args, timeout, activity))
 
-    def call(self, method: str, args: dict | None = None, timeout: float = 30) -> dict | None:
+    def call(
+        self,
+        method: str,
+        args: dict | None = None,
+        timeout: float = 30,
+        *,
+        display: bool = True,
+    ) -> dict | None:
         try:
             activity = NETWORK_ACTIVITIES.get(method)
             result = (
@@ -265,23 +383,25 @@ class HoardCLI:
                 if message.startswith(prefix):
                     message = message[len(prefix):]
                     break
-            self.console.print(Text(f"Ошибка: {message}", style=ORANGE))
+            if display:
+                self.feedback(f"Ошибка: {message}", error=True)
+            else:
+                self._notice = (f"Ошибка: {message}", True)
             return None
         message = result.get("message")
         if message:
-            self.console.print(Text(message, style=GRAY))
+            if display:
+                self.feedback(str(message))
+            else:
+                self._notice = (str(message), False)
         return result
 
     def get_status(self) -> dict:
         return self.api("status", timeout=4)
 
     def print_header(self, status: dict) -> None:
-        self.console.print(
-            Text("hoard.", style=f"bold {ORANGE}"),
-            Text(" v0.4.0.1", style=DIM),
-            sep="",
-        )
         stats = status.get("stats") or {}
+        queue = status.get("queue") or {}
         auth_labels = {
             "authorized": "подключён",
             "api_required": "нужны API-ключи",
@@ -293,58 +413,107 @@ class HoardCLI:
         telegram = auth_labels.get(status.get("telegram"), "сессия не проверена")
         telegram_marker = "●" if status.get("telegram") == "authorized" else "○"
         collector_marker = "●" if status.get("running") else "○"
-        self.console.print(
-            Text(f"{telegram_marker} Telegram ", style=ORANGE),
-            Text(f"{telegram}", style=WHITE),
-            Text("   ", style=GRAY),
-            Text(f"{collector_marker} Сборщик ", style=ORANGE),
-            Text(collector_label(status), style=WHITE),
-            sep="",
+        brand = Text()
+        brand.append("hoard", style=f"bold {ORANGE}")
+        brand.append("  local telegram archive", style=DIM)
+        version = Text(f"v{__version__}", style=DIM)
+
+        telegram_state = Text(f"{telegram_marker} ", style=ORANGE)
+        telegram_state.append("Telegram  ", style=GRAY)
+        telegram_state.append(telegram, style=WHITE)
+        collector_state = Text(f"{collector_marker} ", style=ORANGE)
+        collector_state.append("Сборщик  ", style=GRAY)
+        collector_state.append(collector_label(status), style=WHITE)
+
+        archive_stats = Text(
+            f"источники {stats.get('sources', 0)}  ·  "
+            f"профили {stats.get('authors', 0)}  ·  "
+            f"кружки {stats.get('downloads', 0)}",
+            style=GRAY,
         )
-        self.console.print(
-            Text(
-                f"{stats.get('sources', 0)} источников  ·  "
-                f"{stats.get('authors', 0)} профилей  ·  "
-                f"{stats.get('downloads', 0)} кружков",
-                style=GRAY,
-            )
+        queue_stats = Text(
+            f"очередь {queue.get('queued', 0)}  ·  "
+            f"в работе {queue.get('running', 0)}  ·  "
+            f"ошибки {queue.get('failed', 0)}",
+            style=GRAY,
         )
-        self.console.print(Text("─" * min(70, self.console.width), style=SEPARATOR))
+        identity = Table.grid(padding=0)
+        identity.width = self.content_width
+        identity.add_column(ratio=3, no_wrap=True)
+        identity.add_column(ratio=1, justify="right", no_wrap=True)
+        identity.add_row(brand, version)
+
+        states = Table.grid(padding=0)
+        states.width = self.content_width
+        states.add_column(ratio=1, no_wrap=True)
+        states.add_column(ratio=1, justify="right", no_wrap=True)
+        states.add_row(telegram_state, collector_state)
+
+        metrics = Table.grid(padding=0)
+        metrics.width = self.content_width
+        if self.content_width < 84:
+            metrics.add_column()
+            metrics.add_row(archive_stats)
+            metrics.add_row(queue_stats)
+        else:
+            metrics.add_column(ratio=1, no_wrap=True)
+            metrics.add_column(ratio=1, justify="right", no_wrap=True)
+            metrics.add_row(archive_stats, queue_stats)
+        self.print_content(Group(identity, states, metrics))
+        self.print_content(Text("─" * self.content_width, style=SEPARATOR))
+        if self._notice:
+            message, is_error = self._notice
+            self.print_content(Text(f"  {message}", style=ORANGE if is_error else WHITE))
+            self._notice = None
 
     def print_section(self, name: str, description: str = "") -> None:
-        self.console.print()
-        self.console.print(Text(f"hoard / {name}", style=f"bold {ORANGE}"))
-        if description:
-            self.console.print(Text(description, style=GRAY))
-        self.console.print(Text("─" * min(54, self.console.width), style=SEPARATOR))
+        section = Table.grid(padding=0)
+        section.width = self.content_width
+        section.add_column(ratio=1, no_wrap=True)
+        section.add_column(ratio=2, justify="right")
+        section.add_row(
+            Text(name.upper(), style=f"bold {ORANGE}"),
+            Text(description, style=GRAY),
+        )
+        self.print_content("")
+        self.print_content(section)
+        self.print_content("")
 
     def print_sources(self, sources: list[dict]) -> None:
         if not sources:
-            self.console.print(Text("Источников пока нет", style=GRAY))
+            self.print_content(Text("Источников пока нет", style=GRAY))
             return
+        table = Table.grid(padding=(0, 1))
+        table.width = self.content_width
+        table.add_column(ratio=3)
+        table.add_column(ratio=2, justify="right")
         for s in sources:
             marker = "●" if s["enabled"] else "○"
             title = s.get("title") or s["username"]
-            self.console.print(
-                Text(f"{marker} {title}", style=WHITE),
-                Text(f"  {source_display(s)}  ·  #{s['id']}", style=GRAY),
-                sep="",
+            table.add_row(
+                Text(f"{marker}  {title}", style=WHITE),
+                Text(f"{source_display(s)}  ·  #{s['id']}", style=GRAY),
             )
             result = s.get("last_result") or "Ещё не проверялся"
             checked = s.get("last_checked_at") or "—"
-            self.console.print(
+            table.add_row(
                 Text(
-                    f"  Кружки: {s.get('download_count', 0)}  ·  "
-                    f"Последняя проверка: {checked}  ·  {result}",
+                    f"   {s.get('download_count', 0)} кружков  ·  {result}",
                     style=GRAY,
-                )
+                ),
+                Text(f"проверка {checked}", style=GRAY),
             )
             if s.get("last_error"):
-                self.console.print(Text(f"  Ошибка: {s['last_error']}", style=ORANGE))
+                table.add_row(
+                    Text(f"   {s['last_error']}", style=ORANGE),
+                    Text("ошибка", style=ORANGE),
+                )
+            table.add_row("", "")
+        self.print_content(table)
 
     def _auth_error(self, result: dict) -> None:
         if result.get("error"):
-            self.console.print(Text(str(result["error"]), style=ORANGE))
+            self.feedback(str(result["error"]), error=True)
 
     def connect_telegram(self, *, quiet_if_authorized: bool = False) -> bool:
         """Drive daemon-owned Telegram login as one cancellable conversation."""
@@ -353,7 +522,7 @@ class HoardCLI:
         last_password = ""
         try:
             if not quiet_if_authorized:
-                self.console.print(
+                self.print_content(
                     Text(
                         "Вход выполняет фоновая служба. Во время сетевых шагов "
                         "будут видны ожидание и таймер.",
@@ -368,20 +537,18 @@ class HoardCLI:
                     return False
                 if state == "authorized" or result.get("authorized"):
                     if not quiet_if_authorized and not result.get("message"):
-                        self.console.print(Text("Telegram подключён.", style=WHITE))
+                        self.feedback("Telegram подключён.")
                     return True
                 if state == "api_required":
                     raw_id = self.text("API ID с my.telegram.org/apps")
                     try:
                         api_id = int(raw_id)
                     except ValueError:
-                        self.console.print(
-                            Text("API ID должен быть положительным числом.", style=ORANGE)
-                        )
+                        self.feedback("API ID должен быть положительным числом.", error=True)
                         continue
                     api_hash = self.secret("API Hash")
                     if not api_hash:
-                        self.console.print(Text("API Hash не должен быть пустым.", style=ORANGE))
+                        self.feedback("API Hash не должен быть пустым.", error=True)
                         continue
                     if self.call(
                         "credentials", {"api_id": api_id, "api_hash": api_hash}
@@ -401,7 +568,7 @@ class HoardCLI:
                         force = False
                     else:
                         phone = self.text("Номер телефона (+79990000000)")
-                    self.console.print(
+                    self.print_content(
                         Text(
                             "Запрашиваю код. Если Telegram недоступен в текущей сети, "
                             "включи VPN; Ctrl+C безопасно отменит вход.",
@@ -445,48 +612,42 @@ class HoardCLI:
                         return False
                     result = self.call("auth_begin", timeout=75)
                     continue
-                self.console.print(
-                    Text("Неизвестное состояние подключения Telegram.", style=ORANGE)
-                )
+                self.feedback("Неизвестное состояние подключения Telegram.", error=True)
                 return False
             return False
         except (KeyboardInterrupt, EOFError):
             cancelled = self.call("auth_cancel")
             if cancelled is None:
-                self.console.print(
-                    Text("Подключение отменено; служба продолжает работу.", style=GRAY)
-                )
+                self.feedback("Подключение отменено; служба продолжает работу.")
             return False
 
     def add_source(self) -> None:
-        self.print_section(
+        self.render_page(
+            self.get_status(),
             "новый пост", "Ссылка → проверка доступа → каталог → запуск сканирования"
         )
         raw = self.text("Ссылка на пост")
         try:
             post = parse_post_url(raw)
         except ValueError as exc:
-            self.console.print(Text(str(exc), style=ORANGE))
+            self.feedback(str(exc), error=True)
             return
         if not self.connect_telegram(quiet_if_authorized=True):
-            self.console.print(
-                Text("Пост не добавлен: подключение Telegram не завершено.", style=GRAY)
-            )
+            self.feedback("Пост не добавлен: подключение Telegram не завершено.")
             return
         checked = self.call("source_validate", {"url": post.link}, timeout=75)
         if not checked:
             return
-        self.console.print(
+        self.print_content(
             Text("Найден пост: ", style=GRAY),
-            Text(str(checked.get("title") or post.username), style=WHITE),
-            sep="",
         )
+        self.print_content(Text(str(checked.get("title") or post.username), style=WHITE))
         status = self.get_status()
         target = self.text(
             "Каталог", default=str(status.get("archive_root") or "~/Videos/hoard")
         )
         if not target:
-            self.console.print(Text("Каталог не должен быть пустым", style=ORANGE))
+            self.feedback("Каталог не должен быть пустым", error=True)
             return
         interval = 120
         if not self.confirm("Проверять каждые 120 секунд?", default=True):
@@ -496,9 +657,9 @@ class HoardCLI:
                 if interval < 30 or interval > 86400:
                     raise ValueError
             except ValueError:
-                self.console.print(Text("Интервал: от 30 до 86400 секунд", style=ORANGE))
+                self.feedback("Интервал: от 30 до 86400 секунд", error=True)
                 return
-        self.console.print(Text(f"{post.link}  →  {Path(target).expanduser()}", style=GRAY))
+        self.print_content(Text(f"{post.link}  →  {Path(target).expanduser()}", style=GRAY))
         if not self.confirm("Добавить источник?", default=True):
             return
         added = self.call(
@@ -519,11 +680,11 @@ class HoardCLI:
     def sources_menu(self) -> None:
         while True:
             status = self.get_status()
-            self.print_section("источники", "Посты, которые Hoard проверяет в фоне")
+            self.render_page(status, "источники", "Посты, которые Hoard проверяет в фоне")
             self.print_sources(status.get("sources", []))
             action = self.select("Источники", [
-                {"name": "Добавить пост", "value": "add"},
-                {"name": "Включить / отключить пост", "value": "toggle"},
+                {"name": "Добавить пост", "hint": "новый источник", "value": "add"},
+                {"name": "Включить / отключить", "hint": "управление", "value": "toggle"},
                 {"name": "Назад", "value": "back"},
             ])
             if action == "back":
@@ -533,7 +694,7 @@ class HoardCLI:
             if action == "toggle":
                 sources = status.get("sources", [])
                 if not sources:
-                    self.console.print(Text("Нет источников", style=GRAY))
+                    self.feedback("Нет источников")
                     continue
                 source_choices = [
                     {
@@ -556,17 +717,27 @@ class HoardCLI:
                 )
 
     def telegram_menu(self) -> None:
-        self.print_section("telegram", "Проверка сессии и безопасный вход через daemon")
+        self.render_page(
+            self.get_status(), "telegram", "Проверка сессии и безопасный вход через daemon"
+        )
         self.connect_telegram()
 
     def show_recent(self) -> None:
         status = self.get_status()
-        self.print_section("загрузки", "Последние сохранённые видеокружки")
+        self.render_page(status, "загрузки", "Последние сохранённые видеокружки")
         items = status.get("downloads", [])[:15]
         if not items:
-            self.console.print(Text("Пока нет сохранённых кружков", style=GRAY))
+            self.print_content(Text("Пока нет сохранённых кружков", style=GRAY))
+            self.select("", [{"name": "Назад", "value": "back"}])
             return
-        table = Table(box=None, show_header=True, padding=(0, 2), pad_edge=False)
+        table = Table(
+            box=None,
+            show_header=True,
+            padding=(0, 1),
+            pad_edge=False,
+            width=self.content_width,
+            expand=False,
+        )
         for label in ("Комментарий", "Автор", "Размер", "Файл"):
             table.add_column(label, style=GRAY)
         for item in items:
@@ -576,13 +747,15 @@ class HoardCLI:
                 fmt_bytes(item.get("size")),
                 Text(str(item.get("file_path") or "").rsplit("/", 1)[-1], style=WHITE),
             )
-        self.console.print(table)
+        self.print_content(table)
+        self.select("", [{"name": "Назад", "value": "back"}])
 
     def show_live(self) -> None:
         """Inline live view; no alt screen; keyboard shortcuts only while viewing."""
         if not sys.stdin.isatty():
-            self.console.print(Text("Для просмотра нужен интерактивный терминал", style=GRAY))
+            self.feedback("Для просмотра нужен интерактивный терминал")
             return
+        self.clear_view()
         if is_windows():
             import msvcrt
 
@@ -622,14 +795,26 @@ class HoardCLI:
                 termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
         try:
-            with Live(progress_view(self.get_status()), console=self.console,
-                      screen=False, auto_refresh=False, transient=True) as live:
+            def view(data: dict) -> Padding:
+                return Padding(
+                    progress_view(data, self.content_width),
+                    (0, self.content_margin),
+                    expand=False,
+                )
+
+            with Live(
+                view(self.get_status()),
+                console=self.console,
+                screen=False,
+                auto_refresh=False,
+                transient=True,
+            ) as live:
                 next_poll = 0.0
                 while True:
                     if time.monotonic() >= next_poll:
                         try:
                             status = self.get_status()
-                            live.update(progress_view(status), refresh=True)
+                            live.update(view(status), refresh=True)
                         except Exception as exc:
                             live.update(
                                 Text(f"Служба недоступна: {exc}", style=ORANGE),
@@ -644,25 +829,26 @@ class HoardCLI:
                         break
                     if char in ("p", "s", "r"):
                         command = {"p": "pause", "s": "stop", "r": "start"}[char]
-                        self.call(command)
+                        self.call(command, display=False)
                         next_poll = 0.0
         finally:
             restore()
 
     def control_menu(self, status: dict) -> None:
+        self.render_page(status, "сборщик", "Запуск, пауза и безопасная остановка")
         state = status.get("collector_state")
         if status.get("running"):
             choices = [
-                {"name": "Приостановить", "value": "pause"},
-                {"name": "Остановить", "value": "stop"},
+                {"name": "Приостановить", "hint": "сохранить очередь", "value": "pause"},
+                {"name": "Остановить", "hint": "завершить сбор", "value": "stop"},
             ]
         elif state == "paused":
             choices = [
-                {"name": "Продолжить", "value": "start"},
-                {"name": "Остановить", "value": "stop"},
+                {"name": "Продолжить", "hint": "возобновить очередь", "value": "start"},
+                {"name": "Остановить", "hint": "завершить сбор", "value": "stop"},
             ]
         else:
-            choices = [{"name": "Запустить", "value": "start"}]
+            choices = [{"name": "Запустить", "hint": "обработать очередь", "value": "start"}]
         choices.append({"name": "Назад", "value": "back"})
         action = self.select("Сборщик", choices)
         if action == "back":
@@ -679,13 +865,16 @@ class HoardCLI:
 
     def catalog_menu(self, status: dict) -> None:
         catalog = Path(str(status.get("catalog") or "")).expanduser()
+        self.render_page(status, "html-каталог", "Один автономный файл для просмотра архива")
         choices = []
         if catalog.is_file():
-            choices.append({"name": "Открыть каталог в браузере", "value": "open"})
+            choices.append(
+                {"name": "Открыть в браузере", "hint": catalog.name, "value": "open"}
+            )
         choices.extend(
             [
-                {"name": "Обновить каталог из SQLite", "value": "rebuild"},
-                {"name": "Показать путь к файлу", "value": "path"},
+                {"name": "Обновить", "hint": "пересобрать из SQLite", "value": "rebuild"},
+                {"name": "Показать путь", "hint": "скопировать вручную", "value": "path"},
                 {"name": "Назад", "value": "back"},
             ]
         )
@@ -695,10 +884,10 @@ class HoardCLI:
         if action == "rebuild":
             result = self.call("telegram_report", timeout=90)
             if result:
-                self.console.print(Text(str(catalog), style=WHITE))
+                self._notice = (f"Каталог обновлён: {catalog}", False)
             return
         if action == "path":
-            self.console.print(Text(str(catalog), style=WHITE))
+            self._notice = (str(catalog), False)
             return
         if action == "open":
             import webbrowser
@@ -706,57 +895,76 @@ class HoardCLI:
             try:
                 opened = webbrowser.open(catalog.resolve().as_uri(), new=2)
             except (OSError, ValueError) as exc:
-                self.console.print(Text(f"Не удалось открыть каталог: {exc}", style=ORANGE))
+                self.feedback(f"Не удалось открыть каталог: {exc}", error=True)
                 return
             if opened:
-                self.console.print(Text("Каталог открыт в браузере.", style=GRAY))
+                self.feedback("Каталог открыт в браузере.")
             else:
-                self.console.print(
-                    Text(f"Браузер не найден. Открой файл вручную: {catalog}", style=ORANGE)
+                self._notice = (
+                    f"Браузер не найден. Открой файл вручную: {catalog}",
+                    True,
                 )
 
     def run(self) -> None:
         try:
             asyncio.run(ensure_daemon())
         except (TimeoutError, RuntimeError, OSError) as exc:
-            self.console.print(Text(f"Не удалось запустить локальную службу: {exc}", style=ORANGE))
+            self.print_content(
+                Text(f"Не удалось запустить локальную службу: {exc}", style=ORANGE)
+            )
             return
         while True:
             try:
                 status = self.get_status()
-                self.console.print()
-                self.print_header(status)
-                control = {
-                    "running": "Управление сборщиком",
-                    "paused": "Продолжить или остановить сборщик",
-                    "stopped": "Запустить сборщик",
+                self.render_page(status, "главная", "Локальный архив Telegram")
+                control_hint = {
+                    "running": "работает — пауза или стоп",
+                    "paused": "приостановлен — продолжить",
+                    "stopped": "остановлен — запустить",
                 }.get(status.get("collector_state"), "Управление сборщиком")
-                telegram = (
-                    "Проверить подключение Telegram"
+                telegram_hint = (
+                    "сессия подключена — проверить"
                     if status.get("telegram") == "authorized"
-                    else "Подключить Telegram"
+                    else "подключить аккаунт"
                 )
                 choices = [
-                    {"name": "Источники и посты     добавить или настроить", "value": "sources"},
                     {
-                        "name": "Загрузки              прогресс и последние файлы",
+                        "name": "Источники",
+                        "hint": "посты и расписание",
+                        "value": "sources",
+                    },
+                    {
+                        "name": "Загрузки",
+                        "hint": "прогресс и последние файлы",
                         "value": "downloads",
                     },
-                    {"name": "HTML-каталог          открыть или обновить", "value": "catalog"},
+                    {
+                        "name": "HTML-каталог",
+                        "hint": "открыть или обновить",
+                        "value": "catalog",
+                    },
                 ]
                 if (status.get("stats") or {}).get("sources", 0):
                     choices.extend([
-                        {"name": "Проверить новые комментарии", "value": "scan"},
-                        {"name": "Дополнить данные из Telegram", "value": "enrich"},
-                        {"name": control, "value": "control"},
+                        {
+                            "name": "Проверить сейчас",
+                            "hint": "новые комментарии",
+                            "value": "scan",
+                        },
+                        {
+                            "name": "Дополнить данные",
+                            "hint": "посты и аватарки",
+                            "value": "enrich",
+                        },
+                        {"name": "Сборщик", "hint": control_hint, "value": "control"},
                     ])
                 choices.extend([
-                    {"name": telegram, "value": "telegram"},
+                    {"name": "Telegram", "hint": telegram_hint, "value": "telegram"},
                     {"name": "Выход", "value": "exit"},
                 ])
-                action = self.select("Выбери действие", choices)
+                action = self.select("Действие", choices)
                 if action == "exit":
-                    self.console.print(
+                    self.print_content(
                         Text(
                             "Интерфейс закрыт. Фоновая служба продолжает работу.",
                             style=DIM,
@@ -766,11 +974,25 @@ class HoardCLI:
                 if action == "sources":
                     self.sources_menu()
                 elif action == "downloads":
-                    sub = self.select("Загрузки", [
-                        {"name": "Живой прогресс", "value": "live"},
-                        {"name": "Последние скачанные кружки", "value": "recent"},
-                        {"name": "Назад", "value": "back"},
-                    ])
+                    self.render_page(
+                        self.get_status(), "загрузки", "Прогресс и последние сохранённые файлы"
+                    )
+                    sub = self.select(
+                        "Загрузки",
+                        [
+                            {
+                                "name": "Живой прогресс",
+                                "hint": "обновляется в реальном времени",
+                                "value": "live",
+                            },
+                            {
+                                "name": "Последние файлы",
+                                "hint": "15 видеокружков",
+                                "value": "recent",
+                            },
+                            {"name": "Назад", "value": "back"},
+                        ],
+                    )
                     if sub == "live":
                         self.show_live()
                     elif sub == "recent":
@@ -794,15 +1016,17 @@ class HoardCLI:
                 elif action == "telegram":
                     self.telegram_menu()
             except (KeyboardInterrupt, EOFError):
-                self.console.print(
+                self.clear_view()
+                self.print_content(
                     Text(
-                        "\nИнтерфейс закрыт. Фоновая служба продолжает работу.",
+                        "Интерфейс закрыт. Фоновая служба продолжает работу.",
                         style=DIM,
                     )
                 )
                 break
             except (ConnectionError, RuntimeError, OSError, ValueError) as exc:
-                self.console.print(Text(f"Ошибка: {exc}", style=ORANGE))
+                self.clear_view()
+                self.print_content(Text(f"Ошибка: {exc}", style=ORANGE))
                 break
 
 

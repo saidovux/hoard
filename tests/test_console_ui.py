@@ -105,6 +105,7 @@ def test_source_wizard_uses_ipc_without_starting_telegram():
 def test_source_wizard_rejects_bad_link():
     prompts = FakePrompts(texts=["https://phishing.example.com/abc/123"])
     app, out = cli(prompts)
+    app.get_status = lambda: {"running": False}
     app.call = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("IPC not expected"))
     app.add_source()
     assert "публичная" in out.getvalue()
@@ -160,6 +161,44 @@ def test_select_supports_hjkl_and_h_returns_to_parent():
 
     interrupted, _ = cli(InterruptedPrompts())
     assert interrupted.select("Menu", choices) == "back"
+
+
+def test_completed_prompt_clears_primary_screen_without_alternate_screen():
+    output = io.StringIO()
+    app = HoardCLI(
+        console=Console(file=output, force_terminal=True, width=120),
+        prompts=FakePrompts(selects=["done"]),
+    )
+
+    assert app.select("Menu", [{"name": "Done", "value": "done"}]) == "done"
+    rendered = output.getvalue()
+    assert "\x1b[2J" in rendered
+    assert "\x1b[?1049h" not in rendered
+
+
+def test_dashboard_uses_wide_space_and_stays_readable_when_narrow():
+    status = {
+        "telegram": "authorized",
+        "running": False,
+        "collector_state": "stopped",
+        "stats": {"sources": 1, "authors": 210, "downloads": 255},
+        "queue": {"queued": 3, "running": 0, "failed": 1},
+    }
+    wide_output = io.StringIO()
+    wide = HoardCLI(console=Console(file=wide_output, color_system=None, width=150))
+    wide.print_header(status)
+    first_line = wide_output.getvalue().splitlines()[0]
+    assert wide.content_width == 112
+    assert first_line.startswith(" " * 19 + "hoard")
+    assert "v0.4.0.2" in first_line
+
+    narrow_output = io.StringIO()
+    narrow = HoardCLI(console=Console(file=narrow_output, color_system=None, width=80))
+    narrow.print_header(status)
+    rendered = narrow_output.getvalue()
+    assert "кружки 255" in rendered
+    assert "очередь 3" in rendered
+    assert "…" not in rendered
 
 
 def test_cancel_stop_does_not_issue_ipc():

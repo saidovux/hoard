@@ -23,6 +23,8 @@ active jobs through `JobRunner`, which returns interrupted jobs to `queued`; the
 available for management. Shutdown closes the runner, Telegram client, database and socket.
 Menu keybindings are defined once for arrow and `h/j/k/l` navigation. Telegram IPC calls render
 an inline elapsed-time status with network/VPN guidance while the daemon owns the actual client.
+Views use a bounded responsive workspace and clear only the primary terminal screen between
+completed prompts; the UI never enters the alternate screen or refreshes while closed.
 
 ## Telegram authorization
 
