@@ -57,23 +57,29 @@ class JobRunner:
             self._active.pop(jid, None)
             self._wakeup.set()
 
+    def _enqueue_due_jobs(self) -> None:
+        # Keep schedulers small and synchronous; all work remains an ordinary job.
+        for source in self.store.due_sources():
+            self.store.enqueue(
+                "telegram.scan",
+                {"source_id": source["id"]},
+                unique_key=f"telegram:{source['id']}",
+            )
+        # Profiles discovered before this version are backfilled from their stable
+        # Telegram IDs. New profiles are also enqueued by the scan; this provides
+        # durable retries without rewinding a source.
+        if "telegram.profile_photos" in self.handlers:
+            for author_id in self.store.telegram.due_profile_photo_ids():
+                self.store.enqueue(
+                    "telegram.profile_photos",
+                    {"author_id": author_id},
+                    unique_key=f"telegram-profile-photos:{author_id}",
+                )
+
     async def _run(self) -> None:
         try:
             while True:
-                # Keep the Telegram scheduler simple; sources become ordinary jobs.
-                for source in self.store.due_sources():
-                    self.store.enqueue("telegram.scan", {"source_id": source["id"]},
-                                       unique_key=f"telegram:{source['id']}")
-                # Profiles discovered before this version are backfilled from their
-                # stable Telegram IDs. New profiles are also enqueued by the scan;
-                # this scheduler provides durable retries without rewinding a source.
-                if "telegram.profile_photos" in self.handlers:
-                    for author_id in self.store.telegram.due_profile_photo_ids():
-                        self.store.enqueue(
-                            "telegram.profile_photos",
-                            {"author_id": author_id},
-                            unique_key=f"telegram-profile-photos:{author_id}",
-                        )
+                self._enqueue_due_jobs()
                 slots = max(0, self.parallel - len(self._active))
                 for job in self.store.queued_jobs(limit=slots):
                     if job["kind"] not in self.handlers:
