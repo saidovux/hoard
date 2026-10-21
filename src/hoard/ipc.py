@@ -9,27 +9,43 @@ import sys
 from .paths import endpoint_path, ensure_private, socket_path, state_dir
 from .platform_support import is_windows, read_endpoint
 
+IPC_MAX_BYTES = 64 * 1024
+
+
+def encode_ipc_message(value: dict) -> bytes:
+    payload = (json.dumps(value, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
+    if len(payload) > IPC_MAX_BYTES:
+        raise ValueError("IPC-сообщение превышает лимит 64 KiB; используй пагинацию или вложение")
+    return payload
+
 
 async def request(method: str, args: dict | None = None, timeout: float = 12) -> dict:
+    payload = {"method": method, "args": args or {}}
     if is_windows():
         port, token = read_endpoint(endpoint_path())
+        payload["token"] = token
+        encoded = encode_ipc_message(payload)
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection("127.0.0.1", port), timeout
         )
     else:
-        token = None
+        encoded = encode_ipc_message(payload)
         reader, writer = await asyncio.wait_for(
             asyncio.open_unix_connection(str(socket_path())), timeout
         )
     try:
-        payload = {"method": method, "args": args or {}}
-        if token is not None:
-            payload["token"] = token
-        writer.write((json.dumps(payload, ensure_ascii=False) + "\n").encode())
+        writer.write(encoded)
         await writer.drain()
-        line = await asyncio.wait_for(reader.readline(), timeout)
+        try:
+            line = await asyncio.wait_for(reader.readline(), timeout)
+        except ValueError as exc:
+            raise RuntimeError(
+                "Ответ службы превышает лимит IPC; запроси меньшую страницу"
+            ) from exc
         if not line:
             raise RuntimeError("Служба Hoard закрыла соединение")
+        if len(line) > IPC_MAX_BYTES:
+            raise RuntimeError("Ответ службы превышает лимит IPC; запроси меньшую страницу")
         result = json.loads(line)
         if not result["ok"]:
             raise RuntimeError(result.get("error", "Ошибка службы"))

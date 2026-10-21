@@ -4,7 +4,7 @@ from __future__ import annotations
 from .config import AIConfig, read_ai_config, write_ai_config
 from .deepseek import DeepSeekProvider
 from .executor import AICore
-from .models import AIImage, AIMessage, AIRequest, AIResponse
+from .models import AIImage, AIMessage, AIRequest, AIResponse, AIUsage
 
 
 def create_default_core(config: AIConfig | None = None) -> AICore:
@@ -24,6 +24,7 @@ __all__ = [
     "AIMessage",
     "AIRequest",
     "AIResponse",
+    "AIUsage",
     "create_default_core",
     "read_ai_config",
     "write_ai_config",

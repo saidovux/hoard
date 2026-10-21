@@ -20,7 +20,7 @@ from .errors import (
     AIRequestError,
     AIResponseError,
 )
-from .models import AIMessage, AIRequest, AIResponse
+from .models import AIMessage, AIRequest, AIResponse, AIUsage
 from .provider import AIProvider
 
 API_URL = "https://api.deepseek.com/chat/completions"
@@ -142,7 +142,27 @@ class DeepSeekProvider(AIProvider):
                 data = {}
             self._raise_http_error(response.status, data)
         data = self._decode(response.body)
-        return self._response(data, fallback_model=str(payload["model"]))
+        try:
+            return self._response(data, fallback_model=str(payload["model"]))
+        except AIResponseError as exc:
+            # Keep billable metadata even when the provider's content envelope is
+            # malformed. Do not retain the raw response or rejected content.
+            try:
+                usage = self._usage(data.get("usage"))
+            except AIResponseError:
+                usage = None
+            choices = data.get("choices")
+            choice = choices[0] if isinstance(choices, list) and choices else {}
+            finish_reason = choice.get("finish_reason") if isinstance(choice, dict) else ""
+            exc.provider_response = AIResponse(
+                provider="deepseek",
+                model=str(data.get("model") or payload["model"]),
+                content="",
+                finish_reason=str(finish_reason or ""),
+                request_id=str(data.get("id") or ""),
+                usage=usage,
+            )
+            raise
 
     def _payload(self, request: AIRequest) -> dict[str, Any]:
         if request.response_format == "json":
@@ -235,4 +255,43 @@ class DeepSeekProvider(AIProvider):
             content=content or "",
             finish_reason=finish_reason,
             request_id=str(request_id) if request_id else "",
+            usage=DeepSeekProvider._usage(data.get("usage")),
+        )
+
+    @staticmethod
+    def _usage(value: Any) -> AIUsage | None:
+        if value is None:
+            return None
+        if not isinstance(value, dict):
+            raise AIResponseError("DeepSeek вернул usage неожиданного формата")
+
+        def counter(container: dict[str, Any], name: str) -> int | None:
+            raw = container.get(name)
+            if raw is None:
+                return None
+            if not isinstance(raw, int) or isinstance(raw, bool) or raw < 0:
+                raise AIResponseError(f"DeepSeek вернул некорректный usage: {name}")
+            return raw
+
+        prompt_details = value.get("prompt_tokens_details")
+        if not isinstance(prompt_details, dict):
+            prompt_details = {}
+        completion_details = value.get("completion_tokens_details")
+        if not isinstance(completion_details, dict):
+            completion_details = {}
+
+        cache_hit = counter(value, "prompt_cache_hit_tokens")
+        if cache_hit is None:
+            cache_hit = counter(prompt_details, "cached_tokens")
+        cache_miss = counter(value, "prompt_cache_miss_tokens")
+        if cache_miss is None:
+            cache_miss = counter(prompt_details, "cache_miss_tokens")
+
+        return AIUsage(
+            prompt_tokens=counter(value, "prompt_tokens"),
+            completion_tokens=counter(value, "completion_tokens"),
+            total_tokens=counter(value, "total_tokens"),
+            prompt_cache_hit_tokens=cache_hit,
+            prompt_cache_miss_tokens=cache_miss,
+            reasoning_tokens=counter(completion_details, "reasoning_tokens"),
         )

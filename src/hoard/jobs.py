@@ -18,6 +18,8 @@ class JobRunner:
         parallel: int = 3,
         retry_interrupted: bool = True,
         name: str = "jobs",
+        include_job_id: bool = False,
+        redact_errors: bool = False,
     ):
         if not 1 <= parallel <= 100:
             raise ValueError("Допустимо 1–100 параллельных задач; по умолчанию 3")
@@ -26,6 +28,8 @@ class JobRunner:
         self.parallel = parallel
         self.retry_interrupted = retry_interrupted
         self.name = name
+        self.include_job_id = include_job_id
+        self.redact_errors = redact_errors
         self._loop: asyncio.Task | None = None
         self._active: dict[int, asyncio.Task] = {}
         self._wakeup = asyncio.Event()
@@ -58,7 +62,11 @@ class JobRunner:
         kind = job["kind"]
         try:
             handler = self.handlers[kind]
-            result = await handler(json.loads(job["payload"]))
+            payload = json.loads(job["payload"])
+            if self.include_job_id:
+                payload = dict(payload)
+                payload["_job_id"] = jid
+            result = await handler(payload)
         except asyncio.CancelledError:
             if self.retry_interrupted:
                 self.store.finish_job(jid, "queued", "Прервано; продолжится после запуска")
@@ -66,7 +74,12 @@ class JobRunner:
                 self.store.finish_job(jid, "failed", "Прервано; нужен явный повтор")
             raise
         except Exception as exc:
-            self.store.finish_job(jid, "failed", f"{type(exc).__name__}: {exc}"[:500])
+            result = (
+                "AI-задание завершилось ошибкой; подробности доступны в журнале попыток"
+                if self.redact_errors
+                else f"{type(exc).__name__}: {exc}"[:500]
+            )
+            self.store.finish_job(jid, "failed", result)
         else:
             self.store.finish_job(jid, "done", result[:500])
         finally:

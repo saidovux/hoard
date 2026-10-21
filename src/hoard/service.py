@@ -11,13 +11,16 @@ import signal
 from functools import partial
 
 from .ai import AICore, AIRequest, create_default_core, read_ai_config
+from .ai.chat_service import AIChatService
 from .ai.config import AIConfig
 from .ai.errors import AIConfigurationError
+from .ai.ipc_api import AIIPC
 from .archive_paths import telegram_catalog_file
 from .catalog import build_catalog_from_db
 from .config import read_credentials, write_credentials
 from .integrations.media import download, validate_media
 from .integrations.rclone import upload, validate_upload
+from .ipc import IPC_MAX_BYTES, encode_ipc_message
 from .jobs import JobRunner
 from .models import parse_post_url
 from .paths import db_path, endpoint_path, ensure_private, socket_path, state_dir
@@ -59,15 +62,19 @@ class Service:
             # The unconfigured provider will report an actionable error only if used.
             ai_config = AIConfig()
         self.ai_core = ai_core or create_default_core(ai_config)
+        self.ai_service = AIChatService(self.store.ai, self.ai_core)
         self.ai_runner = JobRunner(
             self.store,
-            {"ai.request": self._ai_request},
+            {"ai.request": self._ai_request, "ai.chat": self._ai_chat},
             parallel=ai_config.max_parallel,
             # A cancelled or crash-interrupted paid request may already have reached
             # the provider. It must require an explicit retry to avoid duplicate cost.
             retry_interrupted=False,
             name="ai",
+            include_job_id=True,
+            redact_errors=True,
         )
+        self.ai_ipc = AIIPC(self.store.ai, self.ai_service, self.ai_runner)
         self.stop_requested = asyncio.Event()
         self.collector_state = "stopped"
 
@@ -98,22 +105,17 @@ class Service:
         unique_key: str | None = None,
     ) -> int:
         """Queue an explicit AI request for current and future Hoard modules."""
-        jid = self.store.enqueue(
-            "ai.request",
-            {"provider": provider, "request": request.to_dict()},
-            unique_key=unique_key,
-        )
+        payload = {"provider": provider, "request": request.to_dict()}
+        jid = self.store.enqueue("ai.request", payload, unique_key=unique_key)
+        self.ai_service.register_legacy_attempt(jid, payload)
         self.ai_runner.wakeup()
         return jid
 
     async def _ai_request(self, payload: dict) -> str:
-        request = AIRequest.from_dict(payload.get("request", {}))
-        provider = payload.get("provider")
-        response = await self.ai_core.execute(
-            request,
-            provider=str(provider) if provider else None,
-        )
-        return response.content
+        return await self.ai_service.execute_legacy(payload)
+
+    async def _ai_chat(self, payload: dict) -> str:
+        return await self.ai_service.execute_attempt(str(payload.get("attempt_id") or ""))
 
     @staticmethod
     def _scan_error(exc: Exception) -> str:
@@ -240,6 +242,9 @@ class Service:
 
     async def start_background(self) -> None:
         """Start non-Telegram work owned by the single Hoard daemon."""
+        if not self.ai_runner.running:
+            self.ai_service.register_interrupted_legacy_attempts()
+            self.store.ai.recover_interrupted_attempts()
         await self.ai_runner.start()
 
     async def stop_background(self) -> None:
@@ -268,6 +273,8 @@ class Service:
             }
 
     async def handle(self, method: str, args: dict) -> dict:
+        if method.startswith("ai_"):
+            return await self.ai_ipc.handle(method, args)
         if method == "status":
             configured = read_credentials() is not None
             auth_state = self.engine.authorization_step
@@ -400,6 +407,11 @@ class Service:
             self.runner.wakeup()
             return {"message": f"Медиа добавлено в очередь: #{jid}", "job_id": jid}
         if method == "job_retry":
+            job = self.store.db.execute(
+                "SELECT kind FROM jobs WHERE id=?", (int(args["id"]),)
+            ).fetchone()
+            if job is not None and str(job["kind"]).startswith("ai."):
+                raise ValueError("AI-запросы повторяются только через ai_attempt_retry")
             self.store.retry_job(int(args["id"]))
             self.runner.wakeup()
             return {"message": "Задание возвращено в очередь"}
@@ -443,9 +455,12 @@ class Service:
 async def serve_connection(service: Service, reader: asyncio.StreamReader,
                            writer: asyncio.StreamWriter, auth_token: str | None = None):
     try:
-        line = await asyncio.wait_for(reader.readline(), timeout=20)
-        if len(line) > 64 * 1024:
-            raise ValueError("Слишком длинный запрос")
+        try:
+            line = await asyncio.wait_for(reader.readline(), timeout=20)
+        except ValueError as exc:
+            raise ValueError("IPC-запрос превышает лимит 64 KiB") from exc
+        if len(line) > IPC_MAX_BYTES:
+            raise ValueError("IPC-запрос превышает лимит 64 KiB")
         req = json.loads(line)
         if auth_token is not None:
             provided = req.get("token", "") if isinstance(req, dict) else ""
@@ -462,7 +477,13 @@ async def serve_connection(service: Service, reader: asyncio.StreamReader,
             error = str(exc) or "Внутренняя ошибка службы"
         response = {"ok": False, "error": error}
     try:
-        writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode())
+        try:
+            encoded = encode_ipc_message(response)
+        except ValueError:
+            encoded = encode_ipc_message(
+                {"ok": False, "error": "IPC-ответ слишком велик; уменьши limit или размер записи"}
+            )
+        writer.write(encoded)
         await writer.drain()
     finally:
         writer.close()

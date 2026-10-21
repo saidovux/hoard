@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .errors import AIRequestError
+from .errors import AIRequestError, AIResponseError
 
 MAX_IMAGE_BYTES = 32 * 1024 * 1024
 MAX_IMAGES = 600
@@ -179,6 +179,43 @@ class AIRequest:
 
 
 @dataclass(frozen=True)
+class AIUsage:
+    """Provider-reported token counters; missing values stay unknown."""
+
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    total_tokens: int | None = None
+    prompt_cache_hit_tokens: int | None = None
+    prompt_cache_miss_tokens: int | None = None
+    reasoning_tokens: int | None = None
+
+    def __post_init__(self) -> None:
+        for name in (
+            "prompt_tokens",
+            "completion_tokens",
+            "total_tokens",
+            "prompt_cache_hit_tokens",
+            "prompt_cache_miss_tokens",
+            "reasoning_tokens",
+        ):
+            value = getattr(self, name)
+            if value is not None and (
+                not isinstance(value, int) or isinstance(value, bool) or value < 0
+            ):
+                raise AIResponseError(f"Некорректный счётчик usage: {name}")
+
+    def to_dict(self) -> dict[str, int | None]:
+        return {
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": self.completion_tokens,
+            "total_tokens": self.total_tokens,
+            "prompt_cache_hit_tokens": self.prompt_cache_hit_tokens,
+            "prompt_cache_miss_tokens": self.prompt_cache_miss_tokens,
+            "reasoning_tokens": self.reasoning_tokens,
+        }
+
+
+@dataclass(frozen=True)
 class AIResponse:
     provider: str
     model: str
@@ -186,3 +223,4 @@ class AIResponse:
     finish_reason: str
     request_id: str = ""
     structured: Any | None = None
+    usage: AIUsage | None = None

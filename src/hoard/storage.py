@@ -7,6 +7,7 @@ import time
 from collections.abc import Collection
 from pathlib import Path
 
+from .ai.storage import AIStorage
 from .models import Post
 from .paths import ensure_private
 from .telegram_storage import TelegramStorage, utc_now
@@ -20,6 +21,7 @@ class Store:
         # SQLite creates files using the process umask; explicitly restrict data.
         filename.chmod(0o600)
         self.db.row_factory = sqlite3.Row
+        self.db.execute("PRAGMA foreign_keys=ON")
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA busy_timeout=5000")
         self.db.executescript("""
@@ -72,6 +74,7 @@ class Store:
                 self.db.execute(f"ALTER TABLE sources ADD COLUMN {name} {declaration}")
         self.db.commit()
         self.telegram = TelegramStorage(self.db, migrate_legacy=migrate_legacy)
+        self.ai = AIStorage(self.db, data_root=filename.parent)
 
     def close(self) -> None:
         self.db.close()

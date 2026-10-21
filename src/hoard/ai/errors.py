@@ -18,6 +18,9 @@ class AIError(RuntimeError):
         super().__init__(message)
         self.code = code or self.default_code
         self.retryable = self.default_retryable if retryable is None else retryable
+        # A provider response may be billable even when AICore rejects its content.
+        # The response is attached in-memory only so accounting can retain usage.
+        self.provider_response = None
 
 
 class AIConfigurationError(AIError):

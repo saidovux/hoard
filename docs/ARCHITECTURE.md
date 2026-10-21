@@ -20,7 +20,9 @@ background service.
   competing clients.
 - `ai/` is provider-neutral and has no Telegram dependency. It defines requests, responses,
   stable errors, configuration, response validation and the provider contract; `deepseek.py`
-  implements the first provider over outbound HTTPS.
+  implements the first provider over outbound HTTPS. `storage.py`, `chat_service.py`,
+  `pricing.py` and `ipc_api.py` keep AI persistence, orchestration, cost calculation and daemon
+  contracts out of the main service module.
 - `telegram_storage.py` owns Telegram-specific tables and migrations while `storage.py` retains
   the shared source, job and event primitives for future modules.
 - `catalog.py` opens SQLite independently and generates a static browser snapshot without owning a
@@ -87,6 +89,18 @@ idempotently-created tables:
 - `tg_post_metadata` and `tg_post_media` for the parent posts;
 - `tg_settings`, `tg_archive_roots` and `schema_versions` for archive configuration, safe access to
   earlier roots and migrations.
+
+AI storage uses the same daemon-owned connection but a separate additive schema:
+
+- `ai_prompts`, immutable `ai_prompt_versions` and per-scope `ai_active_prompts`;
+- `ai_chats`, ordered `ai_messages` and bounded `ai_attachments` links;
+- `ai_memory` and immutable `ai_memory_versions` selected explicitly per request;
+- `ai_attempts`, `ai_attempt_messages` and `ai_attempt_memory` as frozen execution journals;
+- `ai_prices` as user-owned effective-period tariffs whose rows are snapshotted into attempts.
+
+The AI schema records its own version in `schema_versions`. Deletion is soft where history refers
+to an object, critical queue/context writes are transactional, and no transaction stays open over
+a provider request. New attachment files are mode `0600` under a mode-`0700` data directory.
 
 The migration only adds tables/columns. Its one-time legacy pass reads existing `downloads` and
 safe JSON sidecars inside configured archive roots, backfills profile links and file state, and
@@ -166,14 +180,50 @@ DeepSeek errors are mapped to stable configuration, authentication, balance, rat
 connection, request and provider-availability errors with a `retryable` signal, but round 1 never
 acts on that signal automatically. The key comes from `DEEPSEEK_API_KEY` or the user-only
 `ai.json`; it is excluded from object representations and never enters SQLite job payloads or
-events. Token/cost persistence, prompts, chats, Telegram PSL and browser interaction belong to
-later rounds.
+events. Telegram PSL and browser interaction belong to later rounds.
+
+## AI infrastructure — round 4
+
+`AIChatService` is the single assembly path for persistent conversations. An explicit
+`ai_chat_send` freezes the prompt version, selected memory versions, a contiguous recent-history
+slice and attachment IDs in one short transaction. The order is deterministic: system prompt,
+memory marked as user-selected data, then historical and new chat messages. Stored audit metadata
+names the conservative character limit and records used and omitted history counts; it never
+presents that limit as an exact token count. Required prompt, memory and new-message content is
+rejected with an actionable error rather than silently truncated.
+
+The new job payload is only an attempt ID. At execution, the daemon rebuilds the request from the
+frozen SQLite links, verifies each private attachment's size and digest, and calls the existing
+`AICore`. Legacy `ai.request` payloads remain readable and are journaled without migration.
+Operation keys and a partial unique index allow only one queued/running generation per chat and
+make duplicate IPC delivery idempotent.
+
+Attempts move through `queued`, `running`, `completed`, `failed` or `outcome_unknown`. Provider
+usage is attached in memory to validation errors so prompt, output, cache-hit, cache-miss and
+reasoning counts survive rejected content without storing a raw provider response. Cancellation,
+connection ambiguity and a daemon restart after dispatch become `outcome_unknown`; the AI runner
+does not recover them automatically. Only `ai_attempt_retry` creates a new attempt and paid job.
+Terminal accounting and assistant insertion are idempotent.
+
+`pricing.py` uses `Decimal` and only computes components supported by both actual usage and the
+selected provider/model tariff. Reasoning tokens are descriptive output detail and are not added
+to completion tokens again. Missing splits produce `partial` or `unknown`, never zero. Each result
+stores the applied tariff snapshot and is not recalculated after tariff edits. Statistics are SQL
+aggregates filtered by time, provider, actual/requested model, scope or chat and group estimated
+cost by currency without conversion.
+
+AI CRUD, history, send, retry and statistics operations remain behind the same private IPC
+boundary. Lists are capped and paginated. Requests and responses are encoded before sending and
+must fit 64 KiB; oversized pages return an explicit smaller-page error. Job failures receive only
+a safe generic summary, while the attempt keeps a stable code. Chat content, provider error text,
+images and API keys do not enter events or common job diagnostics.
 
 ## Current scope
 
-The interactive product is the Telegram archive and its static local catalog. Optional
-media/rclone adapters remain dormant code paths and are not presented as user-facing tools. There
-is no browser service, AI user interface, PSL automation, multi-user infrastructure or collection
-beyond source posts, video-note authors and the visible profile photos explicitly requested for
-this module. The AI Core is internal infrastructure in round 1 and does not expand data collection
-on its own.
+The interactive product is the Telegram archive and its static local catalog. The AI backend is
+complete through persistent IPC contracts but remains hidden until the round-five interface and
+explicit Telegram AI workflows are implemented. Optional media/rclone adapters remain dormant
+code paths and are not presented as user-facing tools. There is no browser service, AI user
+interface, PSL automation, multi-user infrastructure or collection beyond source posts,
+video-note authors and the visible profile photos explicitly requested for this module. AI
+infrastructure does not expand Telegram collection on its own.

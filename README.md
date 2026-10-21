@@ -1,4 +1,4 @@
-# Hoard 0.4.0.5
+# Hoard 0.4.0.6
 
 Hoard is a local-first Linux and Windows archive for Telegram posts, profiles and video notes
 found in a channel post's comments. It uses Telethon, SQLite, an autonomous offline HTML catalog
@@ -6,8 +6,8 @@ and terminal interfaces. A private background daemon performs all Telegram work;
 interface does not stop downloads.
 
 This release exposes only the working Telegram archiver in its user interface. It also contains
-the first provider-neutral Hoard AI Core for future modules, without an AI menu or automatic
-profile analysis. The project has no web server, Redis, Docker or Electron.
+the provider-neutral AI Core and durable AI infrastructure for future modules, without an AI menu
+or automatic profile analysis. The project has no web server, Redis, Docker or Electron.
 
 ## Terminal interfaces
 
@@ -176,13 +176,12 @@ and durable retries when a temporary failure becomes due; it does not rewind sou
 Start the collector first if it is stopped. Stories, hidden data and unrelated message history
 are not requested. The offline report remains usable without enrichment.
 
-## Hoard AI Core — round 1
+## Hoard AI infrastructure — rounds 1 and 4
 
-`hoard.ai` is an independent subsystem; it does not import Telegram and does not change Telegram
-tables or archives. DeepSeek is its first provider through a generic provider interface. The
-default model is `deepseek-flash`. The core accepts text and explicitly selected JPEG, PNG, GIF or
-WebP images, and supports both normal responses and JSON Output with local Draft 2020-12 JSON
-Schema validation.
+`hoard.ai` is an independent subsystem; it does not import Telegram or change Telegram archives.
+DeepSeek is its first provider through a generic provider interface. The default model is
+`deepseek-flash`. The core accepts text and explicitly selected JPEG, PNG, GIF or WebP images, and
+supports normal responses and JSON Output with local Draft 2020-12 JSON Schema validation.
 
 Set `DEEPSEEK_API_KEY` for the daemon environment, or store it in the private
 `~/.config/hoard/ai.json` file through `hoard.ai.write_ai_config`. The key is never placed in job
@@ -195,8 +194,47 @@ collector is stopped. Their concurrency limits are separate: `HOARD_MAX_JOBS` fo
 pool and `HOARD_AI_MAX_JOBS` (default `2`) for AI. A long DeepSeek request therefore cannot occupy
 a Telegram worker or Telegram lock.
 
-Round 1 intentionally has no AI TUI/CLI screen, PSL integration, cost accounting, prompt/chat
-library or HTML changes. Provider behavior is covered with mock HTTP tests; the test suite makes no
+Round 4 adds daemon-owned persistence for versioned prompts, chats, messages, explicitly selected
+memory, private image attachments, request attempts, usage and user-configured tariff snapshots.
+It does not add an AI TUI/CLI screen, Telegram AI, PSL or HTML controls yet. Opening or viewing a
+chat never sends a request. Only `ai_chat_send` creates a paid operation, requires an
+`operation_id`, assembles its frozen context from SQLite and queues the existing AI runner.
+
+The daemon records `queued`, `running`, `completed`, `failed` and `outcome_unknown` attempts.
+Duplicate operation IDs resolve to the original attempt, only one generation can run per chat,
+and an interrupted or connection-ambiguous request is never retried automatically. An explicit
+`ai_attempt_retry` creates a new attempt and job. Provider-reported prompt, completion, cache-hit,
+cache-miss and reasoning counters follow the official
+[DeepSeek Chat Completions usage schema](https://api-docs.deepseek.com/api/create-chat-completion/)
+and remain unknown when omitted. Usage returned with an invalid JSON, schema mismatch, empty
+result or incomplete result is retained because the call may have been billable.
+
+Tariffs are local user data selected by provider, actual model and effective period. Values are
+stored and calculated with decimal arithmetic. Hoard ships no assumed tariff, performs no
+currency conversion and labels the result as an estimated cost. Missing usage or tariff
+components produce `partial` or `unknown`, never a fictional zero; completed attempts retain the
+exact tariff snapshot used at the time.
+
+The bounded daemon IPC contracts are ready for the round-five UI and integrations:
+
+```text
+ai_prompt_create/get/list/update/delete/versions/activate
+ai_chat_create/get/list/update/delete/history/send
+ai_memory_create/get/list/update/delete
+ai_attachment_import/get/delete
+ai_price_create/list/delete
+ai_attempt_get/retry  ai_job_state  ai_statistics
+```
+
+Lists and history are paginated, and both IPC directions retain the 64 KiB message limit. New chat
+image jobs store only attachment IDs; the explicitly selected image is copied once into a private
+local directory instead of being duplicated as Base64 in SQLite jobs. Old serialized `ai.request`
+payloads remain supported and now receive accounting records without a payload migration.
+
+Prompts, chosen memory and message history are sent to the configured external provider only after
+the explicit send action. Memory is never inferred from Telegram profiles, never shared between
+unrelated scopes and is presented to the model as user-selected data rather than system
+instructions. Provider behavior and orchestration are covered with fakes; the test suite makes no
 paid DeepSeek requests.
 
 ## Background operation
@@ -244,7 +282,8 @@ The interactive wizard additionally performs the live access check.
 - `~/.config/hoard/config.json` — Telegram API credentials, mode `0600`
 - `~/.config/hoard/ai.json` — optional DeepSeek configuration, mode `0600`
 - `~/.local/share/hoard/telegram.session` — Telethon session
-- `~/.local/share/hoard/hoard.sqlite3` — sources, Telegram metadata, downloads, jobs and events
+- `~/.local/share/hoard/hoard.sqlite3` — Telegram and AI metadata, chats, jobs and events
+- `~/.local/share/hoard/ai_attachments/` — private copies of explicitly imported AI images
 - `~/.local/state/hoard/hoard.sock` — private IPC socket
 - `~/.local/state/hoard/daemon.log` — daemon diagnostics
 

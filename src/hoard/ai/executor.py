@@ -39,17 +39,26 @@ class AICore:
         if not selected.configured:
             raise AIConfigurationError("API-ключ DeepSeek не настроен")
 
-        validator = self._schema_validator(request.json_schema)
+        validator = self.validate(request)
         response = await selected.complete(request)
-        if response.finish_reason != "stop":
-            raise AIIncompleteResponseError(response.finish_reason or "missing")
-        content = response.content.strip()
-        if not content:
-            raise AIResponseError("DeepSeek вернул пустой ответ")
-        response = replace(response, content=content)
-        if request.response_format == "json":
-            response = replace(response, structured=self._parse_json(content, validator))
+        try:
+            if response.finish_reason != "stop":
+                raise AIIncompleteResponseError(response.finish_reason or "missing")
+            content = response.content.strip()
+            if not content:
+                raise AIResponseError("DeepSeek вернул пустой ответ")
+            response = replace(response, content=content)
+            if request.response_format == "json":
+                response = replace(response, structured=self._parse_json(content, validator))
+        except AIResponseError as exc:
+            exc.provider_response = response
+            raise
         return response
+
+    @classmethod
+    def validate(cls, request: AIRequest) -> Draft202012Validator | None:
+        """Validate provider-neutral constraints without making a paid request."""
+        return cls._schema_validator(request.json_schema)
 
     @staticmethod
     def _schema_validator(schema: dict[str, Any] | None) -> Draft202012Validator | None:

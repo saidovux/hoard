@@ -20,8 +20,8 @@ from hoard.ai.errors import (
 from hoard.ai.executor import AICore
 
 
-def api_response(content, *, finish_reason="stop", model="deepseek-flash"):
-    return {
+def api_response(content, *, finish_reason="stop", model="deepseek-flash", usage=None):
+    result = {
         "id": "request-1",
         "model": model,
         "choices": [
@@ -31,6 +31,9 @@ def api_response(content, *, finish_reason="stop", model="deepseek-flash"):
             }
         ],
     }
+    if usage is not None:
+        result["usage"] = usage
+    return result
 
 
 class FakeTransport:
@@ -80,6 +83,7 @@ async def test_deepseek_text_request_uses_current_default_model_once():
     assert response.content == "Готово"
     assert response.model == "deepseek-flash"
     assert response.request_id == "request-1"
+    assert response.usage is None
     assert len(transport.calls) == 1
     call = transport.calls[0]
     assert call["url"] == "https://api.deepseek.com/chat/completions"
@@ -231,6 +235,77 @@ async def test_malformed_json_content_is_not_success():
 
     with pytest.raises(AIJSONError):
         await make_core(transport).execute(request)
+
+
+async def test_deepseek_usage_survives_invalid_content_validation():
+    transport = FakeTransport(
+        (
+            200,
+            api_response(
+                "{",
+                usage={
+                    "prompt_tokens": 30,
+                    "completion_tokens": 7,
+                    "total_tokens": 37,
+                    "prompt_cache_hit_tokens": 10,
+                    "prompt_cache_miss_tokens": 20,
+                    "completion_tokens_details": {"reasoning_tokens": 4},
+                },
+            ),
+        )
+    )
+    request = AIRequest(
+        (AIMessage("user", "Верни JSON"),),
+        response_format="json",
+    )
+
+    with pytest.raises(AIJSONError) as caught:
+        await make_core(transport).execute(request)
+
+    usage = caught.value.provider_response.usage
+    assert usage.prompt_tokens == 30
+    assert usage.completion_tokens == 7
+    assert usage.total_tokens == 37
+    assert usage.prompt_cache_hit_tokens == 10
+    assert usage.prompt_cache_miss_tokens == 20
+    assert usage.reasoning_tokens == 4
+
+
+async def test_deepseek_accepts_documented_nested_cached_token_counter():
+    transport = FakeTransport(
+        (
+            200,
+            api_response(
+                "ok",
+                usage={
+                    "prompt_tokens": 5,
+                    "completion_tokens": 1,
+                    "total_tokens": 6,
+                    "prompt_tokens_details": {"cached_tokens": 3},
+                },
+            ),
+        )
+    )
+
+    result = await make_core(transport).execute(AIRequest((AIMessage("user", "test"),)))
+
+    assert result.usage.prompt_cache_hit_tokens == 3
+    assert result.usage.prompt_cache_miss_tokens is None
+
+
+async def test_deepseek_preserves_usage_when_response_envelope_is_malformed():
+    payload = api_response(
+        "ok",
+        usage={"prompt_tokens": 5, "completion_tokens": 1, "total_tokens": 6},
+    )
+    payload["choices"][0]["message"]["content"] = {"unexpected": True}
+    transport = FakeTransport((200, payload))
+
+    with pytest.raises(AIResponseError) as caught:
+        await make_core(transport).execute(AIRequest((AIMessage("user", "test"),)))
+
+    assert caught.value.provider_response.content == ""
+    assert caught.value.provider_response.usage.total_tokens == 6
 
 
 async def test_external_json_schema_reference_fails_before_request():
