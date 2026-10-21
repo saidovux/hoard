@@ -798,9 +798,14 @@ async def test_collector_controls_confirm_active_interrupt_and_refresh_state():
         app.open_section("telegram")
         await pilot.pause()
         await pilot.click("#collector-pause")
-        assert isinstance(app.screen, ConfirmDialog)
+        await wait_for_condition(
+            pilot,
+            lambda: isinstance(app.screen, ConfirmDialog)
+            and len(app.screen.query("#confirm")) == 1,
+        )
+        dialog = app.screen
         assert "pause_collector" not in [name for name, _ in api.calls]
-        await pilot.click("#confirm")
+        dialog.query_one("#confirm").press()
         await wait_for_condition(
             pilot, lambda: any(name == "pause_collector" for name, _ in api.calls)
         )
@@ -813,8 +818,12 @@ async def test_collector_controls_confirm_active_interrupt_and_refresh_state():
         assert api.result["running"] is True
 
         await pilot.click("#collector-stop")
-        assert isinstance(app.screen, ConfirmDialog)
-        await pilot.click("#confirm")
+        await wait_for_condition(
+            pilot,
+            lambda: isinstance(app.screen, ConfirmDialog)
+            and len(app.screen.query("#confirm")) == 1,
+        )
+        app.screen.query_one("#confirm").press()
         await wait_for_condition(
             pilot, lambda: any(name == "stop_collector" for name, _ in api.calls)
         )
@@ -891,8 +900,12 @@ async def test_archive_views_real_results_and_reports_failures_without_false_suc
         )
 
         await pilot.click("#telegram-enrich")
-        assert isinstance(app.screen, ConfirmDialog)
-        await pilot.click("#confirm")
+        await wait_for_condition(
+            pilot,
+            lambda: isinstance(app.screen, ConfirmDialog)
+            and len(app.screen.query("#confirm")) == 1,
+        )
+        app.screen.query_one("#confirm").press()
         await wait_for_condition(
             pilot, lambda: any(name == "enrich_telegram" for name, _ in api.calls)
         )
