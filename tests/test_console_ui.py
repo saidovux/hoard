@@ -1,8 +1,10 @@
 """UI behavior without a TTY, user account, Telegram, or InquirerPy installation."""
 from __future__ import annotations
 
-import asyncio
 import io
+import subprocess
+import sys
+import textwrap
 import webbrowser
 
 from rich.console import Console
@@ -222,41 +224,56 @@ def test_auth_cancel_is_sent_when_prompt_is_cancelled():
     assert calls == ["auth_begin", "auth_cancel"]
 
 
-async def test_network_wait_shows_elapsed_time_and_vpn_hint(monkeypatch):
-    import hoard.console_ui as module
+def test_network_wait_shows_elapsed_time_and_vpn_hint():
+    # Windows 3.11's Proactor loop can affect the next pytest-asyncio test after
+    # it is closed. Exercise the real synchronous UI boundary in its own process.
+    script = textwrap.dedent(
+        """
+        import asyncio
+        import io
 
-    async def delayed_request(method, args, timeout):
-        await asyncio.sleep(0.25)
-        return {"state": "phone_required"}
+        from rich.console import Console
 
-    updates = []
+        import hoard.console_ui as module
 
-    class Activity:
-        def __init__(self, initial):
-            updates.append(str(initial))
+        async def delayed_request(method, args, timeout):
+            await asyncio.sleep(0.25)
+            return {"state": "phone_required"}
 
-        def __enter__(self):
-            return self
+        updates = []
 
-        def __exit__(self, *args):
-            return False
+        class Activity:
+            def __init__(self, initial):
+                updates.append(str(initial))
 
-        def update(self, value):
-            updates.append(str(value))
+            def __enter__(self):
+                return self
 
-    app, _ = cli()
-    monkeypatch.setattr(module, "request", delayed_request)
-    monkeypatch.setattr(
-        app.console,
-        "status",
-        lambda initial, **kwargs: Activity(initial),
+            def __exit__(self, *args):
+                return False
+
+            def update(self, value):
+                updates.append(str(value))
+
+        app = module.HoardCLI(
+            console=Console(file=io.StringIO(), color_system=None, width=90)
+        )
+        module.request = delayed_request
+        app.console.status = lambda initial, **kwargs: Activity(initial)
+
+        assert app.call("auth_begin") == {"state": "phone_required"}
+        assert any("VPN" in item and "с" in item for item in updates)
+        print("ok")
+        """
     )
-
-    result = await app._api_with_activity_async(
-        "auth_begin", None, 30, "Проверяем подключение к Telegram"
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=10,
     )
-    assert result == {"state": "phone_required"}
-    assert any("VPN" in item and "с" in item for item in updates)
+    assert completed.stdout.strip() == "ok"
 
 
 def test_network_timeout_has_actionable_message(monkeypatch):
