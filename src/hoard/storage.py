@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import time
+from collections.abc import Collection
 from pathlib import Path
 
 from .models import Post
@@ -270,9 +271,26 @@ class Store:
                                   (kind, json.dumps(payload, ensure_ascii=False), unique_key))
             return int(cur.lastrowid)
 
-    def queued_jobs(self, limit: int = 3) -> list[dict]:
-        return [dict(r) for r in self.db.execute(
-            "SELECT * FROM jobs WHERE state='queued' ORDER BY id LIMIT ?", (limit,))]
+    def queued_jobs(
+        self,
+        limit: int = 3,
+        *,
+        kinds: Collection[str] | None = None,
+    ) -> list[dict]:
+        if kinds is None:
+            query = "SELECT * FROM jobs WHERE state='queued' ORDER BY id LIMIT ?"
+            parameters: tuple = (limit,)
+        else:
+            selected = tuple(kinds)
+            if not selected:
+                return []
+            placeholders = ",".join("?" for _ in selected)
+            query = (
+                f"SELECT * FROM jobs WHERE state='queued' AND kind IN ({placeholders}) "
+                "ORDER BY id LIMIT ?"
+            )
+            parameters = (*selected, limit)
+        return [dict(row) for row in self.db.execute(query, parameters)]
 
     def recent_jobs(self, count: int = 80) -> list[dict]:
         return [dict(r) for r in self.db.execute(
@@ -293,10 +311,32 @@ class Store:
             self.db.execute("""UPDATE jobs SET state=?,result=?,updated_at=datetime('now')
                 WHERE id=?""", (state, result[:500], jid))
 
-    def recover_interrupted_jobs(self) -> None:
+    def recover_interrupted_jobs(
+        self,
+        kinds: Collection[str] | None = None,
+        *,
+        retry: bool = True,
+    ) -> None:
+        state = "queued" if retry else "failed"
+        result = (
+            "Восстановлено после остановки"
+            if retry
+            else "Прервано остановкой; нужен явный повтор"
+        )
+        parameters: list = [state, result]
+        clause = ""
+        if kinds is not None:
+            selected = tuple(kinds)
+            if not selected:
+                return
+            placeholders = ",".join("?" for _ in selected)
+            clause = f" AND kind IN ({placeholders})"
+            parameters.extend(selected)
         with self.db:
-            self.db.execute("""UPDATE jobs SET state='queued',result='Восстановлено после остановки'
-                WHERE state='running'""")
+            self.db.execute(
+                f"UPDATE jobs SET state=?,result=? WHERE state='running'{clause}",
+                parameters,
+            )
 
     def retry_job(self, jid: int) -> None:
         with self.db:

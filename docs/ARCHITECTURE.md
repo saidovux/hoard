@@ -9,9 +9,13 @@ background service.
   a `TelegramClient`; every operation goes through IPC.
 - `ipc.py` starts the daemon detached when required and sends one JSON request per private
   Unix-socket connection.
-- `service.py` owns the database, job runner and the sole `TelegramEngine`. An asyncio lock
+- `service.py` owns the database, two independently limited job runners and the sole
+  `TelegramEngine`. An asyncio lock
   serializes login, validation, scans and enrichment so one Telethon session is never opened by
   competing clients.
+- `ai/` is provider-neutral and has no Telegram dependency. It defines requests, responses,
+  stable errors, configuration, response validation and the provider contract; `deepseek.py`
+  implements the first provider over outbound HTTPS.
 - `telegram_storage.py` owns Telegram-specific tables and migrations while `storage.py` retains
   the shared source, job and event primitives for future modules.
 - `catalog.py` opens SQLite independently and generates a static browser snapshot without owning a
@@ -20,7 +24,11 @@ background service.
 
 Closing or cancelling the interface does not signal the service. Collector pause/stop cancels
 active jobs through `JobRunner`, which returns interrupted jobs to `queued`; the daemon stays
-available for management. Shutdown closes the runner, Telegram client, database and socket.
+available for management. The AI runner follows the daemon rather than the collector and uses its
+own concurrency limit. Each runner selects only its registered job kinds, so a long AI request
+cannot take a Telegram slot or acquire the Telegram lock. Interrupted AI jobs become `failed` and
+require an explicit retry because a cancelled paid request may already have reached the provider.
+Shutdown closes both runners, the Telegram client, database and socket.
 Menu keybindings are defined once for arrow and `h/j/k/l` navigation. Telegram IPC calls render
 an inline elapsed-time status with network/VPN guidance while the daemon owns the actual client.
 Views use a bounded responsive workspace and clear only the primary terminal screen between
@@ -105,9 +113,39 @@ only when the total is non-zero and never invents an ETA. Routine Telegram failu
 as actionable messages; exception class details are returned only when local `HOARD_DEBUG=1`
 is explicitly enabled.
 
+## AI Core — round 1
+
+`AIProvider` is the asynchronous boundary for providers. `AICore` selects a provider and performs
+provider-neutral completion checks. DeepSeek uses the OpenAI-compatible
+`POST https://api.deepseek.com/chat/completions` endpoint and defaults to `deepseek-flash`.
+The transport is injectable so text and multimodal behavior can be tested without a network or
+paid request; the production stdlib HTTP call runs in a worker thread and never blocks the daemon
+event loop.
+
+Callers construct `AIRequest` values from messages and, only after an explicit action, `AIImage`
+bytes. Image signatures, per-image size, image count and total encoded request size are checked
+before transmission. Images are accepted only in `user` messages. No filesystem discovery or
+automatic Telegram profile analysis exists in the core.
+
+JSON requests set `response_format={"type":"json_object"}` and must explicitly instruct the model
+to return JSON. A result is successful only when content is non-empty and `finish_reason` is
+`stop`. JSON is parsed and optionally checked with a Draft 2020-12 schema. Invalid schemas fail
+before the paid call; malformed, empty, schema-invalid and truncated provider responses fail after
+one call and are never silently accepted. External schema references are rejected, and model
+output is treated only as data: round 1 sends no tools and executes no generated commands.
+
+DeepSeek errors are mapped to stable configuration, authentication, balance, rate-limit,
+connection, request and provider-availability errors with a `retryable` signal, but round 1 never
+acts on that signal automatically. The key comes from `DEEPSEEK_API_KEY` or the user-only
+`ai.json`; it is excluded from object representations and never enters SQLite job payloads or
+events. Token/cost persistence, prompts, chats, Telegram PSL and browser interaction belong to
+later rounds.
+
 ## Current scope
 
 The interactive product is the Telegram archive and its static local catalog. Optional
 media/rclone adapters remain dormant code paths and are not presented as user-facing tools. There
-is no browser service, AI, web UI, multi-user infrastructure or collection beyond source posts,
-video-note authors and the visible profile photos explicitly requested for this module.
+is no browser service, AI user interface, PSL automation, multi-user infrastructure or collection
+beyond source posts, video-note authors and the visible profile photos explicitly requested for
+this module. The AI Core is internal infrastructure in round 1 and does not expand data collection
+on its own.

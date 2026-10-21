@@ -9,6 +9,7 @@ import webbrowser
 
 from rich.console import Console
 
+from hoard import __version__
 from hoard.console_ui import HoardCLI, fmt_bytes, progress_text, progress_view
 
 
@@ -190,7 +191,7 @@ def test_dashboard_uses_wide_space_and_stays_readable_when_narrow():
     first_line = wide_output.getvalue().splitlines()[0]
     assert wide.content_width == 112
     assert first_line.startswith(" " * 19 + "hoard")
-    assert "v0.4.0.2" in first_line
+    assert f"v{__version__}" in first_line
 
     narrow_output = io.StringIO()
     narrow = HoardCLI(console=Console(file=narrow_output, color_system=None, width=80))

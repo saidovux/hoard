@@ -10,6 +10,9 @@ import shutil
 import signal
 from functools import partial
 
+from .ai import AICore, AIRequest, create_default_core, read_ai_config
+from .ai.config import AIConfig
+from .ai.errors import AIConfigurationError
 from .archive_paths import telegram_catalog_file
 from .catalog import build_catalog_from_db
 from .config import read_credentials, write_credentials
@@ -24,27 +27,57 @@ from .telegram import AuthFlowError, AuthState, TelegramEngine
 
 
 class Service:
-    def __init__(self, store: Store | None = None, engine: TelegramEngine | None = None):
+    def __init__(
+        self,
+        store: Store | None = None,
+        engine: TelegramEngine | None = None,
+        ai_core: AICore | None = None,
+    ):
         self.store = store or Store(db_path())
         self.progress: dict = {}
         self._telegram_lock = asyncio.Lock()
         self._report_lock = asyncio.Lock()
         self.engine = engine or TelegramEngine(self.store, self._progress)
-        self.runner = JobRunner(self.store, {
-            "telegram.scan": self._telegram_scan,
-            "telegram.enrich_source": self._telegram_enrich_source,
-            "telegram.post_media": self._telegram_post_media,
-            "telegram.profile_photos": self._telegram_profile_photos,
-            "telegram.report": self._telegram_report,
-            "cloud.copy": self._cloud_copy,
-            "media.download": self._media_download,
-        }, parallel=int(os.environ.get("HOARD_MAX_JOBS", "3")))
+        self.runner = JobRunner(
+            self.store,
+            {
+                "telegram.scan": self._telegram_scan,
+                "telegram.enrich_source": self._telegram_enrich_source,
+                "telegram.post_media": self._telegram_post_media,
+                "telegram.profile_photos": self._telegram_profile_photos,
+                "telegram.report": self._telegram_report,
+                "cloud.copy": self._cloud_copy,
+                "media.download": self._media_download,
+            },
+            parallel=int(os.environ.get("HOARD_MAX_JOBS", "3")),
+            name="telegram",
+        )
+        try:
+            ai_config = read_ai_config()
+        except AIConfigurationError:
+            # A broken optional AI config must not take down Telegram management.
+            # The unconfigured provider will report an actionable error only if used.
+            ai_config = AIConfig()
+        self.ai_core = ai_core or create_default_core(ai_config)
+        self.ai_runner = JobRunner(
+            self.store,
+            {"ai.request": self._ai_request},
+            parallel=ai_config.max_parallel,
+            # A cancelled or crash-interrupted paid request may already have reached
+            # the provider. It must require an explicit retry to avoid duplicate cost.
+            retry_interrupted=False,
+            name="ai",
+        )
         self.stop_requested = asyncio.Event()
         self.collector_state = "stopped"
 
     @property
     def running(self) -> bool:
         return self.runner.running
+
+    @property
+    def ai_running(self) -> bool:
+        return self.ai_runner.running
 
     def _progress(self, value: dict) -> None:
         self.progress = value
@@ -56,6 +89,31 @@ class Service:
         return self.store.enqueue(
             "telegram.report", {}, unique_key="telegram-report"
         )
+
+    def enqueue_ai(
+        self,
+        request: AIRequest,
+        *,
+        provider: str | None = None,
+        unique_key: str | None = None,
+    ) -> int:
+        """Queue an explicit AI request for current and future Hoard modules."""
+        jid = self.store.enqueue(
+            "ai.request",
+            {"provider": provider, "request": request.to_dict()},
+            unique_key=unique_key,
+        )
+        self.ai_runner.wakeup()
+        return jid
+
+    async def _ai_request(self, payload: dict) -> str:
+        request = AIRequest.from_dict(payload.get("request", {}))
+        provider = payload.get("provider")
+        response = await self.ai_core.execute(
+            request,
+            provider=str(provider) if provider else None,
+        )
+        return response.content
 
     @staticmethod
     def _scan_error(exc: Exception) -> str:
@@ -180,6 +238,13 @@ class Service:
         self.collector_state = "running"
         return "Сборщик продолжил работу" if was_paused else "Сборщик запущен"
 
+    async def start_background(self) -> None:
+        """Start non-Telegram work owned by the single Hoard daemon."""
+        await self.ai_runner.start()
+
+    async def stop_background(self) -> None:
+        await self.ai_runner.stop()
+
     async def stop(self, *, paused: bool = False) -> str:
         await self.runner.stop()
         async with self._telegram_lock:
@@ -228,7 +293,7 @@ class Service:
                     "rclone": shutil.which("rclone") is not None,
                     "yt_dlp": shutil.which("yt-dlp") is not None,
                     "browser": False,
-                    "ai": False,
+                    "ai": self.ai_core.is_configured(),
                 },
             }
         if method == "credentials":
@@ -393,6 +458,7 @@ async def run_daemon():
         token = None
         sock = socket_path()
         try:
+            await service.start_background()
             if is_windows():
                 token = secrets.token_urlsafe(32)
                 server = await asyncio.start_server(
@@ -416,6 +482,7 @@ async def run_daemon():
             if server is not None:
                 server.close()
                 await server.wait_closed()
+            await service.stop_background()
             await service.stop()
             service.store.close()
             if token is not None:

@@ -1,12 +1,13 @@
-# Hoard 0.4.0.2
+# Hoard 0.4.0.3
 
 Hoard is a local-first Linux and Windows archive for Telegram posts, profiles and video notes
 found in a channel post's comments. It uses Telethon, SQLite, an autonomous offline HTML catalog
 and a small inline Rich/InquirerPy interface. A private background daemon performs all Telegram
 work; closing the interface does not stop downloads.
 
-This release exposes only the working Telegram archiver. The project has no web server,
-Redis, Docker, Electron or fullscreen dashboard.
+This release exposes only the working Telegram archiver in its user interface. It also contains
+the first provider-neutral Hoard AI Core for future modules, without an AI menu or automatic
+profile analysis. The project has no web server, Redis, Docker, Electron or fullscreen dashboard.
 
 ## Install on Linux
 
@@ -144,6 +145,29 @@ and durable retries when a temporary failure becomes due; it does not rewind sou
 Start the collector first if it is stopped. Stories, hidden data and unrelated message history
 are not requested. The offline report remains usable without enrichment.
 
+## Hoard AI Core — round 1
+
+`hoard.ai` is an independent subsystem; it does not import Telegram and does not change Telegram
+tables or archives. DeepSeek is its first provider through a generic provider interface. The
+default model is `deepseek-flash`. The core accepts text and explicitly selected JPEG, PNG, GIF or
+WebP images, and supports both normal responses and JSON Output with local Draft 2020-12 JSON
+Schema validation.
+
+Set `DEEPSEEK_API_KEY` for the daemon environment, or store it in the private
+`~/.config/hoard/ai.json` file through `hoard.ai.write_ai_config`. The key is never placed in job
+payloads, responses, HTML or public logs. AI requests have no automatic provider retry: an error,
+truncated response, empty response or interrupted paid job requires an explicit caller decision.
+
+The single Hoard daemon owns two independent job pools. `hoard start`, `stop` and `pause` control
+the Telegram pool; the AI pool follows the daemon lifecycle and keeps working when the Telegram
+collector is stopped. Their concurrency limits are separate: `HOARD_MAX_JOBS` for the existing
+pool and `HOARD_AI_MAX_JOBS` (default `2`) for AI. A long DeepSeek request therefore cannot occupy
+a Telegram worker or Telegram lock.
+
+Round 1 intentionally has no AI TUI/CLI screen, PSL integration, cost accounting, prompt/chat
+library or HTML changes. Provider behavior is covered with mock HTTP tests; the test suite makes no
+paid DeepSeek requests.
+
 ## Background operation
 
 The UI communicates with one user-owned daemon over a mode-`0600` Unix socket on Linux (Windows uses authenticated loopback IPC). Selecting
@@ -181,7 +205,8 @@ The interactive wizard additionally performs the live access check.
 
 ## Local files and privacy
 
-- `~/.config/hoard/config.json` — API credentials, mode `0600`
+- `~/.config/hoard/config.json` — Telegram API credentials, mode `0600`
+- `~/.config/hoard/ai.json` — optional DeepSeek configuration, mode `0600`
 - `~/.local/share/hoard/telegram.session` — Telethon session
 - `~/.local/share/hoard/hoard.sqlite3` — sources, Telegram metadata, downloads, jobs and events
 - `~/.local/state/hoard/hoard.sock` — private IPC socket

@@ -69,3 +69,16 @@ async def test_service_builds_report_while_collector_is_stopped(tmp_path):
     assert (tmp_path / "archive" / "telegram_archive.html").is_file()
     assert service.running is False
     store.close()
+
+
+async def test_invalid_optional_ai_config_does_not_break_telegram(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    monkeypatch.setenv("HOARD_AI_MAX_JOBS", "invalid")
+    store = Store(tmp_path / "db.sqlite")
+    service = Service(store=store, engine=FakeEngine())
+
+    assert "запущен" in (await service.handle("start", {}))["message"].lower()
+    assert (await service.handle("status", {}))["integrations"]["ai"] is False
+
+    await service.handle("stop", {})
+    store.close()

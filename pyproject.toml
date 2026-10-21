@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hoard-local"
-version = "0.4.0.2"
+version = "0.4.0.3"
 description = "Local Telegram archive with an autonomous offline HTML catalog"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -13,6 +13,7 @@ dependencies = [
   "telethon>=1.45,<2",
   "rich>=13.7,<15",
   "InquirerPy>=0.3.4,<0.4",
+  "jsonschema>=4.23,<5",
 ]
 
 [project.optional-dependencies]
