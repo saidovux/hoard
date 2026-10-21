@@ -222,7 +222,7 @@ def test_auth_cancel_is_sent_when_prompt_is_cancelled():
     assert calls == ["auth_begin", "auth_cancel"]
 
 
-def test_network_wait_shows_elapsed_time_and_vpn_hint(monkeypatch):
+async def test_network_wait_shows_elapsed_time_and_vpn_hint(monkeypatch):
     import hoard.console_ui as module
 
     async def delayed_request(method, args, timeout):
@@ -252,7 +252,10 @@ def test_network_wait_shows_elapsed_time_and_vpn_hint(monkeypatch):
         lambda initial, **kwargs: Activity(initial),
     )
 
-    assert app.call("auth_begin") == {"state": "phone_required"}
+    result = await app._api_with_activity_async(
+        "auth_begin", None, 30, "Проверяем подключение к Telegram"
+    )
+    assert result == {"state": "phone_required"}
     assert any("VPN" in item and "с" in item for item in updates)
 
 

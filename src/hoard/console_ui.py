@@ -217,33 +217,33 @@ class HoardCLI:
     def api(method: str, args: dict | None = None, timeout: float = 30) -> dict:
         return asyncio.run(request(method, args, timeout=timeout))
 
+    async def _api_with_activity_async(
+        self, method: str, args: dict | None, timeout: float, activity: str
+    ) -> dict:
+        task = asyncio.create_task(request(method, args, timeout=timeout))
+        started = time.monotonic()
+        hint = "проверь сеть/VPN, если ожидание затянулось · Ctrl+C — отмена"
+        try:
+            with self.console.status(
+                Text(f"{activity} · 0 с · {hint}", style=GRAY),
+                spinner="dots",
+                spinner_style=ORANGE,
+                refresh_per_second=8,
+            ) as status:
+                while not task.done():
+                    elapsed = int(time.monotonic() - started)
+                    status.update(Text(f"{activity} · {elapsed} с · {hint}", style=GRAY))
+                    await asyncio.wait({task}, timeout=0.2)
+            return await task
+        finally:
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
     def api_with_activity(
         self, method: str, args: dict | None, timeout: float, activity: str
     ) -> dict:
-        async def run() -> dict:
-            task = asyncio.create_task(request(method, args, timeout=timeout))
-            started = time.monotonic()
-            hint = "проверь сеть/VPN, если ожидание затянулось · Ctrl+C — отмена"
-            try:
-                with self.console.status(
-                    Text(f"{activity} · 0 с · {hint}", style=GRAY),
-                    spinner="dots",
-                    spinner_style=ORANGE,
-                    refresh_per_second=8,
-                ) as status:
-                    while not task.done():
-                        elapsed = int(time.monotonic() - started)
-                        status.update(
-                            Text(f"{activity} · {elapsed} с · {hint}", style=GRAY)
-                        )
-                        await asyncio.wait({task}, timeout=0.2)
-                return await task
-            finally:
-                if not task.done():
-                    task.cancel()
-                    await asyncio.gather(task, return_exceptions=True)
-
-        return asyncio.run(run())
+        return asyncio.run(self._api_with_activity_async(method, args, timeout, activity))
 
     def call(self, method: str, args: dict | None = None, timeout: float = 30) -> dict | None:
         try:
