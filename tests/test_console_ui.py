@@ -1,7 +1,9 @@
 """UI behavior without a TTY, user account, Telegram, or InquirerPy installation."""
 from __future__ import annotations
 
+import asyncio
 import io
+import webbrowser
 
 from rich.console import Console
 
@@ -130,6 +132,34 @@ def test_exit_menu_does_not_issue_stop(monkeypatch):
     }
 
 
+def test_select_supports_hjkl_and_h_returns_to_parent():
+    prompts = FakePrompts(selects=["second"])
+    app, _ = cli(prompts)
+    choices = [
+        {"name": "First", "value": "first"},
+        {"name": "Second", "value": "second"},
+        {"name": "Back", "value": "back"},
+    ]
+
+    assert app.select("Menu", choices) == "second"
+    menu = prompts.menus[0]
+    assert {binding["key"] for binding in menu["keybindings"]["down"]} >= {"j", "down"}
+    assert {binding["key"] for binding in menu["keybindings"]["up"]} >= {"k", "up"}
+    assert {binding["key"] for binding in menu["keybindings"]["answer"]} >= {"l", "enter"}
+    assert {binding["key"] for binding in menu["keybindings"]["interrupt"]} >= {"h", "c-c"}
+
+    class InterruptedPrompt:
+        def execute(self):
+            raise KeyboardInterrupt
+
+    class InterruptedPrompts(FakePrompts):
+        def select(self, **kwargs):
+            return InterruptedPrompt()
+
+    interrupted, _ = cli(InterruptedPrompts())
+    assert interrupted.select("Menu", choices) == "back"
+
+
 def test_cancel_stop_does_not_issue_ipc():
     prompts = FakePrompts(selects=["stop"], confirms=[False])
     app, _ = cli(prompts)
@@ -192,6 +222,52 @@ def test_auth_cancel_is_sent_when_prompt_is_cancelled():
     assert calls == ["auth_begin", "auth_cancel"]
 
 
+def test_network_wait_shows_elapsed_time_and_vpn_hint(monkeypatch):
+    import hoard.console_ui as module
+
+    async def delayed_request(method, args, timeout):
+        await asyncio.sleep(0.25)
+        return {"state": "phone_required"}
+
+    updates = []
+
+    class Activity:
+        def __init__(self, initial):
+            updates.append(str(initial))
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def update(self, value):
+            updates.append(str(value))
+
+    app, _ = cli()
+    monkeypatch.setattr(module, "request", delayed_request)
+    monkeypatch.setattr(
+        app.console,
+        "status",
+        lambda initial, **kwargs: Activity(initial),
+    )
+
+    assert app.call("auth_begin") == {"state": "phone_required"}
+    assert any("VPN" in item and "с" in item for item in updates)
+
+
+def test_network_timeout_has_actionable_message(monkeypatch):
+    app, output = cli()
+    monkeypatch.setattr(
+        app,
+        "api_with_activity",
+        lambda *args, **kwargs: (_ for _ in ()).throw(TimeoutError()),
+    )
+
+    assert app.call("auth_send_code") is None
+    assert "интернет и VPN" in output.getvalue()
+
+
 def test_control_menu_only_shows_actions_for_current_state():
     prompts = FakePrompts(selects=["back"])
     app, _ = cli(prompts)
@@ -200,6 +276,20 @@ def test_control_menu_only_shows_actions_for_current_state():
         "start",
         "back",
     ]
+
+
+def test_catalog_menu_opens_existing_single_file(tmp_path, monkeypatch):
+    catalog = tmp_path / "telegram_archive.html"
+    catalog.write_text("<!doctype html>", encoding="utf-8")
+    prompts = FakePrompts(selects=["open"])
+    app, output = cli(prompts)
+    opened = []
+    monkeypatch.setattr(webbrowser, "open", lambda url, new=0: opened.append((url, new)) or True)
+
+    app.catalog_menu({"catalog": str(catalog)})
+
+    assert opened == [(catalog.resolve().as_uri(), 2)]
+    assert "открыт" in output.getvalue()
 
 
 def test_main_menu_hides_collector_actions_without_sources(monkeypatch):

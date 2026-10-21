@@ -5,6 +5,9 @@ import os
 from pathlib import Path
 from urllib.parse import quote
 
+CATALOG_FILENAME = "telegram_archive.html"
+OBJECTS_DIRECTORY = "hoard_objects"
+
 
 def default_archive_root() -> Path:
     configured = os.environ.get("HOARD_ARCHIVE_HOME")
@@ -13,8 +16,12 @@ def default_archive_root() -> Path:
     return (Path.home() / "Videos" / "hoard").resolve()
 
 
-def telegram_catalog_dir(archive_root: Path) -> Path:
-    return archive_root.expanduser().resolve() / "telegram"
+def telegram_catalog_file(archive_root: Path) -> Path:
+    return archive_root.expanduser().resolve() / CATALOG_FILENAME
+
+
+def telegram_objects_dir(archive_root: Path) -> Path:
+    return archive_root.expanduser().resolve() / OBJECTS_DIRECTORY
 
 
 def _safe_component(value: str | int) -> str:
@@ -31,8 +38,8 @@ def _safe_component(value: str | int) -> str:
 
 
 def object_path(archive_root: Path, *parts: str | int) -> Path:
-    """Build a path below telegram/objects without accepting path traversal."""
-    objects = telegram_catalog_dir(archive_root) / "objects"
+    """Build a path below hoard_objects without accepting path traversal."""
+    objects = telegram_objects_dir(archive_root)
     candidate = objects.joinpath(*(_safe_component(part) for part in parts))
     resolved_objects = objects.resolve(strict=False)
     resolved_candidate = candidate.resolve(strict=False)

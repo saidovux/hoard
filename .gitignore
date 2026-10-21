@@ -22,6 +22,8 @@ dist/
 /downloads/
 /media/
 /telegram/
+telegram_archive.html
+hoard_objects/
 /logs/
 *.log
 config.json

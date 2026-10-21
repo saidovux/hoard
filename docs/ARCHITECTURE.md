@@ -21,6 +21,8 @@ background service.
 Closing or cancelling the interface does not signal the service. Collector pause/stop cancels
 active jobs through `JobRunner`, which returns interrupted jobs to `queued`; the daemon stays
 available for management. Shutdown closes the runner, Telegram client, database and socket.
+Menu keybindings are defined once for arrow and `h/j/k/l` navigation. Telegram IPC calls render
+an inline elapsed-time status with network/VPN guidance while the daemon owns the actual client.
 
 ## Telegram authorization
 
@@ -69,17 +71,25 @@ cursor back to the earliest affected message. A missing legacy JSON sidecar alon
 a network re-download because SQLite already has the required catalog metadata.
 
 Profile photo enumeration is capped at 30 per check. Saved Telegram photo IDs prevent duplicate
-downloads. Privacy/RPC failures and FloodWait retry times are recorded on the profile and do not
-fail the source scan.
+downloads. The scheduler backfills due profile IDs already in SQLite and retries temporary
+failures without rewinding any source checkpoint. Privacy/RPC failures and FloodWait retry times
+are recorded on the profile and do not fail the source scan.
 
 ## Offline catalog
 
-`<archive>/telegram/index.html` loads local `data.js` before `app.js`, which works under `file://`
-without CORS-sensitive `fetch`. The generator takes a normalized SQLite snapshot, validates media
-paths against configured archive roots, escapes script-sensitive characters, stages all four
-generated files and rolls back replacements on an error. The user-owned `objects/` tree is never
-replaced. A dirty marker coalesces changes so a report is generated after a scan or enrichment
-operation rather than after every message.
+`<archive>/telegram_archive.html` is the only generated site file. The repository and wheel keep
+HTML, CSS and JavaScript as three maintainable source resources; `catalog.py` embeds both assets
+and the normalized SQLite snapshot into one HTML document at build time. This works under
+`file://` without CORS-sensitive `fetch`. The generator validates media paths against configured
+archive roots, escapes script-sensitive characters, writes one adjacent temporary file and
+atomically replaces the report only after a complete successful build. The user-owned
+`hoard_objects/` tree is never replaced. A dirty marker coalesces changes so a report is generated
+after a scan or enrichment operation rather than after every message.
+
+The report builder retires the short-lived split layout by moving
+`<archive>/telegram/objects/` into `hoard_objects/` and rewriting only matching media paths in
+SQLite. It never overwrites a conflicting file. Older user archive layouts elsewhere stay in
+place and remain available through validated paths.
 
 The browser uses DOM construction and `textContent`, never HTML interpolation. Original links are
 restricted to HTTPS `t.me`; local media URLs accept only relative or `file:` references produced by

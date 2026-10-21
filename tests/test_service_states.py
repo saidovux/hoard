@@ -66,6 +66,6 @@ async def test_service_builds_report_while_collector_is_stopped(tmp_path):
     result = await service.handle("telegram_report", {})
 
     assert "HTML-каталог обновлён" in result["message"]
-    assert (tmp_path / "archive" / "telegram" / "index.html").is_file()
+    assert (tmp_path / "archive" / "telegram_archive.html").is_file()
     assert service.running is False
     store.close()

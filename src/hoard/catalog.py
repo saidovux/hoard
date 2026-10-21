@@ -3,19 +3,27 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import tempfile
+from contextlib import suppress
 from datetime import UTC, datetime
+from filecmp import cmp
 from importlib import resources
 from pathlib import Path
 from typing import Any
 
-from .archive_paths import media_reference, telegram_catalog_dir
+from .archive_paths import (
+    media_reference,
+    path_is_within,
+    telegram_catalog_file,
+    telegram_objects_dir,
+)
 from .paths import ensure_private
 from .storage import Store
 
 CATALOG_SCHEMA_VERSION = 1
-TEMPLATE_FILES = ("index.html", "style.css", "app.js")
+STYLE_TOKEN = "/*__HOARD_STYLE__*/"
+DATA_TOKEN = "/*__HOARD_DATA__*/"
+APP_TOKEN = "/*__HOARD_APP__*/"
 
 
 def _text(value: object) -> str:
@@ -122,7 +130,7 @@ def _media_item(
 
 def build_payload(store: Store, archive_root: Path) -> dict[str, Any]:
     rows = store.telegram.catalog_rows()
-    catalog_dir = telegram_catalog_dir(archive_root)
+    catalog_dir = archive_root.expanduser().resolve()
     allowed_roots = store.telegram.allowed_media_roots(archive_root)
     metadata = {int(row["source_id"]): row for row in rows["post_metadata"]}
     post_media: dict[int, list[dict[str, Any]]] = {}
@@ -268,11 +276,107 @@ def _serialize_data(payload: dict[str, Any]) -> str:
     return f"window.HOARD_CATALOG={data};\n"
 
 
-def _template_bytes(name: str, template_dir: Path | None) -> bytes:
+def _template_text(name: str, template_dir: Path | None) -> str:
     if template_dir is not None:
-        return (template_dir / name).read_bytes()
+        return (template_dir / name).read_text(encoding="utf-8")
     package = resources.files("hoard.templates.telegram")
-    return package.joinpath(name).read_bytes()
+    return package.joinpath(name).read_text(encoding="utf-8")
+
+
+def _bundle_html(
+    index: str,
+    *,
+    style: str,
+    data: str,
+    app: str,
+) -> str:
+    components = {
+        "HTML": index,
+        "CSS": style,
+        "JavaScript": app,
+    }
+    for label, content in components.items():
+        if not content.strip():
+            raise ValueError(f"Пустой компонент шаблона: {label}")
+    for token in (STYLE_TOKEN, DATA_TOKEN, APP_TOKEN):
+        if index.count(token) != 1:
+            raise ValueError(f"В HTML-шаблоне нужен ровно один маркер {token}")
+    if "</style" in style.casefold():
+        raise ValueError("CSS-шаблон содержит закрывающий HTML-тег")
+    if "</script" in app.casefold():
+        raise ValueError("JavaScript-шаблон содержит закрывающий HTML-тег")
+    return (
+        index.replace(STYLE_TOKEN, style, 1)
+        .replace(DATA_TOKEN, data, 1)
+        .replace(APP_TOKEN, app, 1)
+    )
+
+
+def _rewrite_obsolete_object_paths(
+    store: Store, legacy_objects: Path, current_objects: Path
+) -> None:
+    changed = False
+    with store.db:
+        for table in ("downloads", "tg_profile_photos", "tg_post_media"):
+            rows = list(store.db.execute(f"SELECT rowid,file_path FROM {table}"))
+            for row in rows:
+                try:
+                    source = Path(str(row["file_path"])).expanduser().resolve(strict=False)
+                    relative = source.relative_to(legacy_objects.resolve(strict=False))
+                except (OSError, RuntimeError, ValueError):
+                    continue
+                destination = current_objects.joinpath(relative).resolve(strict=False)
+                if destination.is_file() and path_is_within(destination, current_objects):
+                    store.db.execute(
+                        f"UPDATE {table} SET file_path=? WHERE rowid=?",
+                        (str(destination), int(row["rowid"])),
+                    )
+                    changed = True
+    if changed:
+        store.telegram.set_catalog_dirty()
+
+
+def _migrate_obsolete_split_catalog(store: Store, archive_root: Path) -> None:
+    """Retire the short-lived split catalog without losing its media objects."""
+    legacy = archive_root / "telegram"
+    if not legacy.is_dir():
+        return
+    legacy_objects = legacy / "objects"
+    current_objects = telegram_objects_dir(archive_root)
+    if legacy_objects.is_dir() and not legacy_objects.is_symlink():
+        for source in sorted(item for item in legacy_objects.rglob("*") if item.is_file()):
+            if source.is_symlink() or not path_is_within(source, legacy_objects):
+                continue
+            relative = source.relative_to(legacy_objects)
+            destination = current_objects / relative
+            if not path_is_within(destination, current_objects):
+                continue
+            ensure_private(destination.parent)
+            if destination.exists() or destination.is_symlink():
+                if (
+                    destination.is_file()
+                    and not destination.is_symlink()
+                    and cmp(source, destination, shallow=False)
+                ):
+                    source.unlink()
+                continue
+            os.replace(source, destination)
+        _rewrite_obsolete_object_paths(store, legacy_objects, current_objects)
+    for name in ("index.html", "style.css", "app.js", "data.js"):
+        with suppress(OSError):
+            (legacy / name).unlink(missing_ok=True)
+    # Conflicting or unexpected files are deliberately preserved. In the normal
+    # generated layout every directory is empty here and disappears.
+    with suppress(OSError):
+        directories = sorted(
+            (item for item in legacy.rglob("*") if item.is_dir()),
+            key=lambda item: len(item.parts),
+            reverse=True,
+        )
+        for directory in directories:
+            with suppress(OSError):
+                directory.rmdir()
+        legacy.rmdir()
 
 
 def build_catalog(
@@ -282,56 +386,42 @@ def build_catalog(
     template_dir: Path | None = None,
 ) -> Path:
     root = store.telegram.archive_root(archive_root, persist=archive_root is not None)
-    target = telegram_catalog_dir(root)
-    ensure_private(target)
-    ensure_private(target / "objects")
-    stage = Path(tempfile.mkdtemp(prefix=".catalog-build-", dir=target))
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    target = telegram_catalog_file(root)
+    ensure_private(telegram_objects_dir(root))
+    temporary: Path | None = None
     try:
-        for name in TEMPLATE_FILES:
-            content = _template_bytes(name, template_dir)
-            if not content:
-                raise ValueError(f"Пустой файл шаблона: {name}")
-            (stage / name).write_bytes(content)
+        index = _template_text("index.html", template_dir)
+        style = _template_text("style.css", template_dir)
+        app = _template_text("app.js", template_dir)
+        _migrate_obsolete_split_catalog(store, root)
         store.telegram.set_catalog_dirty(False)
         payload = build_payload(store, root)
-        data_file = stage / "data.js"
-        with data_file.open("w", encoding="utf-8", newline="\n") as stream:
-            stream.write(_serialize_data(payload))
+        content = _bundle_html(
+            index,
+            style=style,
+            data=_serialize_data(payload),
+            app=app,
+        )
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=".telegram_archive-", suffix=".tmp", dir=root
+        )
+        temporary = Path(temporary_name)
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
+            stream.write(content)
             stream.flush()
             os.fsync(stream.fileno())
-        names = (*TEMPLATE_FILES, "data.js")
-        previous: dict[str, Path | None] = {}
-        for name in names:
-            destination = target / name
-            if destination.is_file():
-                backup = stage / f"previous-{name}"
-                shutil.copyfile(destination, backup)
-                previous[name] = backup
-            else:
-                previous[name] = None
-        replaced: list[str] = []
-        try:
-            for name in names:
-                destination = target / name
-                os.replace(stage / name, destination)
-                replaced.append(name)
-                if os.name != "nt":
-                    destination.chmod(0o600)
-        except BaseException:
-            for name in reversed(replaced):
-                destination = target / name
-                backup = previous[name]
-                if backup is None:
-                    destination.unlink(missing_ok=True)
-                elif backup.exists():
-                    os.replace(backup, destination)
-            raise
+        os.replace(temporary, target)
+        temporary = None
+        if os.name != "nt":
+            target.chmod(0o600)
     except BaseException:
         store.telegram.set_catalog_dirty()
         raise
     finally:
-        shutil.rmtree(stage, ignore_errors=True)
-    return target / "index.html"
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+    return target
 
 
 def build_catalog_from_db(

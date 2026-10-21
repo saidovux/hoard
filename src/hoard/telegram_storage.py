@@ -491,6 +491,17 @@ class TelegramStorage:
     def profile_ids(self) -> list[int]:
         return [int(row[0]) for row in self.db.execute("SELECT author_id FROM tg_profiles")]
 
+    def due_profile_photo_ids(self, limit: int = 100) -> list[int]:
+        """Return profiles whose visible photos need an initial check or retry."""
+        return [
+            int(row["author_id"])
+            for row in self.db.execute(
+                """SELECT author_id FROM tg_profiles
+                WHERE photos_retry_at<=? ORDER BY photos_retry_at,author_id LIMIT ?""",
+                (time.time(), max(1, int(limit))),
+            )
+        ]
+
     def profile_photo_due(self, author_id: int) -> bool:
         row = self.db.execute(
             "SELECT photos_retry_at FROM tg_profiles WHERE author_id=?", (int(author_id),)

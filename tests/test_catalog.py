@@ -9,6 +9,9 @@ import pytest
 
 from hoard.archive_paths import media_reference, object_path, video_note_path
 from hoard.catalog import (
+    APP_TOKEN,
+    DATA_TOKEN,
+    STYLE_TOKEN,
     build_catalog,
     build_payload,
     search_posts,
@@ -24,8 +27,8 @@ from hoard.storage import Store
 def payload_from(file: Path) -> dict:
     text = file.read_text(encoding="utf-8")
     prefix = "window.HOARD_CATALOG="
-    assert text.startswith(prefix) and text.endswith(";\n")
-    return json.loads(text[len(prefix):-2])
+    start = text.index(prefix) + len(prefix)
+    return json.JSONDecoder().raw_decode(text[start:])[0]
 
 
 def video_record(source_id: int, message_id: int, path: Path, author_id: int = 101) -> dict:
@@ -49,16 +52,19 @@ def test_new_archive_builds_autonomous_catalog_without_network(tmp_path):
 
     report = build_catalog(store)
 
-    assert report == root / "telegram" / "index.html"
-    assert {item.name for item in report.parent.iterdir()} >= {
-        "index.html", "style.css", "app.js", "data.js", "objects"
+    assert report == root / "telegram_archive.html"
+    assert {item.name for item in root.iterdir()} == {
+        "telegram_archive.html", "hoard_objects"
     }
-    data = payload_from(report.parent / "data.js")
+    data = payload_from(report)
     assert data["posts"][0]["channel_title"] == "Channel X"
     assert data["profiles"] == []
     html = report.read_text(encoding="utf-8")
-    assert '<script src="data.js"></script>' in html
-    assert "https://" not in html
+    assert '<style data-hoard-bundle="style">' in html
+    assert '<script data-hoard-bundle="data">' in html
+    assert '<script data-hoard-bundle="app">' in html
+    assert "<script src=" not in html
+    assert "<link rel=\"stylesheet\"" not in html
     store.close()
 
 
@@ -128,7 +134,7 @@ def test_legacy_sqlite_mp4_and_json_migrate_idempotently(tmp_path):
     assert second.sources()[0]["last_id"] == 22
     assert media.read_bytes() == b"old-video"
     assert sidecar.is_file()
-    data = payload_from(report.parent / "data.js")
+    data = payload_from(report)
     assert data["videos"][0]["available"] is True
     assert data["profiles"][0]["username"] == "legacy_user"
     second.close()
@@ -233,15 +239,15 @@ def test_missing_files_unavailable_photos_and_malicious_paths_are_safe(tmp_path)
     )
 
     report = build_catalog(store)
-    raw = (report.parent / "data.js").read_text(encoding="utf-8")
-    data = payload_from(report.parent / "data.js")
-    assert "<script>" not in raw and "<img" not in raw
+    raw = report.read_text(encoding="utf-8")
+    data = payload_from(report)
+    assert "<img src=x onerror=alert(1)>" not in raw
+    assert "</script><script>" not in raw
     assert data["videos"][0]["available"] is False
     assert data["profiles"][0]["photos"][0]["valid_path"] is False
     assert data["profiles"][0]["photos"][0]["url"] == ""
-    app = (report.parent / "app.js").read_text(encoding="utf-8")
-    assert ".innerHTML" not in app
-    assert "fetch(" not in app
+    assert ".innerHTML" not in raw
+    assert "fetch(" not in raw
     store.close()
 
 
@@ -249,23 +255,75 @@ def test_template_refresh_preserves_objects_and_rolls_back_on_error(tmp_path):
     store = Store(tmp_path / "db.sqlite")
     root = tmp_path / "archive"
     store.add_source(Post("channelx", 7), str(root))
+    legacy = root / "telegram"
+    (legacy / "objects").mkdir(parents=True)
+    for name in ("index.html", "style.css", "app.js", "data.js"):
+        (legacy / name).write_text("obsolete", encoding="utf-8")
     report = build_catalog(store)
-    kept = report.parent / "objects" / "keep.bin"
+    assert not legacy.exists()
+    kept = root / "hoard_objects" / "keep.bin"
     kept.write_bytes(b"keep")
     template = tmp_path / "template"
     template.mkdir()
-    (template / "index.html").write_text("new index", encoding="utf-8")
+    custom_index = (
+        f"<!doctype html><style>{STYLE_TOKEN}</style>"
+        f"<script>{DATA_TOKEN}</script><script>{APP_TOKEN}</script>"
+    )
+    (template / "index.html").write_text(custom_index, encoding="utf-8")
     (template / "style.css").write_text("new style", encoding="utf-8")
     (template / "app.js").write_text("new app", encoding="utf-8")
     build_catalog(store, template_dir=template)
-    assert report.read_text(encoding="utf-8") == "new index"
+    before_error = report.read_text(encoding="utf-8")
+    assert "new style" in before_error
+    assert "new app" in before_error
+    assert "window.HOARD_CATALOG=" in before_error
     assert kept.read_bytes() == b"keep"
 
     (template / "style.css").write_text("", encoding="utf-8")
     with pytest.raises(ValueError):
         build_catalog(store, template_dir=template)
-    assert report.read_text(encoding="utf-8") == "new index"
+    assert report.read_text(encoding="utf-8") == before_error
     assert kept.read_bytes() == b"keep"
+    store.close()
+
+
+def test_split_catalog_objects_move_out_of_telegram_and_keep_database_links(tmp_path):
+    store = Store(tmp_path / "db.sqlite")
+    root = tmp_path / "archive"
+    source_id = store.add_source(Post("channelx", 7), str(root))
+    old_video = (
+        root
+        / "telegram"
+        / "objects"
+        / "video_notes"
+        / f"source_{source_id}"
+        / "author_101"
+        / "message_22.mp4"
+    )
+    old_video.parent.mkdir(parents=True)
+    old_video.write_bytes(b"video")
+    old_video.with_suffix(".json").write_text("{}", encoding="utf-8")
+    store.checkpoint(source_id, 22, video_record(source_id, 22, old_video))
+
+    report = build_catalog(store)
+
+    new_video = (
+        root
+        / "hoard_objects"
+        / "video_notes"
+        / f"source_{source_id}"
+        / "author_101"
+        / "message_22.mp4"
+    )
+    assert report == root / "telegram_archive.html"
+    assert new_video.read_bytes() == b"video"
+    assert new_video.with_suffix(".json").read_text(encoding="utf-8") == "{}"
+    assert not (root / "telegram").exists()
+    assert store.db.execute(
+        "SELECT file_path FROM downloads WHERE source_id=? AND message_id=22",
+        (source_id,),
+    ).fetchone()[0] == str(new_video.resolve())
+    assert payload_from(report)["videos"][0]["url"].startswith("hoard_objects/")
     store.close()
 
 
@@ -280,7 +338,7 @@ def test_report_command_runs_without_daemon(tmp_path, monkeypatch, capsys):
 
     main()
 
-    assert (archive / "telegram" / "index.html").is_file()
+    assert (archive / "telegram_archive.html").is_file()
     assert "HTML-каталог обновлён" in capsys.readouterr().out
 
 
@@ -289,7 +347,7 @@ def test_object_paths_reject_traversal_and_media_reference_falls_back_to_uri(
 ):
     with pytest.raises(ValueError):
         object_path(tmp_path, "..", "escape")
-    local = tmp_path / "archive" / "telegram" / "objects" / "clip.mp4"
+    local = tmp_path / "archive" / "hoard_objects" / "clip.mp4"
     local.parent.mkdir(parents=True)
     local.write_bytes(b"x")
     monkeypatch.setattr(
@@ -297,7 +355,7 @@ def test_object_paths_reject_traversal_and_media_reference_falls_back_to_uri(
         lambda *_: (_ for _ in ()).throw(ValueError()),
     )
     reference = media_reference(
-        str(local), catalog_dir=tmp_path / "archive" / "telegram",
+        str(local), catalog_dir=tmp_path / "archive",
         allowed_roots=[tmp_path / "archive"], expected_size=1,
     )
     assert reference["url"].startswith("file:")

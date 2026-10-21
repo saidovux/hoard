@@ -10,7 +10,7 @@ import shutil
 import signal
 from functools import partial
 
-from .archive_paths import telegram_catalog_dir
+from .archive_paths import telegram_catalog_file
 from .catalog import build_catalog_from_db
 from .config import read_credentials, write_credentials
 from .integrations.media import download, validate_media
@@ -222,7 +222,7 @@ class Service:
                 "jobs": self.store.recent_jobs(),
                 "events": self.store.recent_events(),
                 "archive_root": str(archive_root),
-                "catalog": str(telegram_catalog_dir(archive_root) / "index.html"),
+                "catalog": str(telegram_catalog_file(archive_root)),
                 "integrations": {
                     "telegram": True,
                     "rclone": shutil.which("rclone") is not None,

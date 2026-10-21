@@ -71,6 +71,35 @@ async def test_deduplicates_same_source_while_queued(tmp_path):
     store.close()
 
 
+async def test_existing_profiles_get_photo_jobs_without_rescanning_sources(tmp_path):
+    store = Store(tmp_path / "test.sqlite3")
+    store.telegram.observe_profile(
+        author_id=101,
+        username="example",
+        display_name="Example User",
+        observed_at="2026-01-01T00:00:00+00:00",
+    )
+    calls = []
+
+    async def photos(payload):
+        calls.append(payload["author_id"])
+        store.telegram.finish_profile_photo_check(payload["author_id"])
+        return "ok"
+
+    runner = JobRunner(store, {"telegram.profile_photos": photos})
+    await runner.start()
+    await wait_for(lambda: calls == [101])
+    await runner.stop()
+
+    assert store.db.execute(
+        "SELECT COUNT(*) FROM jobs WHERE kind='telegram.scan'"
+    ).fetchone()[0] == 0
+    assert store.db.execute(
+        "SELECT COUNT(*) FROM jobs WHERE kind='telegram.profile_photos'"
+    ).fetchone()[0] == 1
+    store.close()
+
+
 async def test_failed_job_requires_explicit_retry(tmp_path):
     store = Store(tmp_path / "test.sqlite3")
     async def bad(_):

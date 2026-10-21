@@ -29,6 +29,21 @@ GRAY = "#929292"
 DIM = "#777777"
 SEPARATOR = "#292929"
 
+SELECT_KEYBINDINGS = {
+    "down": [{"key": "down"}, {"key": "c-n"}, {"key": "j"}],
+    "up": [{"key": "up"}, {"key": "c-p"}, {"key": "k"}],
+    "answer": [{"key": "enter"}, {"key": "l"}],
+    "interrupt": [{"key": "c-c"}, {"key": "c-d"}, {"key": "h"}],
+}
+
+NETWORK_ACTIVITIES = {
+    "auth_begin": "Проверяю сохранённую Telegram-сессию",
+    "auth_send_code": "Подключаюсь к Telegram и запрашиваю код",
+    "auth_submit_code": "Проверяю код Telegram",
+    "auth_submit_password": "Проверяю пароль двухэтапной защиты",
+    "source_validate": "Проверяю доступ к Telegram-посту",
+}
+
 
 def fmt_bytes(num: int | float | None) -> str:
     if num is None:
@@ -112,11 +127,11 @@ def progress_view(status: dict) -> Group:
         Text(""),
     ])
     if status.get("running"):
-        pieces.append(Text("q — назад   p — пауза   s — остановить", style=DIM))
+        pieces.append(Text("h/q — назад   p — пауза   s — остановить", style=DIM))
     elif status.get("collector_state") == "paused":
-        pieces.append(Text("q — назад   r — продолжить   s — остановить", style=DIM))
+        pieces.append(Text("h/q — назад   r — продолжить   s — остановить", style=DIM))
     else:
-        pieces.append(Text("q — назад   r — запустить", style=DIM))
+        pieces.append(Text("h/q — назад   r — запустить", style=DIM))
     error = next(
         (item.get("text", "") for item in status.get("events", []) if item.get("kind") == "error"),
         "",
@@ -157,12 +172,26 @@ class HoardCLI:
 
     def select(self, message: str, choices: list[dict[str, str]]) -> str:
         prompts = self._ensure_prompts()
-        return prompts.select(
-            message=message, choices=choices, style=self._style,
-            pointer="❯", qmark="", amark="", border=False,
-            instruction="(↑↓ выбор · Enter продолжить)",
-            cycle=False,
-        ).execute()
+        try:
+            return prompts.select(
+                message=message,
+                choices=choices,
+                style=self._style,
+                pointer="❯",
+                qmark="",
+                amark="",
+                border=False,
+                instruction="(j/k или ↑/↓ · l/Enter выбрать · h назад)",
+                keybindings=SELECT_KEYBINDINGS,
+                cycle=False,
+            ).execute()
+        except KeyboardInterrupt:
+            values = {str(choice.get("value", "")) for choice in choices}
+            if "back" in values:
+                return "back"
+            if "exit" in values:
+                return "exit"
+            raise
 
     def text(self, message: str, default: str = "") -> str:
         return str(self._ensure_prompts().text(
@@ -188,11 +217,50 @@ class HoardCLI:
     def api(method: str, args: dict | None = None, timeout: float = 30) -> dict:
         return asyncio.run(request(method, args, timeout=timeout))
 
+    def api_with_activity(
+        self, method: str, args: dict | None, timeout: float, activity: str
+    ) -> dict:
+        async def run() -> dict:
+            task = asyncio.create_task(request(method, args, timeout=timeout))
+            started = time.monotonic()
+            hint = "проверь сеть/VPN, если ожидание затянулось · Ctrl+C — отмена"
+            try:
+                with self.console.status(
+                    Text(f"{activity} · 0 с · {hint}", style=GRAY),
+                    spinner="dots",
+                    spinner_style=ORANGE,
+                    refresh_per_second=8,
+                ) as status:
+                    while not task.done():
+                        elapsed = int(time.monotonic() - started)
+                        status.update(
+                            Text(f"{activity} · {elapsed} с · {hint}", style=GRAY)
+                        )
+                        await asyncio.wait({task}, timeout=0.2)
+                return await task
+            finally:
+                if not task.done():
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+
+        return asyncio.run(run())
+
     def call(self, method: str, args: dict | None = None, timeout: float = 30) -> dict | None:
         try:
-            result = self.api(method, args, timeout=timeout)
+            activity = NETWORK_ACTIVITIES.get(method)
+            result = (
+                self.api_with_activity(method, args, timeout, activity)
+                if activity
+                else self.api(method, args, timeout=timeout)
+            )
         except Exception as exc:
-            message = str(exc)
+            if isinstance(exc, TimeoutError) and method in NETWORK_ACTIVITIES:
+                message = (
+                    "Telegram не ответил вовремя. Проверь интернет и VPN, "
+                    "затем повтори действие."
+                )
+            else:
+                message = str(exc) or "Операция не завершилась"
             for prefix in ("RuntimeError: ", "ValueError: ", "OSError: "):
                 if message.startswith(prefix):
                     message = message[len(prefix):]
@@ -210,7 +278,7 @@ class HoardCLI:
     def print_header(self, status: dict) -> None:
         self.console.print(
             Text("hoard.", style=f"bold {ORANGE}"),
-            Text(" v0.4.0", style=DIM),
+            Text(" v0.4.0.1", style=DIM),
             sep="",
         )
         stats = status.get("stats") or {}
@@ -223,12 +291,32 @@ class HoardCLI:
             "disconnected": "сессия не проверена",
         }
         telegram = auth_labels.get(status.get("telegram"), "сессия не проверена")
-        self.console.print(Text(
-            f"Telegram: {telegram}  ·  Сборщик: {collector_label(status)}  ·  "
-            f"Источники: {stats.get('sources', 0)}  ·  Кружки: {stats.get('downloads', 0)}",
-            style=GRAY,
-        ))
+        telegram_marker = "●" if status.get("telegram") == "authorized" else "○"
+        collector_marker = "●" if status.get("running") else "○"
+        self.console.print(
+            Text(f"{telegram_marker} Telegram ", style=ORANGE),
+            Text(f"{telegram}", style=WHITE),
+            Text("   ", style=GRAY),
+            Text(f"{collector_marker} Сборщик ", style=ORANGE),
+            Text(collector_label(status), style=WHITE),
+            sep="",
+        )
+        self.console.print(
+            Text(
+                f"{stats.get('sources', 0)} источников  ·  "
+                f"{stats.get('authors', 0)} профилей  ·  "
+                f"{stats.get('downloads', 0)} кружков",
+                style=GRAY,
+            )
+        )
         self.console.print(Text("─" * min(70, self.console.width), style=SEPARATOR))
+
+    def print_section(self, name: str, description: str = "") -> None:
+        self.console.print()
+        self.console.print(Text(f"hoard / {name}", style=f"bold {ORANGE}"))
+        if description:
+            self.console.print(Text(description, style=GRAY))
+        self.console.print(Text("─" * min(54, self.console.width), style=SEPARATOR))
 
     def print_sources(self, sources: list[dict]) -> None:
         if not sources:
@@ -264,6 +352,14 @@ class HoardCLI:
         last_code = ""
         last_password = ""
         try:
+            if not quiet_if_authorized:
+                self.console.print(
+                    Text(
+                        "Вход выполняет фоновая служба. Во время сетевых шагов "
+                        "будут видны ожидание и таймер.",
+                        style=GRAY,
+                    )
+                )
             result = self.call("auth_begin", timeout=75)
             while result:
                 state = result.get("state")
@@ -305,6 +401,13 @@ class HoardCLI:
                         force = False
                     else:
                         phone = self.text("Номер телефона (+79990000000)")
+                    self.console.print(
+                        Text(
+                            "Запрашиваю код. Если Telegram недоступен в текущей сети, "
+                            "включи VPN; Ctrl+C безопасно отменит вход.",
+                            style=GRAY,
+                        )
+                    )
                     result = self.call(
                         "auth_send_code", {"phone": phone, "force": force}, timeout=90
                     )
@@ -356,7 +459,9 @@ class HoardCLI:
             return False
 
     def add_source(self) -> None:
-        self.console.print(Text("Новый Telegram-пост", style=f"bold {ORANGE}"))
+        self.print_section(
+            "новый пост", "Ссылка → проверка доступа → каталог → запуск сканирования"
+        )
         raw = self.text("Ссылка на пост")
         try:
             post = parse_post_url(raw)
@@ -414,8 +519,7 @@ class HoardCLI:
     def sources_menu(self) -> None:
         while True:
             status = self.get_status()
-            self.console.print()
-            self.console.print(Text("hoard / sources", style=f"bold {ORANGE}"))
+            self.print_section("источники", "Посты, которые Hoard проверяет в фоне")
             self.print_sources(status.get("sources", []))
             action = self.select("Источники", [
                 {"name": "Добавить пост", "value": "add"},
@@ -431,10 +535,20 @@ class HoardCLI:
                 if not sources:
                     self.console.print(Text("Нет источников", style=GRAY))
                     continue
-                chosen = self.select("Выбери пост", [
-                    {"name": f"{'●' if s['enabled'] else '○'} {source_display(s)} · #{s['id']}",
-                     "value": str(s["id"])} for s in sources
-                ])
+                source_choices = [
+                    {
+                        "name": (
+                            f"{'●' if source['enabled'] else '○'} "
+                            f"{source_display(source)} · #{source['id']}"
+                        ),
+                        "value": str(source["id"]),
+                    }
+                    for source in sources
+                ]
+                source_choices.append({"name": "Назад", "value": "back"})
+                chosen = self.select("Выбери пост", source_choices)
+                if chosen == "back":
+                    continue
                 source = next(s for s in sources if s["id"] == int(chosen))
                 self.call(
                     "source_enable",
@@ -442,12 +556,12 @@ class HoardCLI:
                 )
 
     def telegram_menu(self) -> None:
-        self.console.print(Text("hoard / telegram", style=f"bold {ORANGE}"))
+        self.print_section("telegram", "Проверка сессии и безопасный вход через daemon")
         self.connect_telegram()
 
     def show_recent(self) -> None:
         status = self.get_status()
-        self.console.print(Text("hoard / downloads", style=f"bold {ORANGE}"))
+        self.print_section("загрузки", "Последние сохранённые видеокружки")
         items = status.get("downloads", [])[:15]
         if not items:
             self.console.print(Text("Пока нет сохранённых кружков", style=GRAY))
@@ -526,7 +640,7 @@ class HoardCLI:
                     if char is None:
                         key_wait()
                         continue
-                    if char in ("q", "\x1b", "\x03", "\x04"):
+                    if char in ("h", "q", "\x1b", "\x03", "\x04"):
                         break
                     if char in ("p", "s", "r"):
                         command = {"p": "pause", "s": "stop", "r": "start"}[char]
@@ -563,6 +677,44 @@ class HoardCLI:
             return
         self.call(action)
 
+    def catalog_menu(self, status: dict) -> None:
+        catalog = Path(str(status.get("catalog") or "")).expanduser()
+        choices = []
+        if catalog.is_file():
+            choices.append({"name": "Открыть каталог в браузере", "value": "open"})
+        choices.extend(
+            [
+                {"name": "Обновить каталог из SQLite", "value": "rebuild"},
+                {"name": "Показать путь к файлу", "value": "path"},
+                {"name": "Назад", "value": "back"},
+            ]
+        )
+        action = self.select("HTML-каталог", choices)
+        if action == "back":
+            return
+        if action == "rebuild":
+            result = self.call("telegram_report", timeout=90)
+            if result:
+                self.console.print(Text(str(catalog), style=WHITE))
+            return
+        if action == "path":
+            self.console.print(Text(str(catalog), style=WHITE))
+            return
+        if action == "open":
+            import webbrowser
+
+            try:
+                opened = webbrowser.open(catalog.resolve().as_uri(), new=2)
+            except (OSError, ValueError) as exc:
+                self.console.print(Text(f"Не удалось открыть каталог: {exc}", style=ORANGE))
+                return
+            if opened:
+                self.console.print(Text("Каталог открыт в браузере.", style=GRAY))
+            else:
+                self.console.print(
+                    Text(f"Браузер не найден. Открой файл вручную: {catalog}", style=ORANGE)
+                )
+
     def run(self) -> None:
         try:
             asyncio.run(ensure_daemon())
@@ -585,9 +737,12 @@ class HoardCLI:
                     else "Подключить Telegram"
                 )
                 choices = [
-                    {"name": "Источники и посты", "value": "sources"},
-                    {"name": "Загрузки и прогресс", "value": "downloads"},
-                    {"name": "Обновить HTML-каталог", "value": "catalog"},
+                    {"name": "Источники и посты     добавить или настроить", "value": "sources"},
+                    {
+                        "name": "Загрузки              прогресс и последние файлы",
+                        "value": "downloads",
+                    },
+                    {"name": "HTML-каталог          открыть или обновить", "value": "catalog"},
                 ]
                 if (status.get("stats") or {}).get("sources", 0):
                     choices.extend([
@@ -628,11 +783,7 @@ class HoardCLI:
                             self.call("start")
                         self.call("scan")
                 elif action == "catalog":
-                    result = self.call("telegram_report", timeout=90)
-                    if result:
-                        self.console.print(
-                            Text(str(status.get("catalog") or ""), style=WHITE)
-                        )
+                    self.catalog_menu(status)
                 elif action == "enrich":
                     if self.connect_telegram(quiet_if_authorized=True):
                         if not status.get("running"):

@@ -1,4 +1,4 @@
-# Hoard 0.4.0
+# Hoard 0.4.0.1
 
 Hoard is a local-first Linux and Windows archive for Telegram posts, profiles and video notes
 found in a channel post's comments. It uses Telethon, SQLite, an autonomous offline HTML catalog
@@ -62,6 +62,9 @@ flow through the background daemon:
 API Hashes, login codes and 2FA passwords use hidden prompts and are not written to logs.
 Cancelling login leaves the daemon running and does not delete an existing session. Invalid
 codes and passwords can be retried; an expired code is requested again only after confirmation.
+Every Telegram network step displays a spinner, elapsed seconds and an explicit network/VPN hint,
+so a blocked connection no longer looks like an empty terminal. Ctrl+C cancels the login flow
+without stopping the daemon.
 
 Only the daemon opens the Telethon session, so the interface never creates a competing
 Telegram client.
@@ -82,15 +85,12 @@ name/username and ID when available. Profile identity is keyed by Telegram ID, s
 change does not split one account into multiple catalog entries. Observation dates are labels for
 when Hoard saw a username, not claims about the exact time it changed.
 
-New objects use stable ID-based paths under the selected archive root:
+The report is one portable HTML file. New media objects use stable ID-based paths beside it:
 
 ```text
-<archive>/telegram/
-├── index.html
-├── style.css
-├── app.js
-├── data.js
-└── objects/
+<archive>/
+├── telegram_archive.html
+└── hoard_objects/
     ├── video_notes/source_<id>/author_<id>/message_<id>.mp4
     ├── profiles/author_<id>/photos/photo_<id>.jpg
     └── posts/source_<id>/media_<id>.<ext>
@@ -113,14 +113,22 @@ hoard telegram report --archive ~/Videos/hoard
 ```
 
 The command reads SQLite and rebuilds the snapshot without starting the daemon, connecting to
-Telegram or requiring internet access. Open `<archive>/telegram/index.html` directly in Firefox,
-Chromium or another local browser. The catalog uses bundled `data.js`; it has no web server,
-`fetch`, CDN, analytics or external font dependency. Search and sorting work locally across posts,
-IDs, current and observed usernames, display names and channels. Media uses lazy loading,
-pagination and `<video controls preload="none">`.
+Telegram or requiring internet access. Open `<archive>/telegram_archive.html` directly in Firefox,
+Chromium or another local browser. CSS, JavaScript and the SQLite snapshot are embedded in that
+single HTML file; it has no companion site assets, web server, `fetch`, CDN, analytics or external
+font dependency. Search and sorting work locally across posts, IDs, current and observed
+usernames, display names and channels. Media uses lazy loading, pagination and
+`<video controls preload="none">`.
 
-The source template is packaged at `src/hoard/templates/telegram/`. Each report refreshes its
-HTML/CSS/JS while preserving `objects/`. SQLite remains the source of truth.
+The TUI catalog menu can rebuild the snapshot, show its path or open the existing single HTML
+file in the default browser.
+
+For maintainability, source HTML, CSS and JavaScript remain separate and are packaged at
+`src/hoard/templates/telegram/`; the generator assembles them only at report time. Each report
+atomically replaces `telegram_archive.html` while preserving `hoard_objects/`. SQLite remains the
+source of truth. Media from the short-lived split layout `<archive>/telegram/objects/` is safely
+moved into `hoard_objects/` and its SQLite paths are updated; unrelated legacy archive layouts
+remain in place. Conflicting or unexpected files are preserved instead of overwritten.
 
 Optional enrichment obtains post text/media and up to 30 latest profile photos visible to the
 authorized account:
@@ -131,6 +139,8 @@ hoard telegram enrich
 
 Enrichment is queued separately from video-note scans, respects Telegram privacy and FloodWait,
 deduplicates media IDs and does not stop the primary scan when a profile photo is unavailable.
+The collector automatically queues an initial photo check for profiles already stored in SQLite
+and durable retries when a temporary failure becomes due; it does not rewind source checkpoints.
 Start the collector first if it is stopped. Stories, hidden data and unrelated message history
 are not requested. The offline report remains usable without enrichment.
 
@@ -148,6 +158,8 @@ The collector continues until it is paused, stopped or the daemon is shut down.
 The interface is inline, does not enter the alternate screen and refreshes only while the
 progress view is open. The terminal supplies the black background; Hoard uses orange
 `#F79646`, white primary text and gray secondary text.
+Lists support both arrow keys and Vim navigation: `j`/`k` move, `l` or Enter selects, and `h`
+returns to the parent menu. The same `h` shortcut leaves the live progress view.
 
 ## Non-interactive commands
 

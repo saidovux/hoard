@@ -57,6 +57,12 @@ async def test_scan_filters_and_resumes(tmp_path):
     assert store.stats()["downloads"] == 2
     assert fake.requests[0] == (7, 0, True)
     assert store.sources()[0]["last_id"] == 23
+    photo_jobs = [
+        job for job in store.queued_jobs(limit=20)
+        if job["kind"] == "telegram.profile_photos"
+    ]
+    assert len(photo_jobs) == 1
+    assert '"author_id": 101' in photo_jobs[0]["payload"]
     assert await engine.scan(store.sources()[0]) == (0, 0)
     assert fake.requests[1] == (7, 23, True)
     files = list(tmp_path.rglob("*.mp4"))

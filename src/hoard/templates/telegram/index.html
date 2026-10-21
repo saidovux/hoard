@@ -5,7 +5,10 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="dark">
   <title>Hoard — Telegram archive</title>
-  <link rel="stylesheet" href="style.css">
+  <!-- CSS stays separate in source and is inserted here when the report is built. -->
+  <style data-hoard-bundle="style">
+/*__HOARD_STYLE__*/
+  </style>
 </head>
 <body>
   <header class="topbar">
@@ -36,7 +39,12 @@
     </nav>
   </main>
   <footer><span id="generated"></span> · только локальные данные</footer>
-  <script src="data.js"></script>
-  <script src="app.js"></script>
+  <!-- Data and behavior are inserted into the same portable HTML file. -->
+  <script data-hoard-bundle="data">
+/*__HOARD_DATA__*/
+  </script>
+  <script data-hoard-bundle="app">
+/*__HOARD_APP__*/
+  </script>
 </body>
 </html>
