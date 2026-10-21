@@ -5,14 +5,47 @@ from __future__ import annotations
 import asyncio
 import subprocess
 import sys
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pytest
-from textual.widgets import Input, OptionList, Static
 
-from hoard.tui.app import HelpScreen, HoardApp
-from hoard.tui.screens import ActivityScreen, OverviewScreen
-from hoard.tui.widgets import HoardHeader, HoardStatusBar, ProgressView, Sidebar
+if TYPE_CHECKING:
+    from textual.widgets import Input, OptionList, Static
+
+    from hoard.tui.app import HelpScreen, HoardApp
+    from hoard.tui.screens import ActivityScreen, OverviewScreen
+    from hoard.tui.widgets import HoardHeader, HoardStatusBar, ProgressView, Sidebar
+
+
+@pytest.fixture(scope="module", autouse=True)
+def load_textual_after_existing_async_tests():
+    """Avoid importing Textual during collection on Windows 3.11's Proactor loop."""
+    from textual.widgets import Input as InputClass
+    from textual.widgets import OptionList as OptionListClass
+    from textual.widgets import Static as StaticClass
+
+    from hoard.tui.app import HelpScreen as HelpScreenClass
+    from hoard.tui.app import HoardApp as HoardAppClass
+    from hoard.tui.screens import ActivityScreen as ActivityScreenClass
+    from hoard.tui.screens import OverviewScreen as OverviewScreenClass
+    from hoard.tui.widgets import HoardHeader as HoardHeaderClass
+    from hoard.tui.widgets import HoardStatusBar as HoardStatusBarClass
+    from hoard.tui.widgets import ProgressView as ProgressViewClass
+    from hoard.tui.widgets import Sidebar as SidebarClass
+
+    globals().update(
+        ActivityScreen=ActivityScreenClass,
+        HelpScreen=HelpScreenClass,
+        HoardApp=HoardAppClass,
+        HoardHeader=HoardHeaderClass,
+        HoardStatusBar=HoardStatusBarClass,
+        Input=InputClass,
+        OptionList=OptionListClass,
+        OverviewScreen=OverviewScreenClass,
+        ProgressView=ProgressViewClass,
+        Sidebar=SidebarClass,
+        Static=StaticClass,
+    )
 
 
 def status_fixture(*, total: int | None = 4096) -> dict[str, Any]:
