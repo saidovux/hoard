@@ -684,13 +684,15 @@ async def test_source_flow_validates_upserts_and_does_not_create_duplicate_scan(
         await wait_for_condition(pilot, lambda: isinstance(app.screen, SourceDialog))
         dialog = app.screen
         dialog.query_one("#source-url", Input).value = "https://t.me/sample_channel/42"
-        await pilot.click("#source-primary")
+        dialog.query_one("#source-primary").press()
         await wait_for_condition(pilot, lambda: getattr(app.screen, "step", None) == "parameters")
+        await wait_for_condition(pilot, lambda: not dialog._busy)
         dialog.query_one("#source-output", Input).value = "/tmp/archive"
         dialog.query_one("#source-interval", Input).value = "300"
         dialog.query_one("#source-title", Input).value = "Updated title"
-        await pilot.click("#source-primary")
+        dialog.query_one("#source-primary").press()
         await wait_for_condition(pilot, lambda: getattr(app.screen, "step", None) == "done")
+        await wait_for_condition(pilot, lambda: not dialog._busy)
         assert "ближайшую проверку" in str(dialog.query_one("#source-message", Static).content)
         assert dialog.query_one("#source-start").display
         dialog.query_one("#source-start").press()
@@ -698,7 +700,7 @@ async def test_source_flow_validates_upserts_and_does_not_create_duplicate_scan(
             pilot, lambda: any(name == "start_collector" for name, _ in api.calls)
         )
         await wait_for_condition(pilot, lambda: not dialog._busy)
-        await pilot.click("#source-primary")
+        dialog.query_one("#source-primary").press()
         await wait_for_condition(pilot, lambda: isinstance(app.screen, SourcesScreen))
 
         await pilot.click("#source-edit")
@@ -707,9 +709,11 @@ async def test_source_flow_validates_upserts_and_does_not_create_duplicate_scan(
         assert dialog.query_one("#source-url", Input).value.endswith("/42")
         dialog.query_one("#source-primary").press()
         await wait_for_condition(pilot, lambda: getattr(app.screen, "step", None) == "parameters")
+        await wait_for_condition(pilot, lambda: not dialog._busy)
         dialog.query_one("#source-interval", Input).value = "600"
         dialog.query_one("#source-primary").press()
         await wait_for_condition(pilot, lambda: getattr(app.screen, "step", None) == "done")
+        await wait_for_condition(pilot, lambda: not dialog._busy)
         dialog.query_one("#source-primary").press()
         await wait_for_condition(pilot, lambda: isinstance(app.screen, SourcesScreen))
 
