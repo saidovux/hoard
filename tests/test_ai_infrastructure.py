@@ -1,7 +1,11 @@
 import asyncio
 import json
 import sqlite3
+import subprocess
+import sys
+import tempfile
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 
@@ -660,3 +664,62 @@ async def test_statistics_filters_and_unknown_cost_count(tmp_path):
     assert stats["estimated_costs"] == {}
     await service.stop_background()
     store.close()
+
+
+# Python 3.11's Windows selector loop can stall when pytest creates and tears down
+# many loops around daemon-runner tests. Exercise every async scenario in one isolated
+# process there, matching the established test_ai_jobs compatibility strategy.
+_ASYNC_SCENARIOS = (
+    test_prompt_crud_versions_activation_and_pagination,
+    test_chat_generation_uses_frozen_prompt_versions_and_persists_history,
+    test_chat_crud_archive_filters_and_soft_delete_preserve_history,
+    test_duplicate_operation_and_concurrent_branch_create_one_paid_job,
+    test_memory_is_explicit_versioned_and_isolated_by_scope,
+    test_context_limit_never_silently_truncates_prompt_or_new_message,
+    test_queued_chat_survives_daemon_restart,
+    test_running_attempt_becomes_unknown_after_daemon_restart,
+    test_old_running_legacy_job_is_backfilled_as_unknown_on_upgrade,
+    test_invalid_json_still_records_usage_reasoning_and_decimal_cost,
+    test_missing_usage_and_partial_tariff_never_become_fake_zero,
+    test_historical_cost_snapshot_does_not_change_with_tariffs,
+    test_connection_loss_is_unknown_and_retry_creates_new_attempt,
+    test_new_image_path_uses_private_attachment_reference_not_job_base64,
+    test_legacy_ai_jobs_are_accounted_without_changing_payload,
+    test_terminal_attempt_accounting_and_assistant_write_are_idempotent,
+    test_ai_job_error_does_not_copy_provider_or_chat_text_to_general_log,
+    test_statistics_filters_and_unknown_cost_count,
+)
+_WIN311 = sys.platform == "win32" and sys.version_info < (3, 12)
+
+
+async def _run_windows_scenarios(root: Path) -> None:
+    for scenario in _ASYNC_SCENARIOS:
+        directory = root / scenario.__name__
+        directory.mkdir()
+        await scenario(directory)
+
+
+if _WIN311 and __name__ != "__main__":
+    for _scenario in _ASYNC_SCENARIOS:
+        globals()[_scenario.__name__] = pytest.mark.skip(
+            reason="covered together in the Windows 3.11 isolated-loop scenario"
+        )(_scenario)
+
+    def test_windows311_ai_infrastructure_in_isolated_loop():
+        completed = subprocess.run(
+            [sys.executable, str(Path(__file__).resolve()), "windows311"],
+            capture_output=True,
+            text=True,
+            timeout=40,
+            check=False,
+        )
+        assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+if __name__ == "__main__":
+    if len(sys.argv) != 2 or sys.argv[1] != "windows311":
+        raise SystemExit("expected windows311 scenario")
+    if _WIN311:
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    with tempfile.TemporaryDirectory(prefix="hoard-ai-infrastructure-") as directory:
+        asyncio.run(_run_windows_scenarios(Path(directory)))
