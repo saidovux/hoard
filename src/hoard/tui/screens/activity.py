@@ -24,7 +24,6 @@ class ActivityScreen(WorkspaceScreen):
         self.poll_timer: Timer | None = None
 
     def compose_workspace(self) -> ComposeResult:
-        yield Static(id="status-error")
         yield Static("ТЕКУЩЕЕ ДЕЙСТВИЕ", classes="section-heading")
         yield Static(id="current-action")
         yield ProgressView()

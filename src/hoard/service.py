@@ -284,6 +284,7 @@ class Service:
                 "queue": self.store.queue_stats(),
                 "sources": self.store.sources(),
                 "downloads": self.store.recent_downloads(),
+                "profiles": self.store.telegram.recent_profiles(),
                 "jobs": self.store.recent_jobs(),
                 "events": self.store.recent_events(),
                 "archive_root": str(archive_root),
@@ -414,6 +415,24 @@ class Service:
             self.runner.wakeup()
             return {"message": "Проверка назначена" if self.running else
                     "Проверка назначена; запусти обработчик"}
+        if method == "scan_source":
+            source_id = int(args.get("id", 0))
+            source = self._source(source_id)
+            if source is None:
+                raise ValueError("Источник не найден")
+            if not source["enabled"]:
+                raise ValueError("Сначала включи источник")
+            job_id = self.store.enqueue(
+                "telegram.scan",
+                {"source_id": source_id},
+                unique_key=f"telegram:{source_id}",
+            )
+            self.runner.wakeup()
+            suffix = "" if self.running else "; запусти обработчик"
+            return {
+                "message": f"Проверка источника #{source_id} назначена{suffix}",
+                "job_id": job_id,
+            }
         if method == "shutdown":
             await self.stop()
             self.stop_requested.set()

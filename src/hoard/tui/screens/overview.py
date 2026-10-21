@@ -18,7 +18,6 @@ class OverviewScreen(WorkspaceScreen):
     screen_subtitle = "Состояние локального архива"
 
     def compose_workspace(self) -> ComposeResult:
-        yield Static(id="status-error")
         with Horizontal(id="overview-grid"):
             yield Static(id="system-summary")
             yield StatisticsView()

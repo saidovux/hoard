@@ -1,3 +1,5 @@
+import pytest
+
 from hoard.models import Post
 from hoard.service import Service
 from hoard.storage import Store
@@ -81,4 +83,54 @@ async def test_invalid_optional_ai_config_does_not_break_telegram(monkeypatch, t
     assert (await service.handle("status", {}))["integrations"]["ai"] is False
 
     await service.handle("stop", {})
+    store.close()
+
+
+async def test_targeted_scan_queues_only_selected_source_and_deduplicates(tmp_path):
+    store = Store(tmp_path / "db.sqlite")
+    first = store.add_source(Post("channelx", 7), str(tmp_path / "archive"))
+    second = store.add_source(Post("channely", 8), str(tmp_path / "archive"))
+    service = Service(store=store, engine=FakeEngine())
+
+    one = await service.handle("scan_source", {"id": first})
+    repeated = await service.handle("scan_source", {"id": first})
+
+    assert one["job_id"] == repeated["job_id"]
+    jobs = list(store.db.execute("SELECT kind,payload FROM jobs ORDER BY id"))
+    assert len(jobs) == 1
+    assert jobs[0]["kind"] == "telegram.scan"
+    assert f'"source_id": {first}' in jobs[0]["payload"]
+    assert str(second) not in jobs[0]["payload"]
+
+    store.set_enabled(first, False)
+    with pytest.raises(ValueError, match="включи"):
+        await service.handle("scan_source", {"id": first})
+    with pytest.raises(ValueError, match="не найден"):
+        await service.handle("scan_source", {"id": 999})
+    store.close()
+
+
+async def test_status_exposes_profile_summaries_without_ui_database_access(tmp_path):
+    store = Store(tmp_path / "db.sqlite")
+    source_id = store.add_source(Post("channelx", 7), str(tmp_path / "archive"))
+    store.telegram.observe_profile(
+        author_id=101,
+        username="alice",
+        display_name="Alice",
+        source_id=source_id,
+    )
+    store.telegram.record_profile_photo(
+        101,
+        "photo-1",
+        file_path=str(tmp_path / "archive" / "photo.jpg"),
+        size=12,
+        photo_date="2026-10-21",
+    )
+    service = Service(store=store, engine=FakeEngine())
+
+    profiles = (await service.handle("status", {}))["profiles"]
+
+    assert profiles[0]["author_id"] == 101
+    assert profiles[0]["photo_count"] == 1
+    assert profiles[0]["source_count"] == 1
     store.close()

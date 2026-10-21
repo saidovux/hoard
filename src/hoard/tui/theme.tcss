@@ -17,7 +17,7 @@ $separator: #262626;
 
 App, Screen, ModalScreen, Container, Horizontal, Vertical, VerticalScroll,
 Header, Footer, Static, Label, Input, TextArea, OptionList, ListView, DataTable,
-Select, SelectOverlay, SelectionList {
+Select, SelectOverlay, SelectionList, Button {
     background: #000000;
 }
 
@@ -60,7 +60,7 @@ Screen {
 
 #navigation {
     height: auto;
-    min-height: 3;
+    min-height: 6;
     border: none;
     padding: 0;
     background: #000000;
@@ -108,7 +108,7 @@ OptionList > .option-list--option-hover {
     color: #888888;
 }
 
-#status-error {
+#status-error, #action-feedback {
     display: none;
     height: auto;
     min-height: 3;
@@ -116,6 +116,11 @@ OptionList > .option-list--option-hover {
     border-left: solid #F79646;
     padding-left: 1;
     margin-bottom: 1;
+}
+
+#action-feedback {
+    color: #FFFFFF;
+    border-left: solid #262626;
 }
 
 #overview-grid {
@@ -168,9 +173,30 @@ OptionList > .option-list--option-hover {
 
 Input, TextArea, DataTable, Select, SelectOverlay, SelectionList,
 Input:focus, TextArea:focus, DataTable:focus, Select:focus,
-Input:hover, TextArea:hover, DataTable:hover, Select:hover {
+Input:hover, TextArea:hover, DataTable:hover, Select:hover,
+Button, Button:hover, Button:focus, Button:disabled,
+Button.-primary, Button.-primary:hover, Button.-primary:focus,
+Button.-default, Button.-default:hover, Button.-default:focus {
     background: #000000;
     border: solid #262626;
+}
+
+Button {
+    color: #FFFFFF;
+    min-width: 12;
+}
+
+Button:hover, Button:focus, Button.-primary, Button.-primary:hover,
+Button.-primary:focus {
+    color: #F79646;
+    text-style: bold;
+    border: solid #F79646;
+}
+
+Button:disabled {
+    color: #888888;
+    border: solid #262626;
+    opacity: 60%;
 }
 
 DataTable > .datatable--cursor,
@@ -185,11 +211,6 @@ SelectOverlay > .option-list--option-hover {
     background: #000000;
 }
 
-ModalScreen {
-    align: center middle;
-    background: #000000;
-}
-
 #help-card {
     width: 54;
     max-width: 90%;
@@ -198,4 +219,121 @@ ModalScreen {
     background: #000000;
     color: #FFFFFF;
     border: solid #F79646;
+}
+
+.action-row {
+    layout: grid;
+    grid-size: 3;
+    grid-columns: 1fr 1fr 1fr;
+    grid-rows: 3;
+    grid-gutter: 0 1;
+    width: 100%;
+    height: auto;
+    min-height: 3;
+    margin-bottom: 1;
+}
+
+.action-row Button {
+    width: 100%;
+    margin-right: 0;
+}
+
+.compact .action-row {
+    grid-size: 1;
+    grid-columns: 1fr;
+}
+
+.compact .action-row Button {
+    width: 100%;
+}
+
+#telegram-summary, #collector-help, #archive-summary, .table-help {
+    height: auto;
+    min-height: 3;
+    margin-bottom: 1;
+}
+
+.table-help {
+    color: #888888;
+}
+
+#sources-table, #archive-table {
+    width: 100%;
+    height: 18;
+    min-height: 8;
+    border: solid #262626;
+}
+
+.compact #sources-table, .compact #archive-table {
+    height: 12;
+}
+
+ModalScreen {
+    align: center middle;
+    background: #000000;
+}
+
+.dialog {
+    width: 72;
+    max-width: 94%;
+    height: auto;
+    max-height: 90%;
+    padding: 1 2;
+    border: solid #F79646;
+    background: #000000;
+}
+
+#confirm-dialog {
+    width: 62;
+}
+
+.dialog-title {
+    height: 2;
+    color: #F79646;
+    text-style: bold;
+}
+
+.dialog-message, .dialog-error {
+    height: auto;
+    min-height: 1;
+    margin-bottom: 0;
+}
+
+.dialog-error {
+    color: #F79646;
+}
+
+.field-label {
+    height: 1;
+    color: #888888;
+}
+
+.dialog Input {
+    width: 100%;
+    margin-bottom: 0;
+}
+
+.dialog-actions {
+    width: 100%;
+    height: auto;
+    min-height: 3;
+    margin-top: 0;
+}
+
+.dialog-actions Button {
+    width: auto;
+    margin-right: 1;
+}
+
+.compact .dialog {
+    padding: 0 1;
+}
+
+.compact .dialog-actions {
+    layout: vertical;
+}
+
+.compact .dialog-actions Button {
+    width: 100%;
+    margin-right: 0;
 }

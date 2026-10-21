@@ -1,4 +1,4 @@
-# Hoard 0.4.0.4
+# Hoard 0.4.0.5
 
 Hoard is a local-first Linux and Windows archive for Telegram posts, profiles and video notes
 found in a channel post's comments. It uses Telethon, SQLite, an autonomous offline HTML catalog
@@ -11,25 +11,27 @@ profile analysis. The project has no web server, Redis, Docker or Electron.
 
 ## Terminal interfaces
 
-Round 2 adds a modular full-screen Textual workspace:
+The round-three interface is a complete Telegram workspace:
 
 ```bash
 hoard tui
 ```
 
-It currently contains only two implemented sections: **Обзор** shows Telegram, collector,
-archive, queue and event status, while **Активность** monitors real progress, transfer size,
-measured speed, queue state and errors. It reads the existing daemon `status` response through
-the private IPC layer; it never opens SQLite or a Telegram client. The activity screen polls at a
-moderate interval, prevents overlapping requests and stops polling when it is no longer visible.
+Its implemented sections are **Обзор**, **Telegram**, **Источники**, **Активность** and **Архив**.
+They cover login including 2FA, collector start/pause/stop, source validation and editing,
+selected-source or global scans, downloads, profile summaries, jobs, errors, enrichment and
+manual HTML generation. All operations use the private daemon IPC layer; the TUI never opens
+SQLite or creates a Telegram client. Only the visible Activity screen polls, with one status
+request in flight at a time.
 
 The entire Textual surface, including navigation, focus, hover and help modal states, uses
 `#000000`; text is white, secondary text is `#888888`, separators are `#262626` and the accent is
 `#F79646`. Use `j`/`k` or arrows to move, `l`, Right or Enter to open, `h`, Left or Esc to return,
-`?` for help, `b` to toggle the sidebar and `q` to close only the UI. On terminals narrower than
-60 columns the sidebar hides automatically while keyboard navigation remains available.
+`?` for help, `b` to toggle the sidebar and `q` to close only the UI. `[` and `]` switch sections
+even when the sidebar is hidden. Tables, buttons and inputs retain their native keyboard behavior.
+On terminals narrower than 60 columns the sidebar hides automatically.
 
-For this transition round, `hoard` and `hoard ui` continue to open the established inline
+`hoard` and `hoard ui` continue to open the established inline
 Rich/InquirerPy interface. Scripts and all existing non-interactive commands are unchanged and do
 not import Textual.
 
@@ -45,7 +47,7 @@ python -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -e .
-hoard
+hoard tui
 ```
 
 For development, install the test tools with `python -m pip install -e '.[dev]'`.
@@ -63,7 +65,7 @@ git clone https://github.com/saidovux/hoard.git
 cd hoard
 py -3 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -e .
-.\.venv\Scripts\hoard.exe
+.\.venv\Scripts\hoard.exe tui
 ```
 
 No PowerShell execution policy changes are needed. Windows stores credentials in
@@ -74,7 +76,7 @@ Use `hoard shutdown` to fully close the service. Windows CI does not test live T
 
 ## First launch and Telegram login
 
-Run `hoard` and choose **Подключить Telegram**. Hoard performs the complete login as one
+Run `hoard tui`, open **Telegram** and choose **Подключить**. Hoard performs the complete login as one
 flow through the background daemon:
 
 1. It checks the saved session and finishes immediately if that session is still valid.
@@ -96,13 +98,18 @@ Telegram client.
 
 ## Add a post and archive video notes
 
-Choose **Источники и посты** → **Добавить пост**. The wizard:
+Open **Источники** → **Добавить**. The wizard:
 
 1. accepts a public post URL such as `https://t.me/examplechannel/123`;
 2. connects Telegram if needed and verifies that the account can access the post;
 3. asks for the archive folder;
 4. uses a 120-second interval or lets you enter 30–86400 seconds;
-5. saves the source and offers to start an immediate scan.
+5. saves or updates the source, schedules its nearest check and offers to start the collector.
+
+**Проверить выбранный** queues only the highlighted post and uses the same unique job key as the
+scheduler, so repeated presses cannot create parallel duplicate scans. **Проверить все** keeps the
+existing global behavior. Editing preserves the current archive directory until it is explicitly
+changed and never moves or deletes existing files.
 
 Hoard reads the linked comment thread and stores Telegram round video messages. Each MP4 gets a
 JSON sidecar containing the source post, comment link, message ID, date and the visible sender
@@ -145,8 +152,8 @@ font dependency. Search and sorting work locally across posts, IDs, current and 
 usernames, display names and channels. Media uses lazy loading, pagination and
 `<video controls preload="none">`.
 
-The TUI catalog menu can rebuild the snapshot, show its path or open the existing single HTML
-file in the default browser.
+The TUI Archive screen can rebuild the snapshot and shows its path together with downloads,
+profiles and jobs. Open the resulting single HTML file in a local browser when needed.
 
 For maintainability, source HTML, CSS and JavaScript remain separate and are packaged at
 `src/hoard/templates/telegram/`; the generator assembles them only at report time. Each report
@@ -212,7 +219,8 @@ Lists support both arrow keys and Vim navigation: `j`/`k` move, `l` or Enter sel
 returns to the parent menu. The same `h` shortcut leaves the live progress view.
 
 `hoard tui` is intentionally full-screen and restores the original terminal on exit. Its
-Overview screen is idle; only the visible Activity screen refreshes status. Both interfaces leave
+Overview and management screens are idle; only the visible Activity screen refreshes status.
+Both interfaces leave
 the same daemon and its Telegram and AI queues running after exit.
 
 ## Non-interactive commands

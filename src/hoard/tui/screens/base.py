@@ -32,6 +32,8 @@ class WorkspaceScreen(Screen):
             with VerticalScroll(id="workspace"):
                 yield Static(self.screen_title, classes="screen-title")
                 yield Static(self.screen_subtitle, classes="screen-subtitle")
+                yield Static(id="status-error")
+                yield Static(id="action-feedback")
                 yield from self.compose_workspace()
         yield HoardStatusBar()
 
@@ -59,6 +61,14 @@ class WorkspaceScreen(Screen):
             error_view.display = True
         else:
             error_view.display = False
+        feedback = self.query_one("#action-feedback", Static)
+        notice = self.hoard_app.notice
+        if notice:
+            message, is_error = notice
+            feedback.update(Text(message, style="#F79646" if is_error else "#FFFFFF"))
+            feedback.display = True
+        else:
+            feedback.display = False
         if status is not None:
             self.render_data(status)
 

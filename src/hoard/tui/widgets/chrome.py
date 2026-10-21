@@ -92,7 +92,7 @@ class HoardStatusBar(Static):
         self.update(
             Text.from_markup(
                 "[bold #F79646]j/k[/] выбор  [bold #F79646]l/Enter[/] открыть  "
-                "[bold #F79646]h/Esc[/] назад  [bold #F79646]?[/] помощь  "
+                "[bold #F79646]скобки[/] раздел  [bold #F79646]?[/] помощь  "
                 "[bold #F79646]q[/] выход"
             )
         )

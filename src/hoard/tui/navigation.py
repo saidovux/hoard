@@ -13,7 +13,10 @@ class Section:
 
 SECTIONS = (
     Section("overview", "Обзор"),
+    Section("telegram", "Telegram"),
+    Section("sources", "Источники"),
     Section("activity", "Активность"),
+    Section("archive", "Архив"),
 )
 
 

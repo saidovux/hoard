@@ -6,10 +6,11 @@ verification and an available GitHub Actions check.
 
 1. **AI Core — completed.** Provider-neutral requests and responses, DeepSeek transport, JSON
    validation, privacy limits and the independent AI job pool.
-2. **Textual TUI Foundation — current.** Strict black theme, modular app/screens/widgets, Overview
+2. **Textual TUI Foundation — completed.** Strict black theme, modular app/screens/widgets, Overview
    and Activity over existing IPC, responsive keyboard navigation and bounded live polling.
-3. **Telegram Screens.** Move implemented Telegram archive workflows into dedicated Textual
-   screens without moving Telethon out of the daemon.
+3. **Telegram Screens — completed.** Telegram authorization, collector controls, source
+   validation/editing, targeted scans, archive/profile/job views and catalog operations are
+   available through typed IPC without moving Telethon out of the daemon.
 4. **Prompts, Chats & Memory.** Add durable, explicit user-owned AI prompt and conversation data.
 5. **AI Usage & Costs.** Persist and present provider usage and cost telemetry without estimates
    presented as billed facts.

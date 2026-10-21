@@ -491,6 +491,26 @@ class TelegramStorage:
     def profile_ids(self) -> list[int]:
         return [int(row[0]) for row in self.db.execute("SELECT author_id FROM tg_profiles")]
 
+    def recent_profiles(self, count: int = 80) -> list[dict[str, Any]]:
+        """Return presentation-safe profile summaries for the daemon status response."""
+        return [
+            dict(row)
+            for row in self.db.execute(
+                """SELECT profiles.*,
+                COUNT(DISTINCT photos.photo_id) AS photo_count,
+                COUNT(DISTINCT links.source_id) AS source_count
+                FROM tg_profiles AS profiles
+                LEFT JOIN tg_profile_photos AS photos
+                  ON photos.author_id=profiles.author_id
+                LEFT JOIN tg_profile_sources AS links
+                  ON links.author_id=profiles.author_id
+                GROUP BY profiles.author_id
+                ORDER BY profiles.last_seen DESC, profiles.author_id
+                LIMIT ?""",
+                (max(1, int(count)),),
+            )
+        ]
+
     def due_profile_photo_ids(self, limit: int = 100) -> list[int]:
         """Return profiles whose visible photos need an initial check or retry."""
         return [

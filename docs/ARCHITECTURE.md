@@ -8,9 +8,10 @@ background service.
 - `console_ui.py` renders the inline Rich/InquirerPy interface. It never imports or creates
   a `TelegramClient`; every operation goes through IPC.
 - `tui/` is the optional full-screen Textual client launched only by `hoard tui`. `app.py` owns
-  lifecycle, keyboard navigation and the single in-flight status refresh; `api.py` adapts the
-  existing `ensure_daemon()` / `request("status")` calls; screens, status formatting, reusable
-  widgets and TCSS remain separate. It imports neither storage nor Telethon.
+  lifecycle, contextual keyboard navigation, named mutation guards and the single in-flight
+  status refresh; `api.py` provides typed operations over the existing `ensure_daemon()` /
+  `request()` boundary. Dialogs, screens, status formatting, reusable widgets and TCSS remain
+  separate. The package imports neither storage nor Telethon.
 - `ipc.py` starts the daemon detached when required and sends one JSON request per private
   Unix-socket connection.
 - `service.py` owns the database, two independently limited job runners and the sole
@@ -47,8 +48,10 @@ collector, shutdown or Telegram command.
 
 The Textual theme sets background, surface and panel to `#000000`; TCSS also fixes computed
 backgrounds for containers, navigation components, focus/hover/selected states, inputs, tables,
-menus and modals. Only Overview and Activity are exposed in round 2. Telegram workflows, AI chat
-and settings remain hidden until their implementation rounds.
+buttons, menus and modals. Round 3 exposes Overview, Telegram, Sources, Activity and Archive.
+The Telegram workspace mirrors daemon authorization states, controls the existing collector,
+uses `source_add` as an upsert and renders downloads, profiles and jobs returned by `status`.
+AI chat and settings remain hidden until their implementation rounds.
 
 ## Telegram authorization
 
@@ -67,6 +70,9 @@ not credentials or an authorized session.
 
 After login, scans reuse the connected client immediately. If the process is restarted during
 login, the transient challenge is intentionally lost and a new code must be requested.
+The Textual authorization dialog stores secrets only in short-lived password inputs, serializes
+each operation and clears API Hash, code and password values on completion or cancellation.
+Cancelling a pending UI request is followed by `auth_cancel`; neither action stops the daemon.
 
 ## Persistence, migration and scheduling
 
@@ -95,6 +101,12 @@ advanced after each processed comment. Media records are committed only after a 
 written, fsynced and atomically renamed. Missing or size-mismatched video notes move the scan
 cursor back to the earliest affected message. A missing legacy JSON sidecar alone does not trigger
 a network re-download because SQLite already has the required catalog metadata.
+
+The `scan_source` IPC operation validates that one source exists and is enabled, then enqueues the
+same `telegram.scan` payload and `telegram:<id>` unique key used by the scheduler. It therefore
+does not reuse the global `scan` command and cannot create a second queued/running job for the
+selected post. The status response includes bounded profile summaries with photo/source counts so
+the TUI never needs direct database access.
 
 Profile photo enumeration is capped at 30 per check. Saved Telegram photo IDs prevent duplicate
 downloads. The scheduler backfills due profile IDs already in SQLite and retries temporary
