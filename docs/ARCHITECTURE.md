@@ -7,6 +7,10 @@ background service.
 
 - `console_ui.py` renders the inline Rich/InquirerPy interface. It never imports or creates
   a `TelegramClient`; every operation goes through IPC.
+- `tui/` is the optional full-screen Textual client launched only by `hoard tui`. `app.py` owns
+  lifecycle, keyboard navigation and the single in-flight status refresh; `api.py` adapts the
+  existing `ensure_daemon()` / `request("status")` calls; screens, status formatting, reusable
+  widgets and TCSS remain separate. It imports neither storage nor Telethon.
 - `ipc.py` starts the daemon detached when required and sends one JSON request per private
   Unix-socket connection.
 - `service.py` owns the database, two independently limited job runners and the sole
@@ -33,6 +37,18 @@ Menu keybindings are defined once for arrow and `h/j/k/l` navigation. Telegram I
 an inline elapsed-time status with network/VPN guidance while the daemon owns the actual client.
 Views use a bounded responsive workspace and clear only the primary terminal screen between
 completed prompts; the UI never enters the alternate screen or refreshes while closed.
+
+The Textual client is a separate presentation option and may enter application mode. Its Overview
+screen performs no idle polling. The Activity screen owns a moderate 1.5-second timer only while
+active, and the app's async lock drops overlapping ticks. Screen suspension, unmount and app exit
+stop the timer. IPC startup and request errors render inside the stable black workspace so a slow
+or unavailable daemon never produces an unexplained empty screen. Exiting the client sends no
+collector, shutdown or Telegram command.
+
+The Textual theme sets background, surface and panel to `#000000`; TCSS also fixes computed
+backgrounds for containers, navigation components, focus/hover/selected states, inputs, tables,
+menus and modals. Only Overview and Activity are exposed in round 2. Telegram workflows, AI chat
+and settings remain hidden until their implementation rounds.
 
 ## Telegram authorization
 

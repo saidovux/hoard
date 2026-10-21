@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hoard-local"
-version = "0.4.0.3"
+version = "0.4.0.4"
 description = "Local Telegram archive with an autonomous offline HTML catalog"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -14,6 +14,7 @@ dependencies = [
   "rich>=13.7,<15",
   "InquirerPy>=0.3.4,<0.4",
   "jsonschema>=4.23,<5",
+  "textual>=8.2.8,<9",
 ]
 
 [project.optional-dependencies]
@@ -24,7 +25,7 @@ hoard = "hoard.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/hoard"]
-artifacts = ["src/hoard/templates/**"]
+artifacts = ["src/hoard/templates/**", "src/hoard/tui/theme.tcss"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

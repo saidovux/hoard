@@ -60,7 +60,7 @@ async def run_command(args: argparse.Namespace):
 def main():
     p = argparse.ArgumentParser(description="Hoard — локальный архиватор Telegram")
     sub = p.add_subparsers(dest="command")
-    for name in ("ui", "daemon", "start", "stop", "scan", "status", "shutdown"):
+    for name in ("ui", "tui", "daemon", "start", "stop", "scan", "status", "shutdown"):
         sub.add_parser(name)
     a = sub.add_parser("add", help="Добавить пост без запуска TUI")
     a.add_argument("url")
@@ -86,14 +86,17 @@ def main():
         cmd.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
                          help=argparse.SUPPRESS)
     args = p.parse_args()
-    if args.command in {None, "ui"}:
+    if args.command in {None, "ui", "tui"}:
         if not sys.stdin.isatty() or not sys.stdout.isatty():
             print(
                 "Ошибка: интерактивный CLI требует терминала. Для скриптов: hoard status",
                 file=sys.stderr,
             )
             raise SystemExit(1)
-        from .console_ui import launch
+        if args.command == "tui":
+            from .tui import launch
+        else:
+            from .console_ui import launch
         launch()
         return
     try:

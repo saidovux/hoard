@@ -1,13 +1,37 @@
-# Hoard 0.4.0.3
+# Hoard 0.4.0.4
 
 Hoard is a local-first Linux and Windows archive for Telegram posts, profiles and video notes
 found in a channel post's comments. It uses Telethon, SQLite, an autonomous offline HTML catalog
-and a small inline Rich/InquirerPy interface. A private background daemon performs all Telegram
-work; closing the interface does not stop downloads.
+and terminal interfaces. A private background daemon performs all Telegram work; closing an
+interface does not stop downloads.
 
 This release exposes only the working Telegram archiver in its user interface. It also contains
 the first provider-neutral Hoard AI Core for future modules, without an AI menu or automatic
-profile analysis. The project has no web server, Redis, Docker, Electron or fullscreen dashboard.
+profile analysis. The project has no web server, Redis, Docker or Electron.
+
+## Terminal interfaces
+
+Round 2 adds a modular full-screen Textual workspace:
+
+```bash
+hoard tui
+```
+
+It currently contains only two implemented sections: **Обзор** shows Telegram, collector,
+archive, queue and event status, while **Активность** monitors real progress, transfer size,
+measured speed, queue state and errors. It reads the existing daemon `status` response through
+the private IPC layer; it never opens SQLite or a Telegram client. The activity screen polls at a
+moderate interval, prevents overlapping requests and stops polling when it is no longer visible.
+
+The entire Textual surface, including navigation, focus, hover and help modal states, uses
+`#000000`; text is white, secondary text is `#888888`, separators are `#262626` and the accent is
+`#F79646`. Use `j`/`k` or arrows to move, `l`, Right or Enter to open, `h`, Left or Esc to return,
+`?` for help, `b` to toggle the sidebar and `q` to close only the UI. On terminals narrower than
+60 columns the sidebar hides automatically while keyboard navigation remains available.
+
+For this transition round, `hoard` and `hoard ui` continue to open the established inline
+Rich/InquirerPy interface. Scripts and all existing non-interactive commands are unchanged and do
+not import Textual.
 
 ## Install on Linux
 
@@ -179,13 +203,17 @@ The collector continues until it is paused, stopped or the daemon is shut down.
 - `hoard shutdown` closes both the collector and daemon cleanly.
 - Reopening `hoard` reconnects to the existing daemon.
 
-The interface is inline, does not enter the alternate screen and refreshes only while the
-progress view is open. The terminal supplies the black background; Hoard uses orange
+The legacy interface is inline, does not enter the alternate screen and refreshes only while the
+progress view is open. The terminal supplies its black background; Hoard uses orange
 `#F79646`, white primary text and gray secondary text. Its centered workspace expands up to
 112 columns, collapses cleanly on narrow terminals and replaces the previous view after every
 completed prompt, so navigation does not leave duplicate menus on screen.
 Lists support both arrow keys and Vim navigation: `j`/`k` move, `l` or Enter selects, and `h`
 returns to the parent menu. The same `h` shortcut leaves the live progress view.
+
+`hoard tui` is intentionally full-screen and restores the original terminal on exit. Its
+Overview screen is idle; only the visible Activity screen refreshes status. Both interfaces leave
+the same daemon and its Telegram and AI queues running after exit.
 
 ## Non-interactive commands
 
