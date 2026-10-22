@@ -1,4 +1,5 @@
 import asyncio
+import faulthandler
 import json
 import sqlite3
 import subprocess
@@ -707,12 +708,10 @@ if _WIN311 and __name__ != "__main__":
                 "windows311",
                 scenario.__name__,
             ],
-            capture_output=True,
-            text=True,
             timeout=15,
             check=False,
         )
-        assert completed.returncode == 0, completed.stdout + completed.stderr
+        assert completed.returncode == 0
 
 
 if __name__ == "__main__":
@@ -725,5 +724,10 @@ if __name__ == "__main__":
         raise SystemExit("unknown Windows 3.11 scenario") from None
     if _WIN311:
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    with tempfile.TemporaryDirectory(prefix="hoard-ai-infrastructure-") as directory:
-        asyncio.run(selected_scenario(Path(directory)))
+        faulthandler.dump_traceback_later(5)
+    try:
+        with tempfile.TemporaryDirectory(prefix="hoard-ai-infrastructure-") as directory:
+            asyncio.run(selected_scenario(Path(directory)))
+    finally:
+        if _WIN311:
+            faulthandler.cancel_dump_traceback_later()
