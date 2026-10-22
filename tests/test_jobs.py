@@ -1,16 +1,13 @@
 import asyncio
-import sys
 
 from hoard.jobs import JobRunner
 from hoard.storage import Store
-
-WIN311 = sys.platform == "win32" and sys.version_info < (3, 12)
 
 
 async def wait_for(predicate, seconds=3):
     async with asyncio.timeout(seconds):
         while not predicate():
-            await asyncio.sleep(0 if WIN311 else 0.02)
+            await asyncio.sleep(0.02)
 
 
 async def test_queue_executes_generic_tasks_and_persists(tmp_path):

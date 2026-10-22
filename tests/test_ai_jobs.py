@@ -1,9 +1,4 @@
 import asyncio
-import os
-import subprocess
-import sys
-import tempfile
-from pathlib import Path
 
 from hoard.ai import AIMessage, AIRequest
 from hoard.ai.executor import AICore
@@ -13,13 +8,11 @@ from hoard.service import Service
 from hoard.storage import Store
 from hoard.telegram import AuthState
 
-WIN311 = sys.platform == "win32" and sys.version_info < (3, 12)
-
 
 async def wait_for(predicate, seconds=3):
     async with asyncio.timeout(seconds):
         while not predicate():
-            await asyncio.sleep(0 if WIN311 else 0.02)
+            await asyncio.sleep(0.02)
 
 
 class FakeEngine:
@@ -60,7 +53,7 @@ def job_state(store, jid):
     return store.db.execute("SELECT state FROM jobs WHERE id=?", (jid,)).fetchone()[0]
 
 
-async def ai_pool_scenario(tmp_path: Path) -> None:
+async def ai_pool_scenario(tmp_path) -> None:
     store = Store(tmp_path / "db.sqlite")
     engine = FakeEngine()
     provider = BlockingProvider()
@@ -92,7 +85,7 @@ async def ai_pool_scenario(tmp_path: Path) -> None:
         store.close()
 
 
-async def cancelled_paid_job_scenario(tmp_path: Path) -> None:
+async def cancelled_paid_job_scenario(tmp_path) -> None:
     store = Store(tmp_path / "db.sqlite")
     provider = BlockingProvider()
     service = Service(
@@ -109,11 +102,7 @@ async def cancelled_paid_job_scenario(tmp_path: Path) -> None:
 
         assert job_state(store, jid) == "failed"
         await service.start_background()
-        if WIN311:
-            for _ in range(20):
-                await asyncio.sleep(0)
-        else:
-            await asyncio.sleep(0.1)
+        await asyncio.sleep(0.1)
         assert provider.calls == 1
         assert job_state(store, jid) == "failed"
     finally:
@@ -121,52 +110,13 @@ async def cancelled_paid_job_scenario(tmp_path: Path) -> None:
         store.close()
 
 
-def run_isolated(scenario: str) -> None:
-    completed = subprocess.run(
-        [sys.executable, str(Path(__file__).resolve()), scenario],
-        capture_output=True,
-        text=True,
-        timeout=30,
-        check=False,
-    )
-    assert completed.returncode == 0, completed.stdout + completed.stderr
+async def test_ai_pool_runs_while_telegram_is_stopped_and_does_not_block_it(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    await ai_pool_scenario(tmp_path)
 
 
-if WIN311:
-
-    def test_ai_pool_runs_while_telegram_is_stopped_and_does_not_block_it():
-        run_isolated("pool")
-
-    def test_cancelled_paid_job_requires_explicit_retry():
-        run_isolated("cancel")
-
-else:
-
-    async def test_ai_pool_runs_while_telegram_is_stopped_and_does_not_block_it(
-        monkeypatch, tmp_path
-    ):
-        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
-        await ai_pool_scenario(tmp_path)
-
-    async def test_cancelled_paid_job_requires_explicit_retry(monkeypatch, tmp_path):
-        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
-        await cancelled_paid_job_scenario(tmp_path)
-
-
-async def isolated_main(scenario: str) -> None:
-    with tempfile.TemporaryDirectory(prefix="hoard-ai-jobs-") as directory:
-        tmp_path = Path(directory)
-        os.environ["XDG_CONFIG_HOME"] = str(tmp_path / "config")
-        if scenario == "pool":
-            await ai_pool_scenario(tmp_path)
-        elif scenario == "cancel":
-            await cancelled_paid_job_scenario(tmp_path)
-        else:
-            raise ValueError(f"Unknown scenario: {scenario}")
-
-
-if __name__ == "__main__":
-    if WIN311:
-        # Isolated jobs use the same Proactor policy as the production daemon.
-        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-    asyncio.run(isolated_main(sys.argv[1]))
+async def test_cancelled_paid_job_requires_explicit_retry(monkeypatch, tmp_path):
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    await cancelled_paid_job_scenario(tmp_path)

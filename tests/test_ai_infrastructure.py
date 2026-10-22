@@ -1,12 +1,7 @@
 import asyncio
-import faulthandler
 import json
 import sqlite3
-import subprocess
-import sys
-import tempfile
 from decimal import Decimal
-from pathlib import Path
 
 import pytest
 
@@ -20,13 +15,11 @@ from hoard.service import Service
 from hoard.storage import Store
 from hoard.telegram import AuthState
 
-_WIN311 = sys.platform == "win32" and sys.version_info < (3, 12)
-
 
 async def wait_for(predicate, seconds=4):
     async with asyncio.timeout(seconds):
         while not predicate():
-            await asyncio.sleep(0 if _WIN311 else 0.02)
+            await asyncio.sleep(0.02)
 
 
 class FakeEngine:
@@ -243,7 +236,7 @@ async def test_duplicate_operation_and_concurrent_branch_create_one_paid_job(tmp
         await send(service, conversation["id"], operation="different")
 
     await service.start_background()
-    await wait_for(provider.started.is_set, seconds=2)
+    await asyncio.wait_for(provider.started.wait(), 2)
     provider.release.set()
     await wait_for(lambda: store.ai.attempt(first["id"])["state"] == "completed")
     assert len(provider.requests) == 1
@@ -667,66 +660,3 @@ async def test_statistics_filters_and_unknown_cost_count(tmp_path):
     assert stats["estimated_costs"] == {}
     await service.stop_background()
     store.close()
-
-
-# Python 3.11's Windows selector loop can stall when pytest creates and tears down
-# many loops around daemon-runner tests. Exercise every async scenario in its own
-# process with the production-default Proactor loop there.
-_ASYNC_SCENARIOS = (
-    test_prompt_crud_versions_activation_and_pagination,
-    test_chat_generation_uses_frozen_prompt_versions_and_persists_history,
-    test_chat_crud_archive_filters_and_soft_delete_preserve_history,
-    test_duplicate_operation_and_concurrent_branch_create_one_paid_job,
-    test_memory_is_explicit_versioned_and_isolated_by_scope,
-    test_context_limit_never_silently_truncates_prompt_or_new_message,
-    test_queued_chat_survives_daemon_restart,
-    test_running_attempt_becomes_unknown_after_daemon_restart,
-    test_old_running_legacy_job_is_backfilled_as_unknown_on_upgrade,
-    test_invalid_json_still_records_usage_reasoning_and_decimal_cost,
-    test_missing_usage_and_partial_tariff_never_become_fake_zero,
-    test_historical_cost_snapshot_does_not_change_with_tariffs,
-    test_connection_loss_is_unknown_and_retry_creates_new_attempt,
-    test_new_image_path_uses_private_attachment_reference_not_job_base64,
-    test_legacy_ai_jobs_are_accounted_without_changing_payload,
-    test_terminal_attempt_accounting_and_assistant_write_are_idempotent,
-    test_ai_job_error_does_not_copy_provider_or_chat_text_to_general_log,
-    test_statistics_filters_and_unknown_cost_count,
-)
-if _WIN311 and __name__ != "__main__":
-    for _scenario in _ASYNC_SCENARIOS:
-        globals()[_scenario.__name__] = pytest.mark.skip(
-            reason="covered in an isolated Windows 3.11 process"
-        )(_scenario)
-
-    @pytest.mark.parametrize("scenario", _ASYNC_SCENARIOS, ids=lambda item: item.__name__)
-    def test_windows311_ai_infrastructure_in_isolated_process(scenario):
-        completed = subprocess.run(
-            [
-                sys.executable,
-                str(Path(__file__).resolve()),
-                "windows311",
-                scenario.__name__,
-            ],
-            timeout=15,
-            check=False,
-        )
-        assert completed.returncode == 0
-
-
-if __name__ == "__main__":
-    if len(sys.argv) != 3 or sys.argv[1] != "windows311":
-        raise SystemExit("expected windows311 and a scenario name")
-    scenarios = {scenario.__name__: scenario for scenario in _ASYNC_SCENARIOS}
-    try:
-        selected_scenario = scenarios[sys.argv[2]]
-    except KeyError:
-        raise SystemExit("unknown Windows 3.11 scenario") from None
-    if _WIN311:
-        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
-        faulthandler.dump_traceback_later(5)
-    try:
-        with tempfile.TemporaryDirectory(prefix="hoard-ai-infrastructure-") as directory:
-            asyncio.run(selected_scenario(Path(directory)))
-    finally:
-        if _WIN311:
-            faulthandler.cancel_dump_traceback_later()
