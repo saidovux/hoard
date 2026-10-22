@@ -1,33 +1,28 @@
 """Cross-platform pytest configuration."""
 
 import asyncio
-import contextlib
 import sys
 
 import pytest
 
 if sys.platform == "win32" and sys.version_info < (3, 12):
 
+    class ResponsiveWindowsSelectorEventLoopPolicy(
+        asyncio.WindowsSelectorEventLoopPolicy
+    ):
+        """Bound selector sleeps in pytest's short-lived Python 3.11 loops."""
+
+        def new_event_loop(self):
+            loop = super().new_event_loop()
+
+            def wake_selector() -> None:
+                if not loop.is_closed():
+                    loop.call_later(0.01, wake_selector)
+
+            loop.call_soon(wake_selector)
+            return loop
+
     @pytest.fixture(scope="session", autouse=True)
     def event_loop_policy():
         """Prevent Python 3.11 Proactor stalls between async test modules."""
-        return asyncio.WindowsSelectorEventLoopPolicy()
-
-
-if sys.version_info < (3, 12):
-
-    @pytest.fixture(autouse=True)
-    async def keep_python311_async_tests_responsive():
-        """Keep Python 3.11 test loops from sleeping with pending async work."""
-
-        async def heartbeat() -> None:
-            while True:
-                await asyncio.sleep(0)
-
-        worker = asyncio.create_task(heartbeat(), name="pytest-py311-loop-heartbeat")
-        try:
-            yield
-        finally:
-            worker.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await worker
+        return ResponsiveWindowsSelectorEventLoopPolicy()
