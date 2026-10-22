@@ -9,7 +9,7 @@ from typing import Any
 
 from .archive_paths import default_archive_root, path_is_within
 
-TELEGRAM_SCHEMA_VERSION = 1
+TELEGRAM_SCHEMA_VERSION = 2
 
 
 def utc_now() -> str:
@@ -131,6 +131,12 @@ class TelegramStorage:
             if name not in download_columns:
                 self.db.execute(f"ALTER TABLE downloads ADD COLUMN {name} {declaration}")
         self.db.execute(
+            "INSERT OR IGNORE INTO tg_settings(key,value) VALUES('catalog_dirty','0')"
+        )
+        self.db.execute(
+            "INSERT OR IGNORE INTO tg_settings(key,value) VALUES('catalog_revision','0')"
+        )
+        self.db.execute(
             """INSERT INTO schema_versions(module,version) VALUES('telegram',?)
             ON CONFLICT(module) DO UPDATE SET
             version=MAX(schema_versions.version,excluded.version),
@@ -185,10 +191,33 @@ class TelegramStorage:
             )
 
     def set_catalog_dirty(self, dirty: bool = True) -> None:
-        self.set_setting("catalog_dirty", "1" if dirty else "0")
+        with self.db:
+            if dirty:
+                self._set_dirty_sql()
+            else:
+                self.db.execute(
+                    "UPDATE tg_settings SET value='0' WHERE key='catalog_dirty'"
+                )
 
     def catalog_dirty(self) -> bool:
         return self.get_setting("catalog_dirty", "0") == "1"
+
+    def catalog_revision(self) -> int:
+        try:
+            return int(self.get_setting("catalog_revision", "0"))
+        except ValueError:
+            return 0
+
+    def clear_catalog_dirty(self, revision: int) -> bool:
+        """Clear dirty only when no archive mutation followed the rendered snapshot."""
+        with self.db:
+            cursor = self.db.execute(
+                """UPDATE tg_settings SET value='0' WHERE key='catalog_dirty'
+                AND CAST((SELECT value FROM tg_settings
+                          WHERE key='catalog_revision') AS INTEGER)=?""",
+                (int(revision),),
+            )
+        return cursor.rowcount == 1
 
     def archive_root(self, preferred: str | Path | None = None, *, persist: bool = False) -> Path:
         if preferred is not None:
@@ -339,6 +368,11 @@ class TelegramStorage:
         self.db.execute(
             """INSERT INTO tg_settings(key,value) VALUES('catalog_dirty','1')
             ON CONFLICT(key) DO UPDATE SET value='1'"""
+        )
+        self.db.execute(
+            """INSERT INTO tg_settings(key,value) VALUES('catalog_revision','1')
+            ON CONFLICT(key) DO UPDATE SET
+            value=CAST(CAST(value AS INTEGER)+1 AS TEXT)"""
         )
 
     def migrate_legacy_downloads(self) -> None:

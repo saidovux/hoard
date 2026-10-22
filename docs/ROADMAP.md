@@ -17,9 +17,11 @@ is not required for round completion; it must not be run without separate user p
 5. **Telegram AI + PSL + AI Chat TUI — completed.** Explicitly confirmed AI chats, provider and
    prompt controls, scoped memory, tariffs/statistics, durable manual retries, saved-profile photo
    selection and the versioned adult-only subjective PSL contract.
-6. **Offline HTML Experience.** Complete the offline redesign and interactive single-file catalog
-   without introducing a web service.
+6. **Offline HTML Experience — completed.** Responsive source/profile media catalog, batch PSL
+   export, composable filters and null-safe sorting, local browser history, bounded galleries and
+   revision-safe atomic regeneration without introducing a web service.
 
 The accelerated plan preserves every prior scope marker: old rounds 4 and 5 are merged into round
 4; old rounds 6 and 7 are merged into round 5; old rounds 8 and 9 are merged into round 6.
-Later-round controls stay hidden until their complete daemon and interface behavior exists.
+The original functional plan is complete. Further work is stabilization, compatibility and bug
+fixing rather than additional product subsystems.

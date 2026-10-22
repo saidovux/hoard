@@ -11,6 +11,7 @@ from importlib import resources
 from pathlib import Path
 from typing import Any
 
+from .ai.psl import validate_psl_result
 from .archive_paths import (
     media_reference,
     path_is_within,
@@ -20,7 +21,7 @@ from .archive_paths import (
 from .paths import ensure_private
 from .storage import Store
 
-CATALOG_SCHEMA_VERSION = 1
+CATALOG_SCHEMA_VERSION = 2
 STYLE_TOKEN = "/*__HOARD_STYLE__*/"
 DATA_TOKEN = "/*__HOARD_DATA__*/"
 APP_TOKEN = "/*__HOARD_APP__*/"
@@ -49,6 +50,67 @@ def search_profiles(profiles: list[dict[str, Any]], query: str) -> list[dict[str
     return [profile for profile in profiles if needle in _profile_search_blob(profile)]
 
 
+def filter_profiles(
+    profiles: list[dict[str, Any]], filters: dict[str, Any]
+) -> list[dict[str, Any]]:
+    """Apply the catalog's composable profile filters with strict null semantics."""
+
+    def flag_matches(actual: bool, requested: Any) -> bool:
+        if requested is None:
+            return True
+        return actual is bool(requested)
+
+    def number(value: Any) -> float | None:
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
+
+    result = search_profiles(profiles, str(filters.get("query") or ""))
+    selected: list[dict[str, Any]] = []
+    source_id = filters.get("source_id")
+    for profile in result:
+        latest = profile.get("psl_latest")
+        photos = profile.get("photos") or []
+        videos = profile.get("video_ids") or []
+        if source_id is not None and int(source_id) not in {
+            int(item) for item in profile.get("post_ids") or []
+        }:
+            continue
+        if not flag_matches(bool(photos), filters.get("has_photos")):
+            continue
+        if not flag_matches(bool(videos), filters.get("has_videos")):
+            continue
+        if not flag_matches(latest is not None, filters.get("has_psl")):
+            continue
+        numeric = {
+            "raw_min": number(latest.get("raw_psl_min")) if latest else None,
+            "raw_max": number(latest.get("raw_psl_max")) if latest else None,
+            "boosted_min": number(latest.get("boosted_psl")) if latest else None,
+            "age_min": number(latest.get("estimated_age")) if latest else None,
+            "age_max": number(latest.get("estimated_age")) if latest else None,
+        }
+        rejected = False
+        for name, actual in numeric.items():
+            requested = number(filters.get(name))
+            if requested is None:
+                continue
+            if actual is None:
+                rejected = True
+                break
+            if name.endswith("_min") and actual < requested:
+                rejected = True
+                break
+            if name.endswith("_max") and actual > requested:
+                rejected = True
+                break
+        if not rejected:
+            selected.append(profile)
+    return selected
+
+
 def search_posts(posts: list[dict[str, Any]], query: str) -> list[dict[str, Any]]:
     needle = query.strip().casefold().lstrip("@")
     if not needle:
@@ -73,7 +135,10 @@ def search_posts(posts: list[dict[str, Any]], query: str) -> list[dict[str, Any]
 def sort_profiles(
     profiles: list[dict[str, Any]], key: str, *, descending: bool = False
 ) -> list[dict[str, Any]]:
+    numeric_keys = {"id", "video_count", "media_count", "raw_psl", "boosted_psl", "age"}
+
     def value(profile: dict[str, Any]):
+        latest = profile.get("psl_latest") or {}
         if key == "id":
             return int(profile["author_id"])
         if key == "username":
@@ -82,11 +147,27 @@ def sort_profiles(
             return profile["first_seen"]
         if key == "video_count":
             return len(profile["video_ids"])
+        if key == "media_count":
+            return len(profile.get("video_ids") or []) + len(profile.get("photos") or [])
+        if key == "raw_psl":
+            low = latest.get("raw_psl_min")
+            high = latest.get("raw_psl_max")
+            return None if low is None or high is None else (float(low) + float(high)) / 2
+        if key == "boosted_psl":
+            value = latest.get("boosted_psl")
+            return None if value is None else float(value)
+        if key == "age":
+            value = latest.get("estimated_age")
+            return None if value is None else int(value)
         if key == "last_active":
             return profile["last_activity"] or profile["last_seen"]
         return profile["display_name"].casefold()
 
-    return sorted(profiles, key=value, reverse=descending)
+    if key not in numeric_keys:
+        return sorted(profiles, key=value, reverse=descending)
+    present = [profile for profile in profiles if value(profile) is not None]
+    missing = [profile for profile in profiles if value(profile) is None]
+    return sorted(present, key=value, reverse=descending) + missing
 
 
 def sort_posts(
@@ -128,10 +209,78 @@ def _media_item(
     }
 
 
-def build_payload(store: Store, archive_root: Path) -> dict[str, Any]:
-    rows = store.telegram.catalog_rows()
+def _catalog_snapshot(
+    store: Store, archive_root: Path
+) -> tuple[int, dict[str, list[dict[str, Any]]], list[dict[str, Any]], list[Path]]:
+    """Read Telegram, AI and root metadata from one short SQLite snapshot."""
+    store.db.execute("BEGIN")
+    try:
+        revision = store.telegram.catalog_revision()
+        rows = store.telegram.catalog_rows()
+        analyses = store.ai.catalog_telegram_analyses()
+        allowed_roots = store.telegram.allowed_media_roots(archive_root)
+    except BaseException:
+        store.db.rollback()
+        raise
+    else:
+        store.db.commit()
+    return revision, rows, analyses, allowed_roots
+
+
+def _analysis_item(row: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    attempt_state = _text(row.get("attempt_state"))
+    result_status = _text(row.get("result_status"))
+    status = result_status or attempt_state or "unknown"
+    valid = False
+    normalized: dict[str, Any] | None = None
+    if result_status == "completed" and attempt_state == "completed":
+        try:
+            normalized = validate_psl_result(
+                {
+                    "status": result_status,
+                    "presentation": row.get("presentation"),
+                    "estimated_age": row.get("estimated_age"),
+                    "raw_psl_min": row.get("raw_psl_min"),
+                    "raw_psl_max": row.get("raw_psl_max"),
+                    "boosted_psl": row.get("boosted_psl"),
+                }
+            )
+        except ValueError:
+            status = "invalid_result"
+        else:
+            valid = True
+    elif attempt_state == "outcome_unknown":
+        status = "outcome_unknown"
+    elif attempt_state == "failed":
+        status = "invalid_result" if result_status == "invalid_result" else "failed"
+
+    item = {
+        "status": status,
+        "analyzed_at": _text(
+            row.get("analyzed_at") or row.get("completed_at") or row.get("created_at")
+        ),
+        "actual_model": _text(row.get("actual_model")),
+        "prompt_version_id": _text(row.get("prompt_version_id")),
+        "schema_version": int(row.get("schema_version") or 0),
+        "attempt_id": _text(row.get("attempt_id")),
+        "presentation": normalized["presentation"] if valid and normalized else None,
+        "estimated_age": normalized["estimated_age"] if valid and normalized else None,
+        "raw_psl_min": normalized["raw_psl_min"] if valid and normalized else None,
+        "raw_psl_max": normalized["raw_psl_max"] if valid and normalized else None,
+        "boosted_psl": normalized["boosted_psl"] if valid and normalized else None,
+    }
+    return item, valid
+
+
+def _build_payload(
+    *,
+    rows: dict[str, list[dict[str, Any]]],
+    analyses: list[dict[str, Any]],
+    archive_root: Path,
+    allowed_roots: list[Path],
+    revision: int,
+) -> dict[str, Any]:
     catalog_dir = archive_root.expanduser().resolve()
-    allowed_roots = store.telegram.allowed_media_roots(archive_root)
     metadata = {int(row["source_id"]): row for row in rows["post_metadata"]}
     post_media: dict[int, list[dict[str, Any]]] = {}
     for raw in rows["post_media"]:
@@ -160,6 +309,8 @@ def build_payload(store: Store, archive_root: Path) -> dict[str, Any]:
             "post_ids": [],
             "video_ids": [],
             "photos": [],
+            "psl_latest": None,
+            "psl_history": [],
         }
     for row in rows["username_history"]:
         profile = profiles.get(int(row["author_id"]))
@@ -187,6 +338,15 @@ def build_payload(store: Store, archive_root: Path) -> dict[str, Any]:
             }
         )
         profile["photos"].append(item)
+
+    for row in analyses:
+        profile = profiles.get(int(row["author_id"]))
+        if profile is None:
+            continue
+        item, valid = _analysis_item(row)
+        profile["psl_history"].append(item)
+        if valid and profile["psl_latest"] is None:
+            profile["psl_latest"] = dict(item)
 
     posts: dict[int, dict[str, Any]] = {}
     for source in rows["sources"]:
@@ -257,11 +417,23 @@ def build_payload(store: Store, archive_root: Path) -> dict[str, Any]:
 
     return {
         "schema_version": CATALOG_SCHEMA_VERSION,
+        "revision": revision,
         "generated_at": datetime.now(UTC).isoformat(),
         "posts": list(posts.values()),
         "profiles": list(profiles.values()),
         "videos": videos,
     }
+
+
+def build_payload(store: Store, archive_root: Path) -> dict[str, Any]:
+    revision, rows, analyses, allowed_roots = _catalog_snapshot(store, archive_root)
+    return _build_payload(
+        rows=rows,
+        analyses=analyses,
+        archive_root=archive_root,
+        allowed_roots=allowed_roots,
+        revision=revision,
+    )
 
 
 def _serialize_data(payload: dict[str, Any]) -> str:
@@ -395,8 +567,14 @@ def build_catalog(
         style = _template_text("style.css", template_dir)
         app = _template_text("app.js", template_dir)
         _migrate_obsolete_split_catalog(store, root)
-        store.telegram.set_catalog_dirty(False)
-        payload = build_payload(store, root)
+        revision, rows, analyses, allowed_roots = _catalog_snapshot(store, root)
+        payload = _build_payload(
+            rows=rows,
+            analyses=analyses,
+            archive_root=root,
+            allowed_roots=allowed_roots,
+            revision=revision,
+        )
         content = _bundle_html(
             index,
             style=style,
@@ -415,6 +593,7 @@ def build_catalog(
         temporary = None
         if os.name != "nt":
             target.chmod(0o600)
+        store.telegram.clear_catalog_dirty(revision)
     except BaseException:
         store.telegram.set_catalog_dirty()
         raise

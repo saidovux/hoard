@@ -359,6 +359,7 @@ class AIChatService:
                     "UPDATE ai_attempts SET job_id=? WHERE id=?",
                     (int(job.lastrowid), attempt_id),
                 )
+                self.storage._mark_catalog_changed_sql()
             return self.storage.telegram_analysis(analysis_id)
         except Exception:
             for _photo, attachment in imported:
@@ -743,4 +744,6 @@ class AIChatService:
                         timestamp,
                     ),
                 )
+            if original_analysis is not None:
+                self.storage._mark_catalog_changed_sql()
         return self.storage.attempt(new_attempt)

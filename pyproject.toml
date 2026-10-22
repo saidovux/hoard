@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hoard-local"
-version = "0.5.0"
+version = "0.6.0"
 description = "Local Telegram archive with an autonomous offline HTML catalog"
 readme = "README.md"
 requires-python = ">=3.11"

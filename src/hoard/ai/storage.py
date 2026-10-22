@@ -1051,6 +1051,36 @@ class AIStorage:
             "has_more": len(rows) > page_limit,
         }
 
+    def catalog_telegram_analyses(self) -> list[dict[str, Any]]:
+        """Read the complete compact PSL journal in one ordered query for HTML export."""
+        return [
+            dict(row)
+            for row in self.db.execute(
+                """SELECT a.id,a.author_id,a.attempt_id,a.prompt_version_id,
+                a.schema_version,a.result_status,a.presentation,a.estimated_age,
+                a.raw_psl_min,a.raw_psl_max,a.boosted_psl,
+                COALESCE(a.actual_model,t.actual_model) AS actual_model,
+                a.analyzed_at,a.created_at,t.state AS attempt_state,t.completed_at
+                FROM ai_telegram_analyses a
+                JOIN ai_attempts t ON t.id=a.attempt_id
+                ORDER BY a.author_id,
+                COALESCE(t.completed_at,a.analyzed_at,a.created_at) DESC,
+                COALESCE(a.analyzed_at,a.created_at) DESC,a.id DESC"""
+            )
+        ]
+
+    def _mark_catalog_changed_sql(self) -> None:
+        """Mark a catalog-visible AI mutation inside the caller's transaction."""
+        self.db.execute(
+            """INSERT INTO tg_settings(key,value) VALUES('catalog_dirty','1')
+            ON CONFLICT(key) DO UPDATE SET value='1'"""
+        )
+        self.db.execute(
+            """INSERT INTO tg_settings(key,value) VALUES('catalog_revision','1')
+            ON CONFLICT(key) DO UPDATE SET
+            value=CAST(CAST(value AS INTEGER)+1 AS TEXT)"""
+        )
+
     def job_state(self, job_id: int) -> dict:
         row = self.db.execute(
             """SELECT id,kind,state,attempts,result,created_at,updated_at
@@ -1085,7 +1115,7 @@ class AIStorage:
         with self.db:
             rows = list(
                 self.db.execute(
-                    """SELECT a.id,a.user_message_id FROM ai_attempts a
+                    """SELECT a.id,a.user_message_id,a.entity_kind FROM ai_attempts a
                     LEFT JOIN jobs j ON j.id=a.job_id
                     WHERE a.state='running' OR (a.state='queued' AND j.state='running')"""
                 )
@@ -1106,6 +1136,8 @@ class AIStorage:
                     f"UPDATE ai_messages SET state='failed' WHERE id IN ({placeholders})",
                     tuple(message_ids),
                 )
+            if any(row["entity_kind"] == "telegram.psl" for row in rows):
+                self._mark_catalog_changed_sql()
         return len(rows)
 
     def finish_attempt(
@@ -1205,6 +1237,7 @@ class AIStorage:
                         actual_model=?,analyzed_at=? WHERE id=? AND analyzed_at IS NULL""",
                         (getattr(response, "model", None), timestamp, current["entity_id"]),
                     )
+                self._mark_catalog_changed_sql()
         return self.attempt(attempt_id)
 
     def statistics(self, filters: dict[str, Any]) -> dict:

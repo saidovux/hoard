@@ -1,13 +1,14 @@
-# Hoard 0.5.0
+# Hoard 0.6.0
 
 Hoard is a local-first Linux and Windows archive for Telegram posts, profiles and video notes
 found in a channel post's comments. It uses Telethon, SQLite, an autonomous offline HTML catalog
 and terminal interfaces. A private background daemon performs all Telegram work; closing an
 interface does not stop downloads.
 
-This release adds an explicit AI workspace and optional, manually initiated analysis of locally
-saved Telegram profile photos. It never analyzes a profile on its own. The project has no web
-server, Redis, Docker or Electron.
+This release completes the original functional roadmap with a modern autonomous HTML media
+catalog. It combines saved publications, profiles, photos, video notes and explicitly requested
+PSL history without a web server or browser network access. AI analysis is never started
+automatically. The project has no web server, Redis, Docker or Electron.
 
 ## Terminal interfaces
 
@@ -147,12 +148,33 @@ hoard telegram report --archive ~/Videos/hoard
 ```
 
 The command reads SQLite and rebuilds the snapshot without starting the daemon, connecting to
-Telegram or requiring internet access. Open `<archive>/telegram_archive.html` directly in Firefox,
-Chromium or another local browser. CSS, JavaScript and the SQLite snapshot are embedded in that
-single HTML file; it has no companion site assets, web server, `fetch`, CDN, analytics or external
-font dependency. Search and sorting work locally across posts, IDs, current and observed
-usernames, display names and channels. Media uses lazy loading, pagination and
-`<video controls preload="none">`.
+Telegram or requiring internet access. Open `<archive>/telegram_archive.html` directly through
+`file://` in Firefox, Chromium or another local browser. CSS, JavaScript and the normalized
+SQLite snapshot are embedded in that single HTML file; it has no companion site assets, web
+server, `fetch`, CDN, analytics or external font dependency. Media remains as local files beside
+the report rather than being embedded as Base64.
+
+The **Источники** view presents saved posts as responsive cards with channel identity, text,
+publication/check dates, local media preview and profile/video counts. **Все профили** deduplicates
+people by stable Telegram `author_id`, so a username change does not split history. Search includes
+IDs, names, current and observed usernames and related sources. Profile filters combine source,
+photo/video availability, successful PSL, Raw/Boosted PSL and adult-age ranges. Name, username,
+ID, discovery/activity dates, media count and PSL fields are sortable; missing numeric values are
+always last. Post search and sorting remain available independently.
+
+Post and profile pages preserve list query, filters, sorting, pagination and scroll context.
+Browser Back/Forward works through local hash history for `Источники → Пост → Профиль` and
+`Все профили → Профиль`. Photo galleries render one bounded page at a time, lazy-load images and
+open a keyboard-accessible viewer with arrow navigation and Escape. Video notes use HTML5
+controls, never autoplay and retain `preload="none"`; their saved comment date and original
+Telegram link are shown. Missing or rejected local paths render an inert placeholder.
+
+Completed Telegram PSL analyses are exported in one batch and joined only by `author_id`. A
+profile's current value is the newest deterministically ordered result whose analysis and attempt
+both completed and whose adult-only PSL fields still pass the versioned validator. A later failed,
+unknown, ineligible or invalid attempt remains in compact history without replacing that value.
+Possible-minor ages, provider payloads, chat text, prompt content, memory, API keys and private AI
+attachment paths are never exported. The catalog labels PSL as subjective and non-scientific.
 
 The TUI Archive screen can rebuild the snapshot and shows its path together with downloads,
 profiles and jobs. Open the resulting single HTML file in a local browser when needed.
@@ -160,9 +182,16 @@ profiles and jobs. Open the resulting single HTML file in a local browser when n
 For maintainability, source HTML, CSS and JavaScript remain separate and are packaged at
 `src/hoard/templates/telegram/`; the generator assembles them only at report time. Each report
 atomically replaces `telegram_archive.html` while preserving `hoard_objects/`. SQLite remains the
-source of truth. Media from the short-lived split layout `<archive>/telegram/objects/` is safely
+source of truth. A monotonic catalog revision prevents a build from clearing the dirty marker
+when Telegram or PSL data changes during generation; the daemon then coalesces and rebuilds the
+newer snapshot. Media from the short-lived split layout `<archive>/telegram/objects/` is safely
 moved into `hoard_objects/` and its SQLite paths are updated; unrelated legacy archive layouts
 remain in place. Conflicting or unexpected files are preserved instead of overwritten.
+
+Moving the complete archive keeps new relative `hoard_objects/` links working. Older media stored
+outside the selected archive may require its original absolute location (or drive on Windows), so
+one HTML file by itself is not promised to contain or relocate media. The catalog warns that it
+contains personal data and should be reviewed before sharing.
 
 Optional enrichment obtains post text/media and up to 30 latest profile photos visible to the
 authorized account:
@@ -264,8 +293,8 @@ to the private AI attachment directory and atomically links it to the attempt. D
 IDs return the existing attempt. Connection ambiguity becomes `outcome_unknown`; Hoard warns that
 the provider may have charged for it and never retries automatically. A manual retry creates a
 new paid attempt linked to the original operation. Historical results, actual model, usage,
-currency-separated estimated costs and selected photo IDs remain in SQLite. The offline HTML is
-intentionally unchanged until round 6.
+currency-separated estimated costs and selected photo IDs remain in SQLite. The offline HTML
+exports only the minimal validated result and compact status history described above.
 
 ## Background operation
 
@@ -336,8 +365,9 @@ python -m pip wheel . --no-deps -w dist
 Set `HOARD_DEBUG=1` only while diagnosing a local daemon problem; normal IPC errors omit
 exception class details. Automated tests use fake Telegram clients and require no account,
 code or network access. Live login and downloads still require your own authorized Telegram
-account and content you are permitted to archive. Automated browser verification is attempted
-when a compatible browser is available; generation and security behavior are covered without one.
+account and content you are permitted to archive. The release procedure verifies the generated
+`file://` catalog in a locally installed Chromium when available, including browser Back/Forward
+context; generation and security behavior are also covered without a browser.
 GitHub Actions is manual-dispatch only and is not required for release verification.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for implementation details.

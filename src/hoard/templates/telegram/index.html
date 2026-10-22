@@ -11,34 +11,95 @@
   </style>
 </head>
 <body>
-  <header class="topbar">
-    <button class="brand plain-button" id="home" type="button">hoard<span>.</span></button>
-    <div>
+  <header class="topbar shell">
+    <button class="brand plain-button" id="home" type="button" aria-label="К источникам">
+      hoard<span>.</span>
+    </button>
+    <div class="heading">
       <h1 id="title">Telegram archive</h1>
       <p id="summary" class="muted">Локальный каталог</p>
     </div>
+    <nav class="switcher" aria-label="Раздел каталога">
+      <button id="show-posts" class="active" type="button">Источники</button>
+      <button id="show-profiles" type="button">Все профили</button>
+    </nav>
   </header>
-  <main>
+
+  <aside class="privacy shell" aria-label="Предупреждение о приватности">
+    Это локальный архив с персональными данными. Перед передачей файла или архива другим людям
+    проверьте его содержимое.
+  </aside>
+
+  <main class="shell">
     <noscript>Для просмотра локального каталога включите JavaScript.</noscript>
-    <section class="toolbar" aria-label="Поиск и сортировка">
-      <label class="search"><span>Поиск</span><input id="query" type="search"
-        placeholder="Имя, @username, ID, канал или пост" autocomplete="off"></label>
-      <label><span>Сортировка</span><select id="sort"></select></label>
-      <button id="direction" type="button" title="Поменять направление">↓</button>
-      <div class="switcher" role="group" aria-label="Раздел">
-        <button id="show-posts" class="active" type="button">Посты</button>
-        <button id="show-profiles" type="button">Все профили</button>
-      </div>
+    <section class="toolbar" id="toolbar" aria-label="Поиск, фильтры и сортировка">
+      <label class="field search">
+        <span>Поиск</span>
+        <input id="query" type="search" placeholder="Имя, @username, ID, канал или пост"
+          autocomplete="off">
+      </label>
+      <label class="field sort-field">
+        <span>Сортировка</span>
+        <select id="sort"></select>
+      </label>
+      <button id="direction" class="direction" type="button" title="По убыванию"
+        aria-label="Поменять направление сортировки">↓</button>
+      <button id="reset" class="secondary" type="button">Сбросить</button>
+
+      <details class="filters" id="profile-filters" hidden>
+        <summary>Фильтры профилей <span id="filter-count" class="filter-count"></span></summary>
+        <div class="filter-grid">
+          <label class="field"><span>Источник</span><select id="filter-source"></select></label>
+          <label class="field"><span>Фотографии</span><select id="filter-photos">
+            <option value="any">Неважно</option><option value="yes">Есть</option>
+            <option value="no">Нет</option>
+          </select></label>
+          <label class="field"><span>Кружки</span><select id="filter-videos">
+            <option value="any">Неважно</option><option value="yes">Есть</option>
+            <option value="no">Нет</option>
+          </select></label>
+          <label class="field"><span>Успешный PSL</span><select id="filter-psl">
+            <option value="any">Неважно</option><option value="yes">Есть</option>
+            <option value="no">Нет</option>
+          </select></label>
+          <label class="field"><span>Raw PSL от</span><input id="filter-raw-min"
+            type="number" min="0" max="8" step="0.1" inputmode="decimal"></label>
+          <label class="field"><span>Raw PSL до</span><input id="filter-raw-max"
+            type="number" min="0" max="8" step="0.1" inputmode="decimal"></label>
+          <label class="field"><span>Boosted PSL от</span><input id="filter-boosted"
+            type="number" min="0" max="8" step="0.1" inputmode="decimal"></label>
+          <label class="field"><span>Возраст от</span><input id="filter-age-min"
+            type="number" min="18" max="120" step="1" inputmode="numeric"></label>
+          <label class="field"><span>Возраст до</span><input id="filter-age-max"
+            type="number" min="18" max="120" step="1" inputmode="numeric"></label>
+        </div>
+      </details>
     </section>
+
     <div id="notice" class="notice" hidden></div>
     <section id="content" aria-live="polite"></section>
     <nav id="pager" class="pager" aria-label="Страницы" hidden>
-      <button id="previous" type="button">Назад</button>
+      <button id="previous" type="button">← Назад</button>
       <span id="page-label"></span>
-      <button id="next" type="button">Дальше</button>
+      <button id="next" type="button">Дальше →</button>
     </nav>
   </main>
-  <footer><span id="generated"></span> · только локальные данные</footer>
+
+  <footer class="shell"><span id="generated"></span> · автономный локальный снимок</footer>
+
+  <dialog id="viewer" class="viewer" aria-label="Просмотр медиа">
+    <div class="viewer-bar">
+      <span id="viewer-label"></span>
+      <button id="viewer-close" type="button" aria-label="Закрыть просмотр">Закрыть ×</button>
+    </div>
+    <div id="viewer-stage" class="viewer-stage"></div>
+    <div class="viewer-controls">
+      <button id="viewer-previous" type="button" aria-label="Предыдущее изображение">←</button>
+      <span id="viewer-position"></span>
+      <button id="viewer-next" type="button" aria-label="Следующее изображение">→</button>
+    </div>
+  </dialog>
+
   <!-- Data and behavior are inserted into the same portable HTML file. -->
   <script data-hoard-bundle="data">
 /*__HOARD_DATA__*/

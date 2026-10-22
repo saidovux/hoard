@@ -1,20 +1,53 @@
 (() => {
   "use strict";
 
-  const catalog = window.HOARD_CATALOG || {posts: [], profiles: [], videos: []};
-  const PAGE_SIZE = 80;
+  const catalog = window.HOARD_CATALOG || {};
+  const PAGE_SIZE = 48;
+  const MEDIA_PAGE_SIZE = 24;
+  const VIDEO_PAGE_SIZE = 12;
+  const HISTORY_PAGE_SIZE = 20;
   const byId = (id) => document.getElementById(id);
   const content = byId("content");
-  const query = byId("query");
-  const sort = byId("sort");
+  const queryInput = byId("query");
+  const sortInput = byId("sort");
   const direction = byId("direction");
-  const state = {view: "posts", detail: null, page: 0, descending: true};
+  const toolbar = byId("toolbar");
+  const profileFilters = byId("profile-filters");
   const posts = Array.isArray(catalog.posts) ? catalog.posts : [];
   const profiles = Array.isArray(catalog.profiles) ? catalog.profiles : [];
   const videos = Array.isArray(catalog.videos) ? catalog.videos : [];
   const postMap = new Map(posts.map((item) => [Number(item.source_id), item]));
   const profileMap = new Map(profiles.map((item) => [Number(item.author_id), item]));
   const videoMap = new Map(videos.map((item) => [String(item.video_id), item]));
+  const profileSearchIndex = new Map();
+  const postSearchIndex = new Map();
+  const sectionPages = new Map();
+  let currentRoute = null;
+  let inputTimer = null;
+
+  const emptyFilters = () => ({
+    source: "", photos: "any", videos: "any", psl: "any",
+    rawMin: "", rawMax: "", boosted: "", ageMin: "", ageMax: "",
+  });
+  const lists = {
+    posts: {query: "", sort: "published", descending: true, page: 0},
+    profiles: {
+      query: "", sort: "last_active", descending: true, page: 0,
+      filters: emptyFilters(),
+    },
+  };
+
+  const profileSorts = [
+    ["name", "Имя"], ["username", "Username"], ["id", "Telegram ID"],
+    ["discovered", "Дата обнаружения"], ["last_active", "Последняя активность"],
+    ["media_count", "Количество медиа"], ["raw_psl", "Raw PSL"],
+    ["boosted_psl", "Boosted PSL"], ["age", "Возраст"],
+  ];
+  const postSorts = [
+    ["published", "Дата публикации"], ["checked", "Последняя проверка"],
+    ["channel", "Канал"], ["post_id", "ID поста"],
+    ["video_count", "Количество кружков"],
+  ];
 
   function element(tag, className, text) {
     const node = document.createElement(tag);
@@ -24,7 +57,7 @@
   }
 
   function clean(value, fallback = "—") {
-    const result = String(value || "").trim();
+    const result = String(value ?? "").trim();
     return result || fallback;
   }
 
@@ -32,6 +65,23 @@
     if (!value) return "—";
     const parsed = new Date(value);
     return Number.isNaN(parsed.getTime()) ? String(value) : parsed.toLocaleString("ru-RU");
+  }
+
+  function numberValue(value) {
+    if (value === null || value === undefined || value === "") return null;
+    const result = Number(value);
+    return Number.isFinite(result) ? result : null;
+  }
+
+  function scoreText(value) {
+    const score = numberValue(value);
+    return score === null ? "—" : score.toLocaleString("ru-RU", {maximumFractionDigits: 2});
+  }
+
+  function meta(items) {
+    const line = element("div", "meta");
+    items.filter(Boolean).forEach((text) => line.append(element("span", "", text)));
+    return line;
   }
 
   function originalLink(url, label) {
@@ -44,20 +94,39 @@
         link.rel = "noreferrer noopener";
         return link;
       }
-    } catch (_) { /* invalid external link stays plain text */ }
+    } catch (_) { /* Invalid external links stay inert text. */ }
     return element("span", "muted", label);
   }
 
   function localMediaURL(url) {
-    const value = String(url || "");
-    if (!value || value.startsWith("//")) return "";
-    if (/^[a-z][a-z0-9+.-]*:/i.test(value) && !value.startsWith("file:")) return "";
+    const value = String(url || "").trim();
+    if (!value || value.startsWith("//") || value.includes("\\") || /[\u0000-\u001f]/.test(value)) {
+      return "";
+    }
+    if (/^[a-z][a-z0-9+.-]*:/i.test(value)) {
+      try {
+        return new URL(value).protocol === "file:" ? value : "";
+      } catch (_) {
+        return "";
+      }
+    }
+    if (value.startsWith("/")) return "";
+    try {
+      if (decodeURIComponent(value).split("/").some((part) => part === "..")) return "";
+    } catch (_) {
+      return "";
+    }
     return value;
+  }
+
+  function latestPSL(profile) {
+    const value = profile && profile.psl_latest;
+    return value && value.status === "completed" ? value : null;
   }
 
   function initials(profile) {
     const source = clean(profile.display_name || profile.username || profile.author_id, "?");
-    return source.slice(0, 2).toUpperCase();
+    return source.slice(0, 2).toLocaleUpperCase("ru-RU");
   }
 
   function avatar(profile, large = false) {
@@ -71,337 +140,766 @@
     return image;
   }
 
-  function meta(items) {
-    const line = element("div", "meta");
-    items.filter(Boolean).forEach((text) => line.append(element("span", "", text)));
-    return line;
-  }
-
   function profileSearch(profile) {
-    const history = (profile.username_history || []).map((item) => item.username).join(" ");
+    const history = (profile.username_history || []).map((item) => item.username || "").join(" ");
     const related = (profile.post_ids || []).map((id) => {
       const post = postMap.get(Number(id)) || {};
-      return `${post.channel_title || ""} ${post.channel_username || ""} ${post.url || ""} ${post.post_id || ""}`;
+      return `${post.channel_title || ""} ${post.channel_username || ""} ${post.post_id || ""}`;
     }).join(" ");
-    return `${profile.author_id} ${profile.username || ""} ${profile.display_name || ""} ${history} ${related}`.toLocaleLowerCase();
+    return `${profile.author_id} ${profile.username || ""} ${profile.display_name || ""} ${history} ${related}`
+      .toLocaleLowerCase("ru-RU");
   }
+
+  profiles.forEach((profile) => profileSearchIndex.set(Number(profile.author_id), profileSearch(profile)));
 
   function postSearch(post) {
-    const authors = (post.profile_ids || []).map((id) => {
-      const profile = profileMap.get(Number(id));
-      return profile ? profileSearch(profile) : "";
-    }).join(" ");
-    return `${post.source_id} ${post.post_id} ${post.channel_title || ""} ${post.channel_username || ""} ${post.url || ""} ${post.text || ""} ${authors}`.toLocaleLowerCase();
+    const authors = (post.profile_ids || []).map((id) => profileSearchIndex.get(Number(id)) || "").join(" ");
+    return `${post.source_id} ${post.post_id} ${post.channel_title || ""} ${post.channel_username || ""} ${post.url || ""} ${post.text || ""} ${authors}`
+      .toLocaleLowerCase("ru-RU");
   }
 
-  profiles.forEach((item) => { item._search = profileSearch(item); });
-  posts.forEach((item) => { item._search = postSearch(item); });
+  posts.forEach((post) => postSearchIndex.set(Number(post.source_id), postSearch(post)));
 
-  const profileSorts = [
-    ["name", "Имя"], ["username", "Username"], ["id", "Telegram ID"],
-    ["discovered", "Дата обнаружения"], ["video_count", "Количество кружков"],
-    ["last_active", "Последняя активность"],
-  ];
-  const postSorts = [
-    ["published", "Дата публикации"], ["checked", "Последняя проверка"],
-    ["channel", "Канал"], ["post_id", "ID поста"], ["video_count", "Количество кружков"],
-  ];
-
-  function setSortOptions() {
-    const choices = state.view === "posts" && !state.detail ? postSorts : profileSorts;
-    const old = sort.value;
-    sort.replaceChildren(...choices.map(([value, label]) => {
-      const option = element("option", "", label);
-      option.value = value;
-      return option;
-    }));
-    sort.value = choices.some(([value]) => value === old) ? old : choices[0][0];
+  function listRoute(view) {
+    return {type: "list", view: view === "profiles" ? "profiles" : "posts"};
   }
 
-  function compareValue(item, key, profile) {
-    if (profile) {
-      if (key === "id") return Number(item.author_id);
-      if (key === "username") return String(item.username || "").toLocaleLowerCase();
-      if (key === "discovered") return item.first_seen || "";
-      if (key === "video_count") return (item.video_ids || []).length;
-      if (key === "last_active") return item.last_activity || item.last_seen || "";
-      return String(item.display_name || "").toLocaleLowerCase();
+  function routeHash(route) {
+    if (route.type === "post") return `#post/${route.id}`;
+    if (route.type === "profile") {
+      if (route.origin && route.origin.type === "post") {
+        return `#profile/${route.id}/post/${route.origin.id}`;
+      }
+      return `#profile/${route.id}/profiles`;
     }
-    if (key === "post_id") return Number(item.post_id);
-    if (key === "checked") return item.last_checked_at || "";
-    if (key === "channel") return String(item.channel_title || item.channel_username || "").toLocaleLowerCase();
-    if (key === "video_count") return Number(item.video_note_count || 0);
-    return item.published_at || "";
+    return route.view === "profiles" ? "#profiles" : "#posts";
   }
 
-  function filteredSorted(items, profile) {
-    const needle = query.value.trim().replace(/^@/, "").toLocaleLowerCase();
-    const selected = needle ? items.filter((item) => item._search.includes(needle)) : [...items];
-    selected.sort((left, right) => {
-      const a = compareValue(left, sort.value, profile);
-      const b = compareValue(right, sort.value, profile);
-      const result = typeof a === "number" ? a - b : String(a).localeCompare(String(b), "ru");
-      return state.descending ? -result : result;
-    });
-    return selected;
-  }
-
-  function page(items) {
-    const pages = Math.max(1, Math.ceil(items.length / PAGE_SIZE));
-    state.page = Math.min(state.page, pages - 1);
-    const start = state.page * PAGE_SIZE;
-    byId("pager").hidden = items.length <= PAGE_SIZE;
-    byId("pager").style.display = items.length <= PAGE_SIZE ? "none" : "flex";
-    byId("page-label").textContent = `${state.page + 1} / ${pages}`;
-    byId("previous").disabled = state.page === 0;
-    byId("next").disabled = state.page >= pages - 1;
-    return items.slice(start, start + PAGE_SIZE);
-  }
-
-  function empty(label) {
-    content.replaceChildren(element("p", "muted", label));
-  }
-
-  function profileRow(profile) {
-    const row = element("article", "row");
-    const button = element("button", "row-action");
-    button.type = "button";
-    const line = element("div", "profile-line");
-    line.append(avatar(profile));
-    const body = element("div", "row-main");
-    body.append(element("div", "row-title", clean(profile.display_name, `ID ${profile.author_id}`)));
-    body.append(meta([
-      profile.username ? `@${profile.username}` : "без username",
-      `ID ${profile.author_id}`,
-      `последнее обнаружение: ${dateText(profile.last_seen)}`,
-    ]));
-    line.append(body);
-    button.append(line);
-    button.addEventListener("click", () => showProfile(profile.author_id));
-    row.append(button);
-    row.append(element("div", "count", `${(profile.video_ids || []).length} круж.`));
-    return row;
-  }
-
-  function postRow(post) {
-    const row = element("article", "row");
-    const button = element("button", "row-action");
-    button.type = "button";
-    const body = element("div", "row-main");
-    body.append(element("div", "row-title", clean(post.channel_title, `@${post.channel_username}`)));
-    if (post.text) body.append(element("div", "excerpt", post.text.slice(0, 280)));
-    body.append(meta([
-      `пост ${post.post_id}`,
-      `опубликован: ${dateText(post.published_at)}`,
-      `проверен: ${dateText(post.last_checked_at)}`,
-      clean(post.last_error || post.last_result, post.enabled ? "ожидает проверки" : "отключён"),
-    ]));
-    const line = element("div", (post.media || []).length ? "post-line" : "");
-    line.append(body);
-    const preview = (post.media || []).find((item) => item.available);
-    if (preview) {
-      const media = mediaNode(preview, preview.kind, "Медиа поста");
-      media.classList.add("post-thumb");
-      line.append(media);
+  function parseRoute() {
+    const parts = location.hash.replace(/^#/, "").split("/").filter(Boolean);
+    if (parts[0] === "post" && Number.isSafeInteger(Number(parts[1]))) {
+      return {type: "post", id: Number(parts[1])};
     }
-    button.append(line);
-    button.addEventListener("click", () => showPost(post.source_id));
-    row.append(button);
-    const count = element("div", "count");
-    count.append(element("div", "state", `${post.video_note_count || 0} круж.`));
-    count.append(element("div", "muted", `${post.author_count || 0} авторов`));
-    row.append(count);
-    return row;
+    if (parts[0] === "profile" && Number.isSafeInteger(Number(parts[1]))) {
+      const origin = parts[2] === "post" && Number.isSafeInteger(Number(parts[3]))
+        ? {type: "post", id: Number(parts[3])}
+        : listRoute("profiles");
+      return {type: "profile", id: Number(parts[1]), origin};
+    }
+    return listRoute(parts[0] === "profiles" ? "profiles" : "posts");
   }
 
-  function mediaNode(item, kind, label) {
+  function rememberScroll() {
+    if (!currentRoute) return;
+    const previous = history.state || {};
+    history.replaceState(
+      {...previous, hoard: true, route: currentRoute, scrollY: window.scrollY},
+      "",
+      routeHash(currentRoute),
+    );
+  }
+
+  function navigate(route, replace = false) {
+    const destination = routeHash(route);
+    if (currentRoute && destination === routeHash(currentRoute)) {
+      renderRoute(route);
+      return;
+    }
+    rememberScroll();
+    const depth = replace ? Number(history.state?.depth || 0) : Number(history.state?.depth || 0) + 1;
+    const method = replace ? "replaceState" : "pushState";
+    history[method]({hoard: true, route, depth, scrollY: 0}, "", destination);
+    renderRoute(route);
+    window.scrollTo(0, 0);
+  }
+
+  function goBack(fallback) {
+    if (history.state?.hoard && Number(history.state.depth || 0) > 0) history.back();
+    else navigate(fallback, true);
+  }
+
+  function backButton(fallback, label) {
+    const button = element("button", "back", `← ${label}`);
+    button.type = "button";
+    button.addEventListener("click", () => goBack(fallback));
+    return button;
+  }
+
+  function available(item) {
+    return Boolean(item && item.available && localMediaURL(item.url));
+  }
+
+  function isVideoItem(item) {
+    return Boolean(item && (
+      item.video_id
+      || /video|round/i.test(String(item.kind || item.media_kind || ""))
+      || /\.(mp4|webm)(?:$|[?#])/i.test(String(item.url || ""))
+    ));
+  }
+
+  const viewer = byId("viewer");
+  const viewerState = {items: [], index: 0, label: ""};
+
+  function closeViewer() {
+    byId("viewer-stage").replaceChildren();
+    if (typeof viewer.close === "function" && viewer.open) viewer.close();
+    else viewer.removeAttribute("open");
+  }
+
+  function renderViewer() {
+    const item = viewerState.items[viewerState.index];
+    const stage = byId("viewer-stage");
+    stage.replaceChildren();
+    if (!item || !available(item)) {
+      stage.append(element("div", "missing", "Локальный файл недоступен"));
+      return;
+    }
+    const url = localMediaURL(item.url);
+    const isVideo = isVideoItem(item);
+    if (isVideo) {
+      const video = element("video", "");
+      video.controls = true;
+      video.preload = "none";
+      video.src = url;
+      stage.append(video);
+    } else {
+      const image = element("img", "");
+      image.alt = viewerState.label;
+      image.src = url;
+      stage.append(image);
+    }
+    byId("viewer-label").textContent = viewerState.label;
+    byId("viewer-position").textContent = `${viewerState.index + 1} / ${viewerState.items.length}`;
+    byId("viewer-previous").disabled = viewerState.items.length < 2;
+    byId("viewer-next").disabled = viewerState.items.length < 2;
+  }
+
+  function openViewer(items, index, label) {
+    const safe = items.filter(available);
+    const selected = items[index];
+    const actual = Math.max(0, safe.indexOf(selected));
+    if (!safe.length) return;
+    viewerState.items = safe;
+    viewerState.index = actual;
+    viewerState.label = label;
+    renderViewer();
+    if (typeof viewer.showModal === "function") viewer.showModal();
+    else viewer.setAttribute("open", "");
+    byId("viewer-close").focus();
+  }
+
+  function moveViewer(change) {
+    if (!viewerState.items.length) return;
+    viewerState.index = (viewerState.index + change + viewerState.items.length) % viewerState.items.length;
+    renderViewer();
+  }
+
+  function mediaNode(item, kind, label, gallery = [item], galleryIndex = 0) {
     const url = item && item.available ? localMediaURL(item.url) : "";
     if (!url) return element("div", "missing", label || "Локальный файл недоступен");
-    if (kind === "video" || /video|round/i.test(kind || "")) {
+    const isVideo = kind === "video" || /video|round/i.test(kind || "");
+    if (isVideo) {
+      const card = element("div", "media-card");
       const video = element("video", "media");
       video.controls = true;
       video.preload = "none";
       video.src = url;
-      return video;
+      const actions = element("div", "media-actions");
+      const expand = element("button", "secondary", "Увеличить");
+      expand.type = "button";
+      expand.addEventListener("click", () => openViewer(gallery, galleryIndex, label));
+      actions.append(expand);
+      card.append(video, actions);
+      return card;
     }
+    const button = element("button", "media-button");
+    button.type = "button";
+    button.setAttribute("aria-label", `${label || "Изображение"}: открыть крупно`);
     const image = element("img", "media");
     image.loading = "lazy";
     image.decoding = "async";
-    image.alt = label || "Локальное медиа";
+    image.alt = label || "Локальное изображение";
     image.src = url;
-    return image;
-  }
-
-  function renderList() {
-    state.detail = null;
-    byId("show-posts").classList.toggle("active", state.view === "posts");
-    byId("show-profiles").classList.toggle("active", state.view === "profiles");
-    byId("title").textContent = state.view === "posts" ? "Telegram archive" : "Все профили";
-    const isProfiles = state.view === "profiles";
-    const items = filteredSorted(isProfiles ? profiles : posts, isProfiles);
-    if (!items.length) return empty(query.value ? "Ничего не найдено" : "Каталог пока пуст");
-    const list = element("div", "list");
-    page(items).forEach((item) => list.append(isProfiles ? profileRow(item) : postRow(item)));
-    content.replaceChildren(list);
-  }
-
-  function backButton(action) {
-    const button = element("button", "back", "← Назад");
-    button.type = "button";
-    button.addEventListener("click", action);
+    button.append(image);
+    button.addEventListener("click", () => openViewer(gallery, galleryIndex, label));
     return button;
+  }
+
+  function boolFilter(value, actual) {
+    return value === "any" || (value === "yes") === actual;
+  }
+
+  function filteredProfiles() {
+    const list = lists.profiles;
+    const needle = list.query.trim().replace(/^@/, "").toLocaleLowerCase("ru-RU");
+    const filters = list.filters;
+    const rawMin = numberValue(filters.rawMin);
+    const rawMax = numberValue(filters.rawMax);
+    const boosted = numberValue(filters.boosted);
+    const ageMin = numberValue(filters.ageMin);
+    const ageMax = numberValue(filters.ageMax);
+    return profiles.filter((profile) => {
+      if (needle && !(profileSearchIndex.get(Number(profile.author_id)) || "").includes(needle)) return false;
+      if (filters.source && !(profile.post_ids || []).some((id) => String(id) === filters.source)) return false;
+      if (!boolFilter(filters.photos, (profile.photos || []).length > 0)) return false;
+      if (!boolFilter(filters.videos, (profile.video_ids || []).length > 0)) return false;
+      const psl = latestPSL(profile);
+      if (!boolFilter(filters.psl, Boolean(psl))) return false;
+      const low = psl ? numberValue(psl.raw_psl_min) : null;
+      const high = psl ? numberValue(psl.raw_psl_max) : null;
+      const boost = psl ? numberValue(psl.boosted_psl) : null;
+      const age = psl ? numberValue(psl.estimated_age) : null;
+      if (rawMin !== null && (low === null || low < rawMin)) return false;
+      if (rawMax !== null && (high === null || high > rawMax)) return false;
+      if (boosted !== null && (boost === null || boost < boosted)) return false;
+      if (ageMin !== null && (age === null || age < ageMin)) return false;
+      if (ageMax !== null && (age === null || age > ageMax)) return false;
+      return true;
+    });
+  }
+
+  function filteredPosts() {
+    const needle = lists.posts.query.trim().replace(/^@/, "").toLocaleLowerCase("ru-RU");
+    return needle
+      ? posts.filter((post) => (postSearchIndex.get(Number(post.source_id)) || "").includes(needle))
+      : [...posts];
+  }
+
+  function profileSortValue(profile, key) {
+    const psl = latestPSL(profile);
+    if (key === "id") return Number(profile.author_id);
+    if (key === "username") return String(profile.username || "").toLocaleLowerCase("ru-RU");
+    if (key === "discovered") return profile.first_seen || "";
+    if (key === "last_active") return profile.last_activity || profile.last_seen || "";
+    if (key === "media_count") return (profile.video_ids || []).length + (profile.photos || []).length;
+    if (key === "raw_psl") {
+      const low = psl ? numberValue(psl.raw_psl_min) : null;
+      const high = psl ? numberValue(psl.raw_psl_max) : null;
+      return low === null || high === null ? null : (low + high) / 2;
+    }
+    if (key === "boosted_psl") return psl ? numberValue(psl.boosted_psl) : null;
+    if (key === "age") return psl ? numberValue(psl.estimated_age) : null;
+    return String(profile.display_name || "").toLocaleLowerCase("ru-RU");
+  }
+
+  function postSortValue(post, key) {
+    if (key === "post_id") return Number(post.post_id);
+    if (key === "checked") return post.last_checked_at || "";
+    if (key === "channel") return String(post.channel_title || post.channel_username || "").toLocaleLowerCase("ru-RU");
+    if (key === "video_count") return Number(post.video_note_count || 0);
+    return post.published_at || "";
+  }
+
+  function sorted(items, view) {
+    const list = lists[view];
+    const numeric = view === "profiles"
+      ? new Set(["id", "media_count", "raw_psl", "boosted_psl", "age"])
+      : new Set(["post_id", "video_count"]);
+    const getter = view === "profiles" ? profileSortValue : postSortValue;
+    return [...items].sort((left, right) => {
+      const a = getter(left, list.sort);
+      const b = getter(right, list.sort);
+      if (numeric.has(list.sort)) {
+        const aMissing = a === null || a === undefined;
+        const bMissing = b === null || b === undefined;
+        if (aMissing !== bMissing) return aMissing ? 1 : -1;
+      }
+      const comparison = typeof a === "number"
+        ? a - b
+        : String(a ?? "").localeCompare(String(b ?? ""), "ru");
+      if (comparison) return list.descending ? -comparison : comparison;
+      return Number(left.author_id || left.source_id || 0) - Number(right.author_id || right.source_id || 0);
+    });
+  }
+
+  function profileCard(profile, origin) {
+    const card = element("article", "card profile-card");
+    const button = element("button", "card-action");
+    button.type = "button";
+    const body = element("div", "card-body");
+    body.append(avatar(profile));
+    const copy = element("div", "profile-copy");
+    copy.append(element("div", "card-title", clean(profile.display_name, `ID ${profile.author_id}`)));
+    copy.append(element("div", "eyebrow", profile.username ? `@${profile.username}` : "без username"));
+    copy.append(meta([
+      `ID ${profile.author_id}`,
+      `${(profile.photos || []).length} фото`,
+      `${(profile.video_ids || []).length} кружков`,
+      `${(profile.post_ids || []).length} источников`,
+      `активность: ${dateText(profile.last_activity || profile.last_seen)}`,
+    ]));
+    const psl = latestPSL(profile);
+    if (psl) copy.append(element("span", "psl-badge", `PSL ${scoreText(psl.raw_psl_min)}–${scoreText(psl.raw_psl_max)}`));
+    body.append(copy);
+    button.append(body);
+    button.addEventListener("click", () => navigate({type: "profile", id: Number(profile.author_id), origin}));
+    card.append(button);
+    return card;
+  }
+
+  function postPreview(post, container) {
+    const item = (post.media || []).find(available);
+    if (!item) return;
+    const preview = element("div", "card-preview");
+    const isVideo = isVideoItem(item);
+    if (isVideo) {
+      preview.append(element("div", "video-placeholder", "Видео · откройте публикацию"));
+    } else {
+      const button = element("button", "media-button");
+      button.type = "button";
+      button.setAttribute("aria-label", "Открыть изображение публикации");
+      const image = element("img", "");
+      image.loading = "lazy";
+      image.decoding = "async";
+      image.alt = "Медиа публикации";
+      image.src = localMediaURL(item.url);
+      button.append(image);
+      button.addEventListener("click", () => openViewer(post.media || [], (post.media || []).indexOf(item), "Медиа публикации"));
+      preview.append(button);
+    }
+    container.append(preview);
+  }
+
+  function postCard(post) {
+    const card = element("article", "card post-card");
+    const button = element("button", "card-action");
+    button.type = "button";
+    const body = element("div", "card-body");
+    body.append(element("div", "eyebrow", post.channel_username ? `@${post.channel_username}` : "Telegram"));
+    body.append(element("div", "card-title", clean(post.channel_title, `Пост #${post.post_id}`)));
+    if (post.text) body.append(element("div", "excerpt", post.text));
+    body.append(meta([
+      `пост ${post.post_id}`,
+      `опубликован: ${dateText(post.published_at)}`,
+      `проверен: ${dateText(post.last_checked_at)}`,
+    ]));
+    const metrics = element("div", "metrics");
+    metrics.append(
+      element("span", "metric", `${post.author_count || 0} профилей`),
+      element("span", "metric", `${post.video_note_count || 0} кружков`),
+    );
+    body.append(metrics);
+    button.append(body);
+    button.addEventListener("click", () => navigate({type: "post", id: Number(post.source_id)}));
+    card.append(button);
+    postPreview(post, card);
+    return card;
+  }
+
+  function activeFilterCount() {
+    const filters = lists.profiles.filters;
+    return Object.values(filters).filter((value) => value && value !== "any").length;
+  }
+
+  function syncToolbar(view) {
+    toolbar.hidden = false;
+    profileFilters.hidden = view !== "profiles";
+    byId("show-posts").classList.toggle("active", view === "posts");
+    byId("show-profiles").classList.toggle("active", view === "profiles");
+    const list = lists[view];
+    if (queryInput.value !== list.query) queryInput.value = list.query;
+    const choices = view === "profiles" ? profileSorts : postSorts;
+    sortInput.replaceChildren(...choices.map(([value, label]) => {
+      const option = element("option", "", label);
+      option.value = value;
+      return option;
+    }));
+    sortInput.value = list.sort;
+    direction.textContent = list.descending ? "↓" : "↑";
+    direction.title = list.descending ? "По убыванию" : "По возрастанию";
+    if (view === "profiles") {
+      const filters = list.filters;
+      byId("filter-source").value = filters.source;
+      byId("filter-photos").value = filters.photos;
+      byId("filter-videos").value = filters.videos;
+      byId("filter-psl").value = filters.psl;
+      byId("filter-raw-min").value = filters.rawMin;
+      byId("filter-raw-max").value = filters.rawMax;
+      byId("filter-boosted").value = filters.boosted;
+      byId("filter-age-min").value = filters.ageMin;
+      byId("filter-age-max").value = filters.ageMax;
+      const count = activeFilterCount();
+      byId("filter-count").textContent = count ? `· ${count}` : "";
+    }
+  }
+
+  function updatePager(items, view) {
+    const list = lists[view];
+    const pages = Math.max(1, Math.ceil(items.length / PAGE_SIZE));
+    list.page = Math.max(0, Math.min(list.page, pages - 1));
+    const pager = byId("pager");
+    pager.hidden = items.length <= PAGE_SIZE;
+    byId("page-label").textContent = `${list.page + 1} / ${pages}`;
+    byId("previous").disabled = list.page === 0;
+    byId("next").disabled = list.page >= pages - 1;
+    return items.slice(list.page * PAGE_SIZE, (list.page + 1) * PAGE_SIZE);
+  }
+
+  function emptyState(label, allowReset) {
+    const root = element("div", "empty-state");
+    root.append(element("p", "", label));
+    if (allowReset) {
+      const reset = element("button", "secondary", "Сбросить фильтры");
+      reset.type = "button";
+      reset.addEventListener("click", resetCurrentList);
+      root.append(reset);
+    }
+    content.replaceChildren(root);
+  }
+
+  function renderList(view) {
+    currentRoute = listRoute(view);
+    syncToolbar(view);
+    byId("title").textContent = view === "posts" ? "Сохранённые публикации" : "Все профили";
+    const source = view === "profiles" ? filteredProfiles() : filteredPosts();
+    const items = sorted(source, view);
+    if (!items.length) {
+      byId("pager").hidden = true;
+      const filtered = lists[view].query || (view === "profiles" && activeFilterCount());
+      emptyState(filtered ? "Ничего не найдено" : "Каталог пока пуст", Boolean(filtered));
+      return;
+    }
+    const grid = element("div", "card-grid");
+    const origin = listRoute("profiles");
+    updatePager(items, view).forEach((item) => {
+      grid.append(view === "profiles" ? profileCard(item, origin) : postCard(item));
+    });
+    content.replaceChildren(grid);
+  }
+
+  function localPager(items, pageSize, key, renderItem, gridClass = "media-grid") {
+    const root = element("div", "");
+    const render = (requested) => {
+      const pages = Math.max(1, Math.ceil(items.length / pageSize));
+      const selected = Math.max(0, Math.min(requested, pages - 1));
+      sectionPages.set(key, selected);
+      const grid = element("div", gridClass);
+      items.slice(selected * pageSize, (selected + 1) * pageSize)
+        .forEach((item, offset) => grid.append(renderItem(item, selected * pageSize + offset)));
+      const nodes = [grid];
+      if (pages > 1) {
+        const controls = element("nav", "pager");
+        controls.setAttribute("aria-label", "Страницы раздела");
+        const previous = element("button", "", "← Назад");
+        const next = element("button", "", "Дальше →");
+        previous.disabled = selected === 0;
+        next.disabled = selected >= pages - 1;
+        previous.addEventListener("click", () => render(selected - 1));
+        next.addEventListener("click", () => render(selected + 1));
+        controls.append(previous, element("span", "", `${selected + 1} / ${pages}`), next);
+        nodes.push(controls);
+      }
+      root.replaceChildren(...nodes);
+    };
+    render(sectionPages.get(key) || 0);
+    return root;
+  }
+
+  function videoCard(video, gallery, index) {
+    const card = element("div", "media-card");
+    card.append(mediaNode(video, "video", "Видеокружок", gallery, index));
+    card.append(meta([`комментарий ${video.message_id}`, dateText(video.message_date)]));
+    card.append(originalLink(video.comment_url, "Исходный комментарий"));
+    return card;
   }
 
   function showPost(sourceId) {
     const post = postMap.get(Number(sourceId));
-    if (!post) return;
-    state.detail = {type: "post", id: Number(sourceId)};
-    state.page = 0;
-    setSortOptions();
+    if (!post) {
+      navigate(listRoute("posts"), true);
+      return;
+    }
+    currentRoute = {type: "post", id: Number(sourceId)};
+    toolbar.hidden = true;
+    byId("pager").hidden = true;
     byId("title").textContent = clean(post.channel_title, `@${post.channel_username}`);
     const root = element("div", "detail");
-    root.append(backButton(() => { state.detail = null; setSortOptions(); renderList(); }));
+    root.append(backButton(listRoute("posts"), "к источникам"));
     const heading = element("div", "detail-head");
-    const body = element("div", "row-main");
+    const body = element("div", "profile-copy");
+    body.append(element("div", "eyebrow", post.channel_username ? `@${post.channel_username}` : "Telegram"));
     body.append(originalLink(post.url, `Открыть исходный пост #${post.post_id}`));
     if (post.text) body.append(element("p", "excerpt", post.text));
     body.append(meta([
       `опубликован: ${dateText(post.published_at)}`,
       `проверен: ${dateText(post.last_checked_at)}`,
-      `${post.video_note_count || 0} кружков`, `${post.author_count || 0} авторов`,
+      `${post.video_note_count || 0} кружков`,
+      `${post.author_count || 0} профилей`,
+      clean(post.last_error || post.last_result, post.enabled ? "ожидает проверки" : "источник отключён"),
     ]));
     heading.append(body);
     root.append(heading);
+
     if ((post.media || []).length) {
-      root.append(element("h2", "section-title", "Медиа поста"));
-      const media = element("div", "media-grid");
-      post.media.forEach((item) => media.append(mediaNode(item, item.kind, "Медиа поста")));
-      root.append(media);
+      root.append(element("h2", "section-title", "Медиа публикации"));
+      root.append(localPager(post.media, MEDIA_PAGE_SIZE, `post-media:${sourceId}`, (item, index) => (
+        mediaNode(item, item.kind, "Медиа публикации", post.media || [], index)
+      )));
     }
-    root.append(element("h2", "section-title", "Найденные профили"));
-    let related = (post.profile_ids || []).map((id) => profileMap.get(Number(id))).filter(Boolean);
-    related = filteredSorted(related, true);
-    const list = element("div", "list");
-    page(related).forEach((profile) => list.append(profileRow(profile)));
-    root.append(list);
+
+    const postVideos = (post.video_ids || []).map((id) => videoMap.get(String(id))).filter(Boolean);
+    root.append(element("h2", "section-title", "Видеокружки"));
+    if (!postVideos.length) root.append(element("p", "muted", "Видеокружков пока нет"));
+    else root.append(localPager(postVideos, VIDEO_PAGE_SIZE, `post-videos:${sourceId}`, (video, index) => (
+      videoCard(video, postVideos, index)
+    )));
+
+    const related = (post.profile_ids || []).map((id) => profileMap.get(Number(id))).filter(Boolean);
+    root.append(element("h2", "section-title", "Связанные профили"));
     if (!related.length) root.append(element("p", "muted", "Профили пока не найдены"));
+    else root.append(localPager(
+      related,
+      PAGE_SIZE,
+      `post-profiles:${sourceId}`,
+      (profile) => profileCard(profile, {type: "post", id: Number(sourceId)}),
+      "card-grid",
+    ));
     content.replaceChildren(root);
   }
 
-  function showProfile(authorId) {
+  function linkedPosts(profile) {
+    const root = element("div", "detail-links");
+    (profile.post_ids || []).forEach((id) => {
+      const post = postMap.get(Number(id));
+      if (!post) return;
+      const row = element("div", "detail-link");
+      const button = element("button", "", `${clean(post.channel_title, post.channel_username)} #${post.post_id}`);
+      button.type = "button";
+      button.addEventListener("click", () => navigate({type: "post", id: Number(post.source_id)}));
+      row.append(button, originalLink(post.url, "Оригинал"));
+      root.append(row);
+    });
+    return root.childNodes.length ? root : element("p", "muted", "Связанные публикации не сохранены");
+  }
+
+  function pslMetrics(item) {
+    const metrics = element("div", "metrics");
+    metrics.append(
+      element("span", "metric", `presentation: ${clean(item.presentation)}`),
+      element("span", "metric", `возраст ≈ ${clean(item.estimated_age)}`),
+      element("span", "metric", `Raw ${scoreText(item.raw_psl_min)}–${scoreText(item.raw_psl_max)}`),
+      element("span", "metric", `Boosted ${scoreText(item.boosted_psl)}`),
+    );
+    return metrics;
+  }
+
+  function pslHistoryEntry(item) {
+    const row = element("article", "psl-entry");
+    row.append(element("div", "card-title", clean(item.status, "unknown")));
+    row.append(meta([
+      dateText(item.analyzed_at),
+      item.actual_model ? `модель: ${item.actual_model}` : "модель не сохранена",
+      item.prompt_version_id ? `prompt: ${item.prompt_version_id}` : "",
+      item.schema_version ? `schema v${item.schema_version}` : "",
+      item.attempt_id ? `attempt: ${item.attempt_id}` : "",
+    ]));
+    if (item.status === "completed") row.append(pslMetrics(item));
+    return row;
+  }
+
+  function showProfile(authorId, origin) {
     const profile = profileMap.get(Number(authorId));
-    if (!profile) return;
-    const previous = state.detail;
-    state.detail = {type: "profile", id: Number(authorId), previous};
+    if (!profile) {
+      navigate(listRoute("profiles"), true);
+      return;
+    }
+    const fallback = origin?.type === "post" ? origin : listRoute("profiles");
+    currentRoute = {type: "profile", id: Number(authorId), origin: fallback};
+    toolbar.hidden = true;
     byId("pager").hidden = true;
-    byId("pager").style.display = "none";
     byId("title").textContent = clean(profile.display_name, `ID ${profile.author_id}`);
     const root = element("div", "detail");
-    root.append(backButton(() => {
-      if (previous && previous.type === "post") showPost(previous.id);
-      else { state.detail = null; setSortOptions(); renderList(); }
-    }));
+    root.append(backButton(fallback, fallback.type === "post" ? "к публикации" : "ко всем профилям"));
     const heading = element("div", "detail-head");
     heading.append(avatar(profile, true));
-    const identity = element("div", "row-main");
-    identity.append(element("div", "row-title", clean(profile.display_name, "Имя не сохранено")));
-    identity.append(element("div", "state", profile.username ? `@${profile.username}` : "username не задан"));
+    const identity = element("div", "profile-copy");
+    identity.append(element("div", "card-title", clean(profile.display_name, "Имя не сохранено")));
+    identity.append(element("div", "eyebrow", profile.username ? `@${profile.username}` : "username не задан"));
     identity.append(meta([
       `Telegram ID ${profile.author_id}`,
       `впервые: ${dateText(profile.first_seen)}`,
-      `последнее обнаружение: ${dateText(profile.last_seen)}`,
+      `активность: ${dateText(profile.last_activity || profile.last_seen)}`,
+      `${(profile.photos || []).length} фото`,
+      `${(profile.video_ids || []).length} кружков`,
+      `${(profile.post_ids || []).length} источников`,
     ]));
+    const latest = latestPSL(profile);
+    if (latest) identity.append(element("span", "psl-badge", `PSL ${scoreText(latest.raw_psl_min)}–${scoreText(latest.raw_psl_max)}`));
     heading.append(identity);
     root.append(heading);
-    const history = profile.username_history || [];
-    root.append(element("h2", "section-title", "Наблюдавшиеся username"));
-    if (!history.length) root.append(element("p", "muted", "Username не наблюдался"));
+
+    root.append(element("h2", "section-title", "История username"));
+    const usernames = profile.username_history || [];
+    if (!usernames.length) root.append(element("p", "muted", "Username не наблюдался"));
     else {
-      const list = element("ul", "history");
-      history.forEach((item) => list.append(element(
-        "li", "", `@${item.username} · наблюдался ${dateText(item.first_seen)} — ${dateText(item.last_seen)}`
+      const history = element("ul", "history");
+      usernames.forEach((item) => history.append(element(
+        "li", "", `@${item.username} · ${dateText(item.first_seen)} — ${dateText(item.last_seen)}`,
       )));
-      root.append(list);
+      root.append(history);
     }
-    root.append(element("h2", "section-title", "Посты"));
-    const linked = element("div", "meta");
-    (profile.post_ids || []).forEach((id) => {
-      const post = postMap.get(Number(id));
-      if (post) linked.append(originalLink(post.url, `${clean(post.channel_title, post.channel_username)} #${post.post_id}`));
-    });
-    root.append(linked.childNodes.length ? linked : element("p", "muted", "Связанные посты не сохранены"));
-    root.append(element("h2", "section-title", "Фотографии профиля"));
-    const photos = element("div", "media-grid");
-    (profile.photos || []).forEach((photo) => photos.append(mediaNode(photo, "image", "Фото профиля")));
-    root.append(photos.childNodes.length ? photos : element("p", "muted", profile.photo_error || "Доступных фотографий нет"));
+
+    root.append(element("h2", "section-title", "Связанные публикации"), linkedPosts(profile));
+
+    root.append(element("h2", "section-title", "Фотографии"));
+    const photos = profile.photos || [];
+    if (!photos.length) root.append(element("p", "muted", profile.photo_error || "Сохранённых фотографий нет"));
+    else root.append(localPager(photos, MEDIA_PAGE_SIZE, `profile-photos:${authorId}`, (photo, index) => (
+      mediaNode(photo, "image", "Фото профиля", photos, index)
+    )));
+
     root.append(element("h2", "section-title", "Видеокружки"));
-    const profileVideos = (profile.video_ids || [])
-      .map((id) => videoMap.get(String(id))).filter(Boolean);
+    const profileVideos = (profile.video_ids || []).map((id) => videoMap.get(String(id))).filter(Boolean);
     if (!profileVideos.length) root.append(element("p", "muted", "Видеокружков нет"));
-    else {
-      const videoSection = element("div", "");
-      function renderVideoPage(videoPage) {
-        const media = element("div", "media-grid");
-        const start = videoPage * PAGE_SIZE;
-        profileVideos.slice(start, start + PAGE_SIZE).forEach((video) => {
-          const card = element("div", "media-card");
-          card.append(mediaNode(video, "video", "Видеокружок недоступен"));
-          card.append(meta([`комментарий ${video.message_id}`, dateText(video.message_date)]));
-          card.append(originalLink(video.comment_url, "Исходный комментарий"));
-          media.append(card);
-        });
-        const pieces = [media];
-        const pages = Math.ceil(profileVideos.length / PAGE_SIZE);
-        if (pages > 1) {
-          const controls = element("div", "pager");
-          controls.style.display = "flex";
-          const previousPage = element("button", "", "Назад");
-          const nextPage = element("button", "", "Дальше");
-          previousPage.disabled = videoPage === 0;
-          nextPage.disabled = videoPage >= pages - 1;
-          previousPage.addEventListener("click", () => renderVideoPage(videoPage - 1));
-          nextPage.addEventListener("click", () => renderVideoPage(videoPage + 1));
-          controls.append(previousPage, element("span", "", `${videoPage + 1} / ${pages}`), nextPage);
-          pieces.push(controls);
-        }
-        videoSection.replaceChildren(...pieces);
-      }
-      renderVideoPage(0);
-      root.append(videoSection);
-    }
+    else root.append(localPager(profileVideos, VIDEO_PAGE_SIZE, `profile-videos:${authorId}`, (video, index) => (
+      videoCard(video, profileVideos, index)
+    )));
+
+    root.append(element("h2", "section-title", "PSL-анализ"));
+    root.append(element(
+      "p", "subjective",
+      "PSL — субъективная, ненаучная визуальная оценка. Она не является фактом или объективным измерением.",
+    ));
+    if (latest) {
+      const latestBlock = element("div", "psl-latest");
+      latestBlock.append(element("div", "card-title", "Последняя допустимая оценка"));
+      latestBlock.append(pslMetrics(latest));
+      latestBlock.append(meta([
+        dateText(latest.analyzed_at),
+        latest.actual_model ? `модель: ${latest.actual_model}` : "",
+        latest.prompt_version_id ? `prompt: ${latest.prompt_version_id}` : "",
+      ]));
+      root.append(latestBlock);
+    } else root.append(element("p", "muted", "Допустимой завершённой оценки нет"));
+
+    const analyses = Array.isArray(profile.psl_history) ? profile.psl_history : [];
+    root.append(element("h3", "section-title", "История анализов"));
+    if (!analyses.length) root.append(element("p", "muted", "Анализы ещё не запускались"));
+    else root.append(localPager(
+      analyses, HISTORY_PAGE_SIZE, `profile-psl:${authorId}`, pslHistoryEntry, "psl-history",
+    ));
     content.replaceChildren(root);
   }
 
-  function rerender(resetPage = true) {
-    if (resetPage) state.page = 0;
-    if (state.detail && state.detail.type === "post") showPost(state.detail.id);
-    else if (state.detail && state.detail.type === "profile") showProfile(state.detail.id);
-    else renderList();
+  function renderRoute(route = parseRoute()) {
+    if (route.type === "post") showPost(route.id);
+    else if (route.type === "profile") showProfile(route.id, route.origin);
+    else renderList(route.view);
   }
 
-  byId("summary").textContent = `${posts.length} постов · ${profiles.length} профилей · ${videos.length} кружков`;
+  function resetCurrentList() {
+    const view = currentRoute?.type === "list" ? currentRoute.view : "posts";
+    lists[view].query = "";
+    lists[view].page = 0;
+    lists[view].descending = true;
+    lists[view].sort = view === "profiles" ? "last_active" : "published";
+    if (view === "profiles") lists.profiles.filters = emptyFilters();
+    renderList(view);
+    window.scrollTo(0, 0);
+  }
+
+  function delayedListRender(view) {
+    window.clearTimeout(inputTimer);
+    inputTimer = window.setTimeout(() => {
+      if (currentRoute?.type === "list" && currentRoute.view === view) renderList(view);
+    }, 160);
+  }
+
+  function setSourceOptions() {
+    const first = element("option", "", "Все источники");
+    first.value = "";
+    const options = [first, ...posts.map((post) => {
+      const option = element("option", "", `${clean(post.channel_title, post.channel_username)} #${post.post_id}`);
+      option.value = String(post.source_id);
+      return option;
+    })];
+    byId("filter-source").replaceChildren(...options);
+  }
+
+  queryInput.addEventListener("input", () => {
+    if (currentRoute?.type !== "list") return;
+    const view = currentRoute.view;
+    lists[view].query = queryInput.value;
+    lists[view].page = 0;
+    delayedListRender(view);
+  });
+  sortInput.addEventListener("change", () => {
+    if (currentRoute?.type !== "list") return;
+    const list = lists[currentRoute.view];
+    list.sort = sortInput.value;
+    list.page = 0;
+    renderList(currentRoute.view);
+  });
+  direction.addEventListener("click", () => {
+    if (currentRoute?.type !== "list") return;
+    const list = lists[currentRoute.view];
+    list.descending = !list.descending;
+    list.page = 0;
+    renderList(currentRoute.view);
+  });
+  byId("reset").addEventListener("click", resetCurrentList);
+  byId("show-posts").addEventListener("click", () => navigate(listRoute("posts")));
+  byId("show-profiles").addEventListener("click", () => navigate(listRoute("profiles")));
+  byId("home").addEventListener("click", () => navigate(listRoute("posts")));
+  byId("previous").addEventListener("click", () => {
+    if (currentRoute?.type !== "list") return;
+    lists[currentRoute.view].page -= 1;
+    renderList(currentRoute.view);
+    window.scrollTo(0, 0);
+  });
+  byId("next").addEventListener("click", () => {
+    if (currentRoute?.type !== "list") return;
+    lists[currentRoute.view].page += 1;
+    renderList(currentRoute.view);
+    window.scrollTo(0, 0);
+  });
+
+  const filterBindings = [
+    ["filter-source", "source"], ["filter-photos", "photos"],
+    ["filter-videos", "videos"], ["filter-psl", "psl"],
+    ["filter-raw-min", "rawMin"], ["filter-raw-max", "rawMax"],
+    ["filter-boosted", "boosted"], ["filter-age-min", "ageMin"],
+    ["filter-age-max", "ageMax"],
+  ];
+  filterBindings.forEach(([id, key]) => {
+    const node = byId(id);
+    const eventName = node.tagName === "INPUT" ? "input" : "change";
+    node.addEventListener(eventName, () => {
+      lists.profiles.filters[key] = node.value;
+      lists.profiles.page = 0;
+      if (eventName === "input") delayedListRender("profiles");
+      else renderList("profiles");
+    });
+  });
+
+  byId("viewer-close").addEventListener("click", closeViewer);
+  byId("viewer-previous").addEventListener("click", () => moveViewer(-1));
+  byId("viewer-next").addEventListener("click", () => moveViewer(1));
+  viewer.addEventListener("close", () => byId("viewer-stage").replaceChildren());
+  viewer.addEventListener("click", (event) => { if (event.target === viewer) closeViewer(); });
+  document.addEventListener("keydown", (event) => {
+    if (!viewer.open) return;
+    if (event.key === "ArrowLeft") { event.preventDefault(); moveViewer(-1); }
+    if (event.key === "ArrowRight") { event.preventDefault(); moveViewer(1); }
+    if (event.key === "Escape") closeViewer();
+  });
+
+  window.addEventListener("popstate", (event) => {
+    const route = event.state?.route || parseRoute();
+    renderRoute(route);
+    window.requestAnimationFrame(() => window.scrollTo(0, Number(event.state?.scrollY || 0)));
+  });
+  window.addEventListener("hashchange", () => {
+    const parsed = parseRoute();
+    if (!currentRoute || routeHash(parsed) !== routeHash(currentRoute)) renderRoute(parsed);
+  });
+  window.addEventListener("beforeunload", rememberScroll);
+
+  setSourceOptions();
+  byId("summary").textContent = `${posts.length} публикаций · ${profiles.length} профилей · ${videos.length} кружков`;
   byId("generated").textContent = `Снимок: ${dateText(catalog.generated_at)}`;
   byId("notice").hidden = true;
-  query.addEventListener("input", () => rerender());
-  sort.addEventListener("change", () => rerender());
-  direction.addEventListener("click", () => {
-    state.descending = !state.descending;
-    direction.textContent = state.descending ? "↓" : "↑";
-    direction.title = state.descending ? "По убыванию" : "По возрастанию";
-    rerender();
-  });
-  byId("show-posts").addEventListener("click", () => {
-    state.view = "posts"; state.detail = null; setSortOptions(); rerender();
-  });
-  byId("show-profiles").addEventListener("click", () => {
-    state.view = "profiles"; state.detail = null; setSortOptions(); rerender();
-  });
-  byId("home").addEventListener("click", () => {
-    state.view = "posts"; state.detail = null; query.value = ""; setSortOptions(); rerender();
-  });
-  byId("previous").addEventListener("click", () => { state.page -= 1; rerender(false); });
-  byId("next").addEventListener("click", () => { state.page += 1; rerender(false); });
-
-  setSortOptions();
-  renderList();
+  const initialRoute = parseRoute();
+  history.replaceState({hoard: true, route: initialRoute, depth: 0, scrollY: 0}, "", routeHash(initialRoute));
+  renderRoute(initialRoute);
 })();

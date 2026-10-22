@@ -138,8 +138,22 @@ and the normalized SQLite snapshot into one HTML document at build time. This wo
 `file://` without CORS-sensitive `fetch`. The generator validates media paths against configured
 archive roots, escapes script-sensitive characters, writes one adjacent temporary file and
 atomically replaces the report only after a complete successful build. The user-owned
-`hoard_objects/` tree is never replaced. A dirty marker coalesces changes so a report is generated
-after a scan or enrichment operation rather than after every message.
+`hoard_objects/` tree is never replaced.
+
+Telegram tables, all PSL analysis rows and remembered archive roots are read in one short SQLite
+snapshot. PSL is joined to profiles by stable `author_id` in memory, without a per-profile query.
+The latest displayable score requires both the domain result and attempt to be completed and must
+still pass the versioned adult-only validator. Deterministic completion-time/ID ordering keeps an
+older success active when a newer attempt failed, became outcome-unknown, was ineligible or stored
+an invalid result. Non-success history exports only status/audit metadata; possible-minor ages and
+all score fields are null. AI chat text, prompt content, memory, raw responses, private attachment
+paths and provider job payloads do not enter the snapshot.
+
+Every catalog-visible Telegram or PSL mutation sets `catalog_dirty` and increments a monotonic
+`catalog_revision` in the same transaction. The builder records the revision belonging to its
+SQLite snapshot, publishes the complete temporary file, then clears dirty with a conditional
+update only if the revision is unchanged. A concurrent mutation therefore stays dirty and the
+existing report worker coalesces another build; no scan or second queue system is required.
 
 The report builder retires the short-lived split layout by moving
 `<archive>/telegram/objects/` into `hoard_objects/` and rewriting only matching media paths in
@@ -147,8 +161,13 @@ SQLite. It never overwrites a conflicting file. Older user archive layouts elsew
 place and remain available through validated paths.
 
 The browser uses DOM construction and `textContent`, never HTML interpolation. Original links are
-restricted to HTTPS `t.me`; local media URLs accept only relative or `file:` references produced by
-the generator. Pagination limits rows to 80, images are lazy, and videos use `preload=none`.
+restricted to HTTPS `t.me`; local media URLs accept only traversal-free relative or `file:`
+references produced by the generator. Separate post/profile list state preserves queries,
+composable filters, sorting, pages and scroll positions. Local hash/history routes support browser
+Back/Forward without a server or router dependency. Lists and galleries are paginated, images are
+lazy, the lightbox creates one full-size node at a time, and videos use `preload=none` without
+autoplay. Missing round-six fields remain optional so an older normalized snapshot degrades to an
+unscored profile rather than breaking rendering.
 
 ## Progress and errors
 
@@ -249,14 +268,15 @@ as subjective and non-scientific.
 The AI attempt and domain result finish in one SQLite transaction. A connection/cancellation
 ambiguity remains `outcome_unknown` without a domain result; invalid provider JSON/domain data is
 `failed` plus `invalid_result`. A manual paid retry reuses the frozen photo attachments, creates a
-new attempt/analysis row and points `root_analysis_id` to the original. Latest successful and full
-history queries are available for the round-six catalog, but round 5 does not change HTML.
+new attempt/analysis row and points `root_analysis_id` to the original. The round-six catalog
+consumes these rows in one batch while retaining the same storage contract.
 
 ## Current scope
 
-The interactive product includes the Telegram archive, static local catalog, explicit AI chats
-and manually initiated Telegram-photo PSL. Optional media/rclone adapters remain dormant code
-paths and are not presented as user-facing tools. There is no browser service, PSL automation,
-multi-user infrastructure or collection beyond source posts, video-note authors and the visible
-profile photos explicitly requested for this module. AI does not expand Telegram collection on
-its own, and Telegram AI results are not added to HTML before round 6.
+The original six-round functional plan is complete. The interactive product includes the Telegram
+archive, static local catalog with minimal validated PSL history, explicit AI chats and manually
+initiated Telegram-photo PSL. Optional media/rclone adapters remain dormant code paths and are not
+presented as user-facing tools. There is no browser service, PSL automation, multi-user
+infrastructure or collection beyond source posts, video-note authors and the visible profile
+photos explicitly requested for this module. AI does not expand Telegram collection on its own;
+subsequent work is stabilization and compatibility rather than new subsystems.

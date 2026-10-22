@@ -7,6 +7,8 @@ from pathlib import Path
 
 import pytest
 
+from hoard.ai.models import AIResponse
+from hoard.ai.pricing import CostEstimate
 from hoard.archive_paths import media_reference, object_path, video_note_path
 from hoard.catalog import (
     APP_TOKEN,
@@ -14,6 +16,7 @@ from hoard.catalog import (
     STYLE_TOKEN,
     build_catalog,
     build_payload,
+    filter_profiles,
     search_posts,
     search_profiles,
     sort_posts,
@@ -43,6 +46,64 @@ def video_record(source_id: int, message_id: int, path: Path, author_id: int = 1
         "file_path": str(path),
         "size": path.stat().st_size,
     }
+
+
+def insert_catalog_analysis(
+    store: Store,
+    *,
+    analysis_id: str,
+    author_id: int,
+    state: str,
+    completed_at: str | None,
+    result_status: str | None = None,
+    presentation: str | None = None,
+    age: int | None = None,
+    raw_min: float | None = None,
+    raw_max: float | None = None,
+    boosted: float | None = None,
+) -> str:
+    prompt = store.ai.ensure_psl_prompt()["current_version"]
+    attempt_id = f"attempt-{analysis_id}"
+    created_at = completed_at or "2026-01-01T00:00:00+00:00"
+    with store.db:
+        store.db.execute(
+            """INSERT INTO ai_attempts(id,operation_key,scope,entity_kind,entity_id,
+            provider,requested_model,actual_model,prompt_version_id,state,created_at,completed_at)
+            VALUES(?,?,'telegram','telegram.psl',?,'deepseek','requested-model',
+            'actual-model',?,?,?,?)""",
+            (
+                attempt_id,
+                f"operation-{analysis_id}",
+                analysis_id,
+                prompt["id"],
+                state,
+                created_at,
+                completed_at,
+            ),
+        )
+        store.db.execute(
+            """INSERT INTO ai_telegram_analyses(id,operation_key,author_id,attempt_id,
+            prompt_version_id,schema_version,adult_confirmed,result_status,presentation,
+            estimated_age,raw_psl_min,raw_psl_max,boosted_psl,actual_model,analyzed_at,
+            created_at) VALUES(?,?,?,?,?,1,1,?,?,?,?,?,?,?,?,?)""",
+            (
+                analysis_id,
+                f"operation-{analysis_id}",
+                author_id,
+                attempt_id,
+                prompt["id"],
+                result_status,
+                presentation,
+                age,
+                raw_min,
+                raw_max,
+                boosted,
+                "actual-model" if completed_at else None,
+                completed_at,
+                created_at,
+            ),
+        )
+    return attempt_id
 
 
 def test_new_archive_builds_autonomous_catalog_without_network(tmp_path):
@@ -374,3 +435,239 @@ def test_changed_archive_root_keeps_previous_media_root_available(tmp_path):
     assert first.resolve() in roots
     assert second.resolve() in roots
     store.close()
+
+
+def test_psl_export_selects_latest_valid_completed_result_by_author_id(tmp_path):
+    store = Store(tmp_path / "db.sqlite")
+    root = tmp_path / "archive"
+    source_id = store.add_source(Post("channelx", 7), str(root))
+    store.telegram.observe_profile(
+        author_id=101,
+        username="old_name",
+        display_name="Synthetic Person",
+        observed_at="2025-01-01",
+        source_id=source_id,
+    )
+    store.telegram.observe_profile(
+        author_id=101,
+        username="new_name",
+        display_name="Synthetic Person",
+        observed_at="2026-01-01",
+        source_id=source_id,
+    )
+    insert_catalog_analysis(
+        store,
+        analysis_id="analysis-a",
+        author_id=101,
+        state="completed",
+        completed_at="2026-03-01T00:00:00+00:00",
+        result_status="completed",
+        presentation="female",
+        age=25,
+        raw_min=4,
+        raw_max=5,
+        boosted=5.5,
+    )
+    insert_catalog_analysis(
+        store,
+        analysis_id="analysis-z",
+        author_id=101,
+        state="completed",
+        completed_at="2026-03-01T00:00:00+00:00",
+        result_status="completed",
+        presentation="female",
+        age=27,
+        raw_min=6,
+        raw_max=7,
+        boosted=7.5,
+    )
+    insert_catalog_analysis(
+        store,
+        analysis_id="analysis-failed",
+        author_id=101,
+        state="failed",
+        completed_at="2026-04-01T00:00:00+00:00",
+    )
+    insert_catalog_analysis(
+        store,
+        analysis_id="analysis-invalid-old-data",
+        author_id=101,
+        state="completed",
+        completed_at="2026-05-01T00:00:00+00:00",
+        result_status="completed",
+        presentation="female",
+        age=16,
+        raw_min=7,
+        raw_max=8,
+        boosted=8,
+    )
+
+    profile = build_payload(store, root)["profiles"][0]
+
+    assert profile["author_id"] == 101
+    assert profile["username"] == "new_name"
+    assert profile["psl_latest"]["raw_psl_min"] == 6.0
+    assert profile["psl_latest"]["attempt_id"] == "attempt-analysis-z"
+    assert [item["status"] for item in profile["psl_history"]] == [
+        "invalid_result", "failed", "completed", "completed"
+    ]
+    assert profile["psl_history"][0]["estimated_age"] is None
+    assert profile["psl_history"][1]["raw_psl_min"] is None
+    assert "instructions" not in profile["psl_history"][0]
+    store.close()
+
+
+def test_profiles_without_successful_psl_keep_null_and_numeric_filters_exclude_null():
+    scored = {
+        "author_id": 1,
+        "username": "scored",
+        "display_name": "Scored",
+        "first_seen": "2024",
+        "last_seen": "2026",
+        "last_activity": "2026",
+        "post_ids": [9],
+        "video_ids": ["v"],
+        "photos": [{"photo_id": "p"}],
+        "username_history": [],
+        "psl_latest": {
+            "status": "completed", "raw_psl_min": 4.5, "raw_psl_max": 5.5,
+            "boosted_psl": 6.0, "estimated_age": 24,
+        },
+    }
+    unscored = {
+        "author_id": 2,
+        "username": "unscored",
+        "display_name": "Unscored",
+        "first_seen": "2025",
+        "last_seen": "2025",
+        "last_activity": "",
+        "post_ids": [],
+        "video_ids": [],
+        "photos": [],
+        "username_history": [],
+        "psl_latest": None,
+    }
+    profiles = [unscored, scored]
+
+    assert filter_profiles(profiles, {}) == profiles
+    assert filter_profiles(profiles, {"has_psl": True}) == [scored]
+    assert filter_profiles(profiles, {"has_psl": False}) == [unscored]
+    assert filter_profiles(profiles, {"raw_min": 4, "raw_max": 6}) == [scored]
+    assert filter_profiles(profiles, {"boosted_min": 6, "age_min": 21}) == [scored]
+    assert filter_profiles(profiles, {"source_id": 9, "has_photos": True}) == [scored]
+    assert sort_profiles(profiles, "raw_psl", descending=True) == [scored, unscored]
+    assert sort_profiles(profiles, "raw_psl", descending=False) == [scored, unscored]
+
+
+def test_psl_finish_marks_catalog_dirty_in_same_terminal_update(tmp_path):
+    store = Store(tmp_path / "db.sqlite")
+    attempt_id = insert_catalog_analysis(
+        store,
+        analysis_id="analysis-running",
+        author_id=101,
+        state="queued",
+        completed_at=None,
+    )
+    store.telegram.set_catalog_dirty(False)
+    before = store.telegram.catalog_revision()
+    response = AIResponse("deepseek", "actual-model", "{}", "stop")
+
+    store.ai.finish_attempt(
+        attempt_id,
+        state="completed",
+        usage=None,
+        response=response,
+        error_code=None,
+        cost=CostEstimate(None, None, "unknown", {}),
+        price=None,
+        analysis_result={
+            "status": "completed",
+            "presentation": "female",
+            "estimated_age": 30,
+            "raw_psl_min": 5.0,
+            "raw_psl_max": 6.0,
+            "boosted_psl": 6.5,
+        },
+    )
+
+    assert store.telegram.catalog_dirty() is True
+    assert store.telegram.catalog_revision() == before + 1
+    row = store.db.execute(
+        "SELECT result_status,raw_psl_min FROM ai_telegram_analyses WHERE id='analysis-running'"
+    ).fetchone()
+    assert tuple(row) == ("completed", 5.0)
+    store.close()
+
+
+def test_catalog_revision_preserves_change_during_atomic_generation(tmp_path, monkeypatch):
+    import hoard.catalog as catalog_module
+
+    store = Store(tmp_path / "db.sqlite")
+    root = tmp_path / "archive"
+    store.add_source(Post("channelx", 7), str(root))
+    build_catalog(store)
+    assert store.telegram.catalog_dirty() is False
+    original_bundle = catalog_module._bundle_html
+    changed = False
+
+    def mutate_after_snapshot(*args, **kwargs):
+        nonlocal changed
+        if not changed:
+            concurrent = Store(store.filename)
+            concurrent.telegram.observe_profile(
+                author_id=202, username="concurrent", display_name="Concurrent"
+            )
+            concurrent.close()
+            changed = True
+        return original_bundle(*args, **kwargs)
+
+    monkeypatch.setattr(catalog_module, "_bundle_html", mutate_after_snapshot)
+    report = build_catalog(store)
+
+    assert store.telegram.catalog_dirty() is True
+    assert payload_from(report)["profiles"] == []
+    build_catalog(store)
+    assert store.telegram.catalog_dirty() is False
+    assert payload_from(report)["profiles"][0]["author_id"] == 202
+    store.close()
+
+
+def test_large_synthetic_catalog_keeps_one_profile_record_per_telegram_id(tmp_path):
+    store = Store(tmp_path / "db.sqlite")
+    root = tmp_path / "archive"
+    with store.db:
+        store.db.executemany(
+            """INSERT INTO tg_profiles(author_id,current_username,display_name,first_seen,last_seen)
+            VALUES(?,?,?,?,?)""",
+            (
+                (index, f"user{index}", f"Synthetic {index}", "2025", "2026")
+                for index in range(1, 10_001)
+            ),
+        )
+        store.telegram._set_dirty_sql()
+
+    report = build_catalog(store, archive_root=root)
+    payload = payload_from(report)
+
+    assert len(payload["profiles"]) == 10_000
+    assert payload["profiles"][0]["author_id"] == 1
+    assert payload["profiles"][-1]["author_id"] == 10_000
+    assert report.stat().st_size < 15 * 1024 * 1024
+    store.close()
+
+
+def test_frontend_has_independent_list_state_local_history_and_bounded_media():
+    app = Path("src/hoard/templates/telegram/app.js").read_text(encoding="utf-8")
+
+    assert "const lists =" in app
+    assert "posts:" in app and "profiles:" in app
+    assert "history.pushState" not in app  # Dynamic dispatch avoids duplicated route writes.
+    assert '"pushState"' in app and '"replaceState"' in app
+    assert 'window.addEventListener("popstate"' in app
+    assert "rememberScroll" in app
+    assert "state.detail" not in app
+    assert "MEDIA_PAGE_SIZE" in app and "VIDEO_PAGE_SIZE" in app
+    assert 'image.loading = "lazy"' in app
+    assert 'video.preload = "none"' in app
+    assert "fetch(" not in app
+    assert ".innerHTML" not in app
