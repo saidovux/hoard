@@ -34,6 +34,7 @@ class SourcesScreen(WorkspaceScreen):
             yield Button("Вкл./выкл.", id="source-toggle")
             yield Button("Проверить выбранный", id="source-scan")
             yield Button("Проверить все", id="source-scan-all")
+            yield Button("Анализировать профили", id="source-ai")
         yield Static(
             "Enter — изменить · a — добавить · e — изменить · s — проверить выбранный",
             classes="table-help",
@@ -105,10 +106,18 @@ class SourcesScreen(WorkspaceScreen):
             "source-toggle": self._toggle,
             "source-scan": self.action_scan_source,
             "source-scan-all": self._scan_all,
+            "source-ai": self._analyze_profiles,
         }
         action = actions.get(str(event.button.id))
         if action:
             action()
+
+    def _analyze_profiles(self) -> None:
+        source_id = self.selected_source_id
+        if source_id is None:
+            self.hoard_app.set_notice("Сначала выбери публикацию.", error=True)
+            return
+        self.hoard_app.open_telegram_analysis({"source_id": source_id})
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         if event.data_table.id == "sources-table" and self.selected_source_id is not None:

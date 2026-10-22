@@ -1,6 +1,6 @@
 # Hoard contributor notes
 
-Local-first Telegram archive and extensible small-tool core, Python >=3.11. Keep a single daemon + user-owned IPC; no network service, Redis, Docker, Electron or web UI in current scope.
+Local-first Telegram archive and extensible small-tool core, Python >=3.11. Keep a single daemon + user-owned IPC; no network service, Redis, Docker or Electron. The sole HTTP exception is the explicit, short-lived `hoard web` client: it binds only to `127.0.0.1`, proxies through daemon IPC and must never become a LAN or persistent service.
 
 - The legacy `hoard` / `hoard ui` client uses `src/hoard/console_ui.py`: Rich + InquirerPy,
   black terminal background supplied by the terminal, accent #F79646. The optional `hoard tui`

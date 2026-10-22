@@ -62,6 +62,11 @@ def main():
     sub = p.add_subparsers(dest="command")
     for name in ("ui", "tui", "daemon", "start", "stop", "scan", "status", "shutdown"):
         sub.add_parser(name)
+    web = sub.add_parser("web", help="Открыть короткоживущий локальный веб-интерфейс")
+    web.add_argument("--no-open", action="store_true", help="Не открывать браузер автоматически")
+    web.add_argument(
+        "--lifetime", type=int, default=1800, help="Закрыть сервер после простоя, секунд"
+    )
     a = sub.add_parser("add", help="Добавить пост без запуска TUI")
     a.add_argument("url")
     a.add_argument("--output", default="~/Videos/hoard")
@@ -86,6 +91,15 @@ def main():
         cmd.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
                          help=argparse.SUPPRESS)
     args = p.parse_args()
+    if args.command == "web":
+        from .web import run_web
+
+        try:
+            run_web(open_browser=not args.no_open, lifetime=args.lifetime)
+        except (RuntimeError, ValueError, OSError) as exc:
+            print(f"Ошибка: {exc}", file=sys.stderr)
+            raise SystemExit(1) from None
+        return
     if args.command in {None, "ui", "tui"}:
         if not sys.stdin.isatty() or not sys.stdout.isatty():
             print(

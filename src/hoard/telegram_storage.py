@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from .archive_paths import default_archive_root, path_is_within
+from .models import parse_post_url
 
 TELEGRAM_SCHEMA_VERSION = 2
 
@@ -587,12 +588,12 @@ class TelegramStorage:
 
     def recent_profiles(self, count: int = 80) -> list[dict[str, Any]]:
         """Return presentation-safe profile summaries for the daemon status response."""
-        return [
-            dict(row)
-            for row in self.db.execute(
+        result = []
+        for row in self.db.execute(
                 """SELECT profiles.*,
                 COUNT(DISTINCT photos.photo_id) AS photo_count,
-                COUNT(DISTINCT links.source_id) AS source_count
+                COUNT(DISTINCT links.source_id) AS source_count,
+                GROUP_CONCAT(DISTINCT links.source_id) AS source_ids_text
                 FROM tg_profiles AS profiles
                 LEFT JOIN tg_profile_photos AS photos
                   ON photos.author_id=profiles.author_id
@@ -602,8 +603,145 @@ class TelegramStorage:
                 ORDER BY profiles.last_seen DESC, profiles.author_id
                 LIMIT ?""",
                 (max(1, int(count)),),
+            ):
+            item = dict(row)
+            item["source_ids"] = [
+                int(value)
+                for value in str(item.pop("source_ids_text") or "").split(",")
+                if value
+            ]
+            result.append(item)
+        return result
+
+    def resolve_source_id(self, value: Any) -> int:
+        """Resolve only an already saved source id or post URL; never contact Telegram."""
+        raw = str(value or "").strip()
+        if not raw:
+            raise ValueError("Выбери сохранённую публикацию")
+        try:
+            source_id = int(raw)
+        except ValueError:
+            post = parse_post_url(raw)
+            row = self.db.execute(
+                "SELECT id FROM sources WHERE lower(username)=? AND post_id=?",
+                (post.username, post.message_id),
+            ).fetchone()
+        else:
+            row = self.db.execute("SELECT id FROM sources WHERE id=?", (source_id,)).fetchone()
+        if row is None:
+            raise ValueError(
+                "Публикация не найдена в локальном архиве; анализ не запускает новый сбор"
+            )
+        return int(row["id"])
+
+    def source_summary(self, source_id: int) -> dict[str, Any]:
+        row = self.db.execute(
+            """SELECT s.id,s.username,s.post_id,s.url,s.title,
+            COALESCE(m.channel_title,'') AS channel_title,
+            COUNT(DISTINCT links.author_id) AS profile_count,
+            COUNT(DISTINCT CASE WHEN photos.status='saved' THEN photos.photo_id END)
+                AS photo_count
+            FROM sources s
+            LEFT JOIN tg_post_metadata m ON m.source_id=s.id
+            LEFT JOIN tg_profile_sources links ON links.source_id=s.id
+            LEFT JOIN tg_profile_photos photos ON photos.author_id=links.author_id
+            WHERE s.id=? GROUP BY s.id""",
+            (int(source_id),),
+        ).fetchone()
+        if row is None:
+            raise ValueError("Публикация не найдена в локальном архиве")
+        return dict(row)
+
+    def source_profiles(self, source_id: int) -> list[int]:
+        """Return the complete local relation, intentionally without the status 80-row cap."""
+        self.source_summary(source_id)
+        return [
+            int(row["author_id"])
+            for row in self.db.execute(
+                """SELECT author_id FROM tg_profile_sources WHERE source_id=?
+                ORDER BY last_seen DESC,author_id""",
+                (int(source_id),),
             )
         ]
+
+    def profile_summaries(
+        self,
+        *,
+        author_ids: list[int] | None = None,
+        source_id: int | None = None,
+        query: str = "",
+        limit: int = 100,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        """Paginated presentation-safe local profiles for analysis pickers."""
+        page_limit = max(1, min(100, int(limit)))
+        page_offset = max(0, int(offset))
+        clauses = ["1=1"]
+        parameters: list[Any] = []
+        join = ""
+        if source_id is not None:
+            selected_source = self.resolve_source_id(source_id)
+            join = "JOIN tg_profile_sources selected ON selected.author_id=profiles.author_id"
+            clauses.append("selected.source_id=?")
+            parameters.append(selected_source)
+        if author_ids is not None:
+            identifiers: list[int] = []
+            for item in author_ids:
+                try:
+                    author_id = int(item)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("author_ids содержит некорректный Telegram ID") from exc
+                if author_id > 0 and author_id not in identifiers:
+                    identifiers.append(author_id)
+            if not identifiers:
+                return {"items": [], "total": 0, "limit": page_limit, "offset": page_offset,
+                        "has_more": False}
+            placeholders = ",".join("?" for _ in identifiers)
+            clauses.append(f"profiles.author_id IN ({placeholders})")
+            parameters.extend(identifiers)
+        needle = str(query or "").strip().lstrip("@").casefold()
+        if needle:
+            clauses.append(
+                """(CAST(profiles.author_id AS TEXT) LIKE ? OR
+                lower(profiles.display_name) LIKE ? OR lower(profiles.current_username) LIKE ? OR
+                EXISTS (SELECT 1 FROM tg_username_history history
+                        WHERE history.author_id=profiles.author_id
+                          AND lower(history.username) LIKE ?))"""
+            )
+            pattern = f"%{needle}%"
+            parameters.extend([pattern, pattern, pattern, pattern])
+        where = " AND ".join(clauses)
+        total = int(
+            self.db.execute(
+                f"SELECT COUNT(DISTINCT profiles.author_id) FROM tg_profiles profiles {join} "
+                f"WHERE {where}",
+                parameters,
+            ).fetchone()[0]
+        )
+        rows = [
+            dict(row)
+            for row in self.db.execute(
+                f"""SELECT profiles.author_id,profiles.current_username,
+                profiles.display_name,profiles.first_seen,profiles.last_seen,
+                profiles.photo_error,
+                COUNT(DISTINCT CASE WHEN photos.status='saved' THEN photos.photo_id END)
+                    AS photo_count,
+                COUNT(DISTINCT links.source_id) AS source_count
+                FROM tg_profiles profiles {join}
+                LEFT JOIN tg_profile_photos photos ON photos.author_id=profiles.author_id
+                LEFT JOIN tg_profile_sources links ON links.author_id=profiles.author_id
+                WHERE {where} GROUP BY profiles.author_id
+                ORDER BY profiles.last_seen DESC,profiles.author_id LIMIT ? OFFSET ?""",
+                (*parameters, page_limit, page_offset),
+            )
+        ]
+        return {
+            "items": rows,
+            "total": total,
+            "limit": page_limit,
+            "offset": page_offset,
+            "has_more": page_offset + len(rows) < total,
+        }
 
     def due_profile_photo_ids(self, limit: int = 100) -> list[int]:
         """Return profiles whose visible photos need an initial check or retry."""

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-PSL_SCHEMA_VERSION = 1
+PSL_SCHEMA_VERSION = 2
 PSL_STATUSES = {"completed", "insufficient_data", "ineligible", "invalid_result"}
 
 PSL_JSON_SCHEMA: dict[str, Any] = {
@@ -35,7 +35,14 @@ PSL_JSON_SCHEMA: dict[str, Any] = {
     },
 }
 
-DEFAULT_PSL_INSTRUCTIONS = """Analyze only the explicitly selected local profile photos.
+DEFAULT_PSL_INSTRUCTIONS = """IMPORTANT: First determine whether the supplied images contain a
+suitable real-person photograph. Do not assign PSL scores to animals, drawings, anime, fictional
+characters, memes, logos, clearly synthetic avatars or photographs obviously unrelated to the
+intended subject. An image alone cannot verify the identity of a Telegram account owner. When the
+images are unsuitable or their relevance is uncertain, return an ineligible or insufficient-data
+result with null PSL scores. Do not identify people by face or automatically recognize celebrities.
+
+Analyze only the explicitly selected local profile photos.
 Return only JSON matching the supplied schema. This is a subjective, non-scientific visual
 estimate, not a factual measurement. PSL scores apply only when visual presentation is female,
 the person is clearly an adult, and the images are sufficient. If presentation is male or

@@ -247,7 +247,7 @@ SelectOverlay > .option-list--option-hover {
     width: 100%;
 }
 
-#telegram-summary, #collector-help, #archive-summary, .table-help {
+#telegram-summary, #collector-help, #archive-summary, #ai-onboarding, .table-help {
     height: auto;
     min-height: 3;
     margin-bottom: 1;
@@ -269,8 +269,8 @@ SelectOverlay > .option-list--option-hover {
 }
 
 #archive-actions {
-    grid-size: 4;
-    grid-columns: 1fr 1fr 1fr 1fr;
+    grid-size: 3;
+    grid-columns: 1fr 1fr 1fr;
 }
 
 .ai-mode-row {
@@ -300,8 +300,28 @@ SelectOverlay > .option-list--option-hover {
     margin-bottom: 1;
 }
 
-.ai-record-dialog, .telegram-ai-dialog {
+.ai-record-dialog, .telegram-ai-dialog, .telegram-analysis-dialog {
     width: 80;
+}
+
+.telegram-analysis-dialog SelectionList {
+    height: auto;
+    min-height: 3;
+    max-height: 14;
+    margin-bottom: 1;
+    border: solid #262626;
+}
+
+#ai-onboarding {
+    width: 100%;
+    max-width: 58;
+    padding: 2 1;
+    border-left: solid #F79646;
+}
+
+#ai-onboarding Button {
+    width: 28;
+    margin-top: 1;
 }
 
 .compact #archive-actions, .compact .ai-mode-row, .compact #ai-actions {

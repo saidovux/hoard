@@ -169,5 +169,6 @@ class IPCStatusAPI:
             "ai_chat_send",
             "ai_attempt_retry",
             "ai_telegram_psl_start",
+            "ai_telegram_batch_start",
         } else self.CONTROL_TIMEOUT
         return await request(method, args or {}, timeout=timeout)

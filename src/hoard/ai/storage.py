@@ -14,7 +14,7 @@ from .models import AIImage, AIUsage
 from .pricing import CostEstimate, decimal_text
 from .psl import DEFAULT_PSL_INSTRUCTIONS, PSL_JSON_SCHEMA
 
-AI_SCHEMA_VERSION = 2
+AI_SCHEMA_VERSION = 3
 MAX_TEXT_BYTES = 32 * 1024
 MAX_NAME_BYTES = 300
 MAX_PAGE = 100
@@ -277,6 +277,22 @@ class AIStorage:
                 PRIMARY KEY(analysis_id, photo_id),
                 UNIQUE(analysis_id, position)
             );
+            CREATE TABLE IF NOT EXISTS ai_telegram_batches (
+                id TEXT PRIMARY KEY,
+                operation_key TEXT NOT NULL UNIQUE,
+                source_id INTEGER,
+                selected_count INTEGER NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS ai_telegram_batch_items (
+                batch_id TEXT NOT NULL REFERENCES ai_telegram_batches(id) ON DELETE CASCADE,
+                author_id INTEGER NOT NULL,
+                analysis_id TEXT REFERENCES ai_telegram_analyses(id),
+                state TEXT NOT NULL CHECK(state IN ('pending','queued','skipped')),
+                reason TEXT NOT NULL DEFAULT '',
+                photo_count INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(batch_id, author_id)
+            );
             CREATE INDEX IF NOT EXISTS ai_prompts_scope_idx
                 ON ai_prompts(scope, updated_at DESC);
             CREATE INDEX IF NOT EXISTS ai_prompt_versions_prompt_idx
@@ -295,6 +311,8 @@ class AIStorage:
                 ON ai_attempts(provider, actual_model, scope, chat_id, created_at);
             CREATE INDEX IF NOT EXISTS ai_telegram_analyses_author_idx
                 ON ai_telegram_analyses(author_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS ai_telegram_batch_items_analysis_idx
+                ON ai_telegram_batch_items(analysis_id);
             CREATE UNIQUE INDEX IF NOT EXISTS ai_attempts_chat_active_idx
                 ON ai_attempts(chat_id)
                 WHERE chat_id IS NOT NULL AND state IN ('queued','running');
@@ -380,6 +398,22 @@ class AIStorage:
             )
         else:
             prompt = self.get_prompt(str(row["id"]))
+            if not str(prompt["current_version"].get("instructions") or "").startswith(
+                "IMPORTANT: First determine whether"
+            ):
+                # Keep the previous immutable version and install the revised built-in safety
+                # contract as a new version. User-created prompts are not touched.
+                prompt = self.update_prompt(
+                    str(prompt["id"]),
+                    {
+                        "name": prompt["name"],
+                        "instructions": DEFAULT_PSL_INSTRUCTIONS,
+                        "provider": prompt["current_version"].get("provider") or "deepseek",
+                        "model": prompt["current_version"].get("model") or "deepseek-chat",
+                        "response_format": "json",
+                        "json_schema": PSL_JSON_SCHEMA,
+                    },
+                )
         return prompt
 
     def create_prompt(self, values: dict[str, Any]) -> dict:
@@ -1016,6 +1050,132 @@ class AIStorage:
             "SELECT id FROM ai_telegram_analyses WHERE operation_key=?", (operation_key,)
         ).fetchone()
         return self.telegram_analysis(str(row["id"])) if row else None
+
+    def create_telegram_batch(
+        self,
+        *,
+        operation_key: str,
+        source_id: int | None,
+        selected_count: int,
+        items: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        existing = self.telegram_batch_by_operation(operation_key)
+        if existing is not None:
+            return existing
+        batch_id = new_id()
+        timestamp = now_utc()
+        with self.db:
+            self.db.execute(
+                """INSERT INTO ai_telegram_batches(
+                id,operation_key,source_id,selected_count,created_at) VALUES(?,?,?,?,?)""",
+                (batch_id, operation_key, source_id, int(selected_count), timestamp),
+            )
+            for item in items:
+                self.db.execute(
+                    """INSERT INTO ai_telegram_batch_items(
+                    batch_id,author_id,state,reason,photo_count) VALUES(?,?,?,?,?)""",
+                    (
+                        batch_id,
+                        int(item["author_id"]),
+                        str(item.get("state") or "pending"),
+                        str(item.get("reason") or "")[:500],
+                        int(item.get("photo_count") or 0),
+                    ),
+                )
+        return self.telegram_batch(batch_id)
+
+    def link_telegram_batch_analysis(
+        self, batch_id: str, author_id: int, analysis_id: str
+    ) -> None:
+        with self.db:
+            cursor = self.db.execute(
+                """UPDATE ai_telegram_batch_items
+                SET analysis_id=?,state='queued',reason=''
+                WHERE batch_id=? AND author_id=? AND state='pending'""",
+                (str(analysis_id), str(batch_id), int(author_id)),
+            )
+            if cursor.rowcount not in {0, 1}:
+                raise RuntimeError("Не удалось связать групповое AI-задание")
+
+    def fail_telegram_batch_item(self, batch_id: str, author_id: int, reason: str) -> None:
+        with self.db:
+            self.db.execute(
+                """UPDATE ai_telegram_batch_items SET state='skipped',reason=?
+                WHERE batch_id=? AND author_id=? AND state='pending'""",
+                (str(reason)[:500], str(batch_id), int(author_id)),
+            )
+
+    def telegram_batch_by_operation(self, operation_key: str) -> dict[str, Any] | None:
+        row = self.db.execute(
+            "SELECT id FROM ai_telegram_batches WHERE operation_key=?", (str(operation_key),)
+        ).fetchone()
+        return self.telegram_batch(str(row["id"])) if row is not None else None
+
+    def telegram_batch(
+        self, batch_id: str, *, limit: Any = 100, offset: Any = 0
+    ) -> dict[str, Any]:
+        page_limit, page_offset = paging(limit, offset)
+        row = self.db.execute(
+            "SELECT * FROM ai_telegram_batches WHERE id=?", (str(batch_id),)
+        ).fetchone()
+        if row is None:
+            raise ValueError("Группа Telegram AI не найдена")
+        all_rows = [
+            dict(item)
+            for item in self.db.execute(
+                """SELECT i.batch_id,i.author_id,i.analysis_id,i.state AS item_state,
+                i.reason,i.photo_count,p.display_name,p.current_username,
+                a.result_status,a.presentation,a.estimated_age,a.raw_psl_min,a.raw_psl_max,
+                a.boosted_psl,t.id AS attempt_id,t.state AS attempt_state,t.error_code,
+                t.estimated_cost,t.cost_currency,t.cost_status,t.requested_model,t.actual_model
+                FROM ai_telegram_batch_items i
+                LEFT JOIN tg_profiles p ON p.author_id=i.author_id
+                LEFT JOIN ai_telegram_analyses a ON a.id=i.analysis_id
+                LEFT JOIN ai_attempts t ON t.id=a.attempt_id
+                WHERE i.batch_id=? ORDER BY i.author_id""",
+                (str(batch_id),),
+            )
+        ]
+        queued = completed = skipped = errors = 0
+        usd_total = None
+        unknown_cost = 0
+        from decimal import Decimal
+
+        for item in all_rows:
+            if item["item_state"] == "skipped":
+                skipped += 1
+                item["state"] = "skipped"
+                continue
+            state = str(item.get("attempt_state") or item["item_state"])
+            item["state"] = state
+            if state in {"queued", "running", "pending"}:
+                queued += 1
+            elif state == "completed":
+                completed += 1
+            elif state in {"failed", "outcome_unknown"}:
+                errors += 1
+            if item.get("estimated_cost") is not None and item.get("cost_currency") == "USD":
+                usd_total = (usd_total or Decimal("0")) + Decimal(str(item["estimated_cost"]))
+            elif item.get("analysis_id") and item.get("cost_status") != "complete":
+                unknown_cost += 1
+        page = all_rows[page_offset : page_offset + page_limit]
+        result = dict(row)
+        result.update(
+            {
+                "items": page,
+                "limit": page_limit,
+                "offset": page_offset,
+                "has_more": page_offset + len(page) < len(all_rows),
+                "queued": queued,
+                "completed": completed,
+                "skipped": skipped,
+                "errors": errors,
+                "estimated_cost_usd": format(usd_total, "f") if usd_total is not None else None,
+                "unknown_cost": unknown_cost,
+                "terminal": queued == 0,
+            }
+        )
+        return result
 
     def list_telegram_analyses(
         self,

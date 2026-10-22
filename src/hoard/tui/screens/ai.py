@@ -30,12 +30,19 @@ class AIWorkspaceScreen(WorkspaceScreen):
         self.items: list[dict[str, Any]] = []
         self.prompts: list[dict[str, Any]] = []
         self.statistics: dict[str, dict[str, Any]] = {}
+        self.config: dict[str, Any] = {}
         self.selected_chat: dict[str, Any] | None = None
         self.history_offset = 0
         self._loading = False
 
     def compose_workspace(self) -> ComposeResult:
         yield Static(id="ai-summary")
+        with Vertical(id="ai-onboarding"):
+            yield Static(
+                "DeepSeek не подключён\nДобавь один API-ключ, чтобы открыть AI-функции.",
+                id="ai-onboarding-copy",
+            )
+            yield Button("Добавить API-ключ", id="ai-add-key", variant="primary")
         yield Static(id="ai-statistics")
         with Horizontal(classes="action-row ai-mode-row"):
             yield Button("Диалоги", id="ai-mode-chats", variant="primary")
@@ -52,6 +59,7 @@ class AIWorkspaceScreen(WorkspaceScreen):
                 yield Button("Активировать", id="ai-activate")
                 yield Button("Повторить", id="ai-retry")
                 yield Button("Настроить ключ", id="ai-config")
+                yield Button("Открыть веб-интерфейс", id="ai-web")
                 yield Button("Обновить", id="ai-refresh")
             yield DataTable(id="ai-table", cursor_type="row")
         with Vertical(id="ai-chat-pane"):
@@ -78,6 +86,7 @@ class AIWorkspaceScreen(WorkspaceScreen):
     def on_mount(self) -> None:
         super().on_mount()
         self.query_one("#ai-chat-pane").display = False
+        self.query_one("#ai-onboarding").display = False
         self._load()
 
     def on_screen_resume(self) -> None:
@@ -86,10 +95,18 @@ class AIWorkspaceScreen(WorkspaceScreen):
 
     def render_data(self, status: dict) -> None:
         integration = status.get("integrations") or {}
-        configured = bool(integration.get("ai"))
+        configured = bool(self.config.get("configured", integration.get("ai")))
+        key_status = str(self.config.get("key_status") or "")
+        state_label = {
+            "not_configured": "не настроен",
+            "key_saved": "ключ сохранён · ещё не проверен",
+            "verified": "подключён",
+            "authorization_error": "ошибка авторизации",
+        }.get(key_status, "настроен" if configured else "не настроен")
         text = Text()
         text.append("DeepSeek  ", style="#888888")
-        text.append("настроен" if configured else "нужен API-ключ", style="#FFFFFF")
+        state_style = "#F79646" if key_status == "authorization_error" else "#FFFFFF"
+        text.append(state_label, style=state_style)
         text.append("  ·  ", style="#888888")
         text.append("платные запросы только после подтверждения", style="#F79646")
         self.query_one("#ai-summary", Static).update(text)
@@ -102,6 +119,16 @@ class AIWorkspaceScreen(WorkspaceScreen):
 
     async def _load_data(self) -> None:
         try:
+            self.config = await self.hoard_app.api.ai_call("ai_config_get")
+            available = bool(self.config.get("configured")) or "key_status" not in self.config
+            if self.is_mounted:
+                self.query_one("#ai-onboarding").display = not available
+                self.query_one("#ai-statistics").display = available
+                self.query_one(".ai-mode-row").display = available
+                self.query_one("#ai-list-pane").display = available
+                self.render_data(self.hoard_app.status or {})
+            if not available:
+                return
             prompt_page, general_stats, telegram_stats = await asyncio.gather(
                 self.hoard_app.api.ai_call(
                     "ai_prompt_list", {"limit": 100, "offset": 0}
@@ -262,6 +289,10 @@ class AIWorkspaceScreen(WorkspaceScreen):
             self._load()
         elif identifier == "ai-config":
             self._open_config()
+        elif identifier == "ai-add-key":
+            self.hoard_app.ensure_ai(self._load)
+        elif identifier == "ai-web":
+            self.hoard_app.open_web_interface()
         elif identifier == "ai-create":
             self._open_editor(None)
         elif identifier == "ai-edit":

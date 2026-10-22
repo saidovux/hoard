@@ -93,6 +93,7 @@ input, select { width: 100%; min-height: 2.45rem; padding: .46rem .65rem; }
   border-radius: 10px;
 }
 .notice { margin: .5rem 0; padding: .8rem; color: var(--danger); border-left: 2px solid var(--danger); }
+.notice.success { color: #d7d7d7; border-left-color: var(--accent); }
 
 .card-grid {
   display: grid;
@@ -108,6 +109,59 @@ input, select { width: 100%; min-height: 2.45rem; padding: .46rem .65rem; }
   overflow: hidden;
 }
 .card:hover { border-color: var(--line); }
+.interactive-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: .55rem;
+  padding: .65rem .9rem;
+  border-top: 1px solid var(--line);
+}
+.interactive-actions button { min-height: 2rem; padding: .35rem .58rem; font-size: .78rem; }
+.detail-actions { display: flex; flex-wrap: wrap; gap: .55rem; margin: .2rem 0 1rem; }
+.primary-action { color: #111; background: var(--accent); border-color: var(--accent); }
+.check-row { display: flex; align-items: center; gap: .5rem; color: #d5d5d5; font-size: .82rem; }
+.check-row input { width: 1rem; min-height: 1rem; accent-color: var(--accent); }
+
+.workflow-dialog {
+  width: min(760px, calc(100vw - 1rem));
+  max-height: min(90vh, 880px);
+  padding: 0;
+  color: var(--text);
+  background: #080808;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+}
+.workflow-dialog::backdrop { background: rgba(0, 0, 0, .88); }
+.workflow-head {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 1rem;
+  padding: .75rem 1rem;
+  background: #080808;
+  border-bottom: 1px solid var(--line);
+}
+.workflow-head h2 { margin: 0; font-size: 1rem; }
+.workflow-body { padding: 1rem; overflow: auto; }
+.workflow-summary { padding: .7rem; background: var(--surface); border-left: 2px solid var(--accent); }
+.workflow-list { display: grid; gap: .55rem; margin: .8rem 0; }
+.workflow-row {
+  display: grid;
+  gap: .4rem;
+  padding: .75rem;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+.workflow-reason, .notice-inline { color: var(--danger); font-size: .8rem; }
+.photo-choices { display: grid; gap: .4rem; padding: .35rem 0; }
+.adult-check, .external-check { padding: .45rem 0; }
+.external-check { margin-top: .8rem; }
 .card-body { min-width: 0; padding: .9rem; }
 .card-action {
   display: block;
@@ -262,4 +316,5 @@ footer { padding: 2rem 0; font-size: .78rem; }
   .media-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .media { min-height: 120px; height: 170px; }
   .viewer { width: 100vw; height: 100vh; max-width: none; max-height: none; border-radius: 0; }
+  .detail-actions button, .interactive-actions button { width: 100%; }
 }

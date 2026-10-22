@@ -10,9 +10,9 @@ from typing import TYPE_CHECKING, Any
 import pytest
 
 if TYPE_CHECKING:
-    from textual.widgets import DataTable, Input, OptionList, Static
+    from textual.widgets import DataTable, Input, OptionList, SelectionList, Static
 
-    from hoard.tui.ai_dialogs import AIRecordDialog, TelegramAIDialog
+    from hoard.tui.ai_dialogs import AIRecordDialog, TelegramAIDialog, TelegramAnalysisDialog
     from hoard.tui.app import HelpScreen, HoardApp
     from hoard.tui.dialogs import AuthDialog, ConfirmDialog, SourceDialog
     from hoard.tui.screens import (
@@ -32,10 +32,12 @@ def load_textual_after_existing_async_tests():
     from textual.widgets import DataTable as DataTableClass
     from textual.widgets import Input as InputClass
     from textual.widgets import OptionList as OptionListClass
+    from textual.widgets import SelectionList as SelectionListClass
     from textual.widgets import Static as StaticClass
 
     from hoard.tui.ai_dialogs import AIRecordDialog as AIRecordDialogClass
     from hoard.tui.ai_dialogs import TelegramAIDialog as TelegramAIDialogClass
+    from hoard.tui.ai_dialogs import TelegramAnalysisDialog as TelegramAnalysisDialogClass
     from hoard.tui.app import HelpScreen as HelpScreenClass
     from hoard.tui.app import HoardApp as HoardAppClass
     from hoard.tui.dialogs import AuthDialog as AuthDialogClass
@@ -66,6 +68,7 @@ def load_textual_after_existing_async_tests():
         HoardStatusBar=HoardStatusBarClass,
         Input=InputClass,
         OptionList=OptionListClass,
+        SelectionList=SelectionListClass,
         OverviewScreen=OverviewScreenClass,
         ProgressView=ProgressViewClass,
         Sidebar=SidebarClass,
@@ -74,6 +77,7 @@ def load_textual_after_existing_async_tests():
         Static=StaticClass,
         TelegramScreen=TelegramScreenClass,
         TelegramAIDialog=TelegramAIDialogClass,
+        TelegramAnalysisDialog=TelegramAnalysisDialogClass,
     )
 
 
@@ -1094,12 +1098,81 @@ async def test_telegram_ai_requires_visible_adult_and_external_confirmation():
         app.screen.query_one("#telegram-ai-photo-ids", Input).value = "photo-1"
         app.screen.query_one("#telegram-ai-submit").press()
         await wait_for_condition(pilot, lambda: isinstance(app.screen, ConfirmDialog))
+        await pilot.pause()
         message = str(app.screen.query_one(".dialog-message", Static).content)
         assert "18" in message
         assert "DeepSeek" in message
         assert "платным" in message
         app.screen.query_one("#cancel").press()
         assert not any(name == "ai_telegram_psl_start" for name, _ in api.calls)
+
+
+@pytest.mark.asyncio
+async def test_minimal_telegram_analysis_picker_uses_default_photos_and_per_profile_adult():
+    status = status_fixture()
+    status["profiles"] = [
+        {
+            "display_name": "Synthetic",
+            "current_username": "synthetic",
+            "author_id": 99,
+            "source_count": 1,
+            "photo_count": 1,
+            "last_seen": "2026-10-22",
+            "photo_error": "",
+        }
+    ]
+    api = FakeAPI(status)
+    api.queue(
+        "ai_config_get",
+        {"configured": True, "key_status": "key_saved", "provider": "deepseek"},
+    )
+    api.queue(
+        "ai_telegram_batch_preview",
+        {
+            "preview": {
+                "selected_count": 1,
+                "photo_count": 1,
+                "ready_count": 0,
+                "skipped_count": 1,
+                "items": [
+                    {
+                        "author_id": 99,
+                        "display_name": "Synthetic",
+                        "username": "synthetic",
+                        "photo_count": 1,
+                        "photos": [
+                            {
+                                "photo_id": "photo-1",
+                                "date": "2026-10-22",
+                                "size": 100,
+                                "available": True,
+                            }
+                        ],
+                        "selected_photo_ids": ["photo-1"],
+                        "reason": "Совершеннолетие не подтверждено",
+                        "previous": None,
+                    }
+                ],
+            }
+        },
+    )
+    app = HoardApp(api)
+    async with app.run_test(size=(100, 32)) as pilot:
+        await wait_for_startup(app, pilot)
+        app.open_section("archive")
+        await pilot.pause()
+        await pilot.click("#mode-profiles")
+        await pilot.click("#telegram-ai")
+        await wait_for_condition(pilot, lambda: isinstance(app.screen, TelegramAnalysisDialog))
+        photos = app.screen.query_one("#analysis-photos", SelectionList)
+        adults = app.screen.query_one("#analysis-adults", SelectionList)
+        assert photos.selected == ["photo-1"]
+        adults.select(99)
+        app.screen.query_one("#analysis-submit").press()
+        await wait_for_condition(pilot, lambda: isinstance(app.screen, ConfirmDialog))
+        message = str(app.screen.query_one(".dialog-message", Static).content)
+        assert "локальные фотографии" in message
+        assert "DeepSeek" in message
 
 
 def test_cli_module_keeps_textual_lazy_for_noninteractive_commands():

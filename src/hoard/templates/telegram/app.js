@@ -2,6 +2,8 @@
   "use strict";
 
   const catalog = window.HOARD_CATALOG || {};
+  const interactive = window.HOARD_INTERACTIVE || null;
+  const interactiveEnabled = Boolean(interactive && interactive.interactive && interactive.csrf);
   const PAGE_SIZE = 48;
   const MEDIA_PAGE_SIZE = 24;
   const VIDEO_PAGE_SIZE = 12;
@@ -22,6 +24,7 @@
   const profileSearchIndex = new Map();
   const postSearchIndex = new Map();
   const sectionPages = new Map();
+  const selectedProfiles = new Set();
   let currentRoute = null;
   let inputTimer = null;
 
@@ -36,6 +39,39 @@
       filters: emptyFilters(),
     },
   };
+
+  function restoreInteractiveState() {
+    if (!interactiveEnabled) return;
+    try {
+      const saved = JSON.parse(sessionStorage.getItem("hoard.web.state") || "null");
+      if (!saved || typeof saved !== "object") return;
+      ["posts", "profiles"].forEach((view) => {
+        const source = saved.lists && saved.lists[view];
+        if (!source || typeof source !== "object") return;
+        lists[view].query = String(source.query || "");
+        lists[view].sort = String(source.sort || lists[view].sort);
+        lists[view].descending = Boolean(source.descending);
+        lists[view].page = Math.max(0, Number(source.page || 0));
+        if (view === "profiles" && source.filters) {
+          lists.profiles.filters = {...emptyFilters(), ...source.filters};
+        }
+      });
+      (saved.selectedProfiles || []).forEach((id) => {
+        const value = Number(id);
+        if (profileMap.has(value)) selectedProfiles.add(value);
+      });
+    } catch (_) { /* Broken browser state is non-authoritative. */ }
+  }
+
+  function saveInteractiveState() {
+    if (!interactiveEnabled) return;
+    try {
+      sessionStorage.setItem("hoard.web.state", JSON.stringify({
+        lists,
+        selectedProfiles: [...selectedProfiles],
+      }));
+    } catch (_) { /* Private browsing may disable sessionStorage. */ }
+  }
 
   const profileSorts = [
     ["name", "Имя"], ["username", "Username"], ["id", "Telegram ID"],
@@ -96,6 +132,348 @@
       }
     } catch (_) { /* Invalid external links stay inert text. */ }
     return element("span", "muted", label);
+  }
+
+  function showNotice(message, error = false) {
+    const notice = byId("notice");
+    notice.hidden = !message;
+    notice.textContent = String(message || "");
+    notice.classList.toggle("success", !error);
+  }
+
+  async function api(path, options = {}) {
+    if (!interactiveEnabled) throw new Error("Интерактивный режим не запущен");
+    const method = options.method || "GET";
+    const headers = {"Accept": "application/json"};
+    if (method !== "GET") {
+      headers["Content-Type"] = "application/json";
+      headers["X-Hoard-CSRF"] = interactive.csrf;
+    }
+    const response = await window.fetch.call(window, path, {
+      method,
+      headers,
+      credentials: "same-origin",
+      body: method === "GET" ? undefined : JSON.stringify(options.body || {}),
+    });
+    let payload = {};
+    try { payload = await response.json(); } catch (_) { /* handled below */ }
+    if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
+    return payload;
+  }
+
+  function modal(title) {
+    const dialog = element("dialog", "workflow-dialog");
+    const bar = element("div", "workflow-head");
+    bar.append(element("h2", "", title));
+    const close = element("button", "secondary", "Закрыть ×");
+    close.type = "button";
+    close.addEventListener("click", () => dialog.close());
+    bar.append(close);
+    const body = element("div", "workflow-body");
+    dialog.append(bar, body);
+    document.body.append(dialog);
+    dialog.addEventListener("close", () => dialog.remove(), {once: true});
+    dialog.showModal();
+    return {dialog, body};
+  }
+
+  async function ensureAI(resume, forceSettings = false) {
+    let config = {};
+    try {
+      config = await api("/api/config");
+      if (config.configured && !forceSettings) {
+        resume();
+        return;
+      }
+    } catch (error) {
+      showNotice(error.message, true);
+      return;
+    }
+    const {dialog, body} = modal(config.configured ? "AI → Настройки" : "DeepSeek не подключён");
+    body.append(element(
+      "p", "muted",
+      config.configured
+        ? "Сохранённый ключ не показывается. Вставь новый ключ только если хочешь его заменить."
+        : "Добавь один API-ключ. Модель, тарифы и другие настройки для начала не нужны.",
+    ));
+    const label = element("label", "field");
+    label.append(element("span", "", "API-ключ DeepSeek"));
+    const input = element("input", "");
+    input.type = "password";
+    input.autocomplete = "off";
+    input.placeholder = "sk-…";
+    label.append(input);
+    const feedback = element("p", "notice-inline");
+    const save = element("button", "primary-action", "Сохранить");
+    save.type = "button";
+    save.addEventListener("click", async () => {
+      if (!input.value.trim()) {
+        feedback.textContent = "Вставь API-ключ DeepSeek.";
+        return;
+      }
+      save.disabled = true;
+      try {
+        const result = await api("/api/config", {
+          method: "POST", body: {api_key: input.value.trim()},
+        });
+        input.value = "";
+        dialog.close();
+        showNotice(result.message || "Ключ сохранён; проверка произойдёт при первом запросе.");
+        resume();
+      } catch (error) {
+        feedback.textContent = error.message;
+        save.disabled = false;
+      }
+    });
+    body.append(label, feedback, save);
+    input.focus();
+  }
+
+  function operationId() {
+    if (window.crypto && typeof window.crypto.randomUUID === "function") {
+      return window.crypto.randomUUID().replaceAll("-", "");
+    }
+    const bytes = new Uint8Array(16);
+    window.crypto.getRandomValues(bytes);
+    return [...bytes].map((value) => value.toString(16).padStart(2, "0")).join("");
+  }
+
+  function batchSummary(batch) {
+    const cost = batch.estimated_cost_usd === null || batch.estimated_cost_usd === undefined
+      ? "стоимость неизвестна"
+      : `≈ $${batch.estimated_cost_usd}`;
+    return `Выбрано ${batch.selected_count || 0} · в очереди ${batch.queued || 0} · `
+      + `готово ${batch.completed || 0} · пропущено ${batch.skipped || 0} · `
+      + `ошибки ${batch.errors || 0} · ${cost}`;
+  }
+
+  function renderBatch(body, batch) {
+    body.replaceChildren(element("p", "workflow-summary", batchSummary(batch)));
+    const list = element("div", "workflow-list");
+    (batch.items || []).forEach((item) => {
+      const row = element("div", "workflow-row");
+      const name = clean(item.display_name || item.current_username, `ID ${item.author_id}`);
+      row.append(element("strong", "", name));
+      row.append(element("span", "muted", item.state || "—"));
+      if (item.reason) row.append(element("span", "workflow-reason", item.reason));
+      if (item.error_code) row.append(element("span", "workflow-reason", item.error_code));
+      list.append(row);
+    });
+    body.append(list);
+  }
+
+  async function pollBatch(dialog, body, batchId) {
+    for (let index = 0; index < 120 && dialog.open; index += 1) {
+      await new Promise((resolve) => window.setTimeout(resolve, 1500));
+      let result;
+      try { result = await api(`/api/batches/${encodeURIComponent(batchId)}`); }
+      catch (error) {
+        body.append(element("p", "notice-inline", error.message));
+        return;
+      }
+      const batch = result.batch;
+      renderBatch(body, batch);
+      if (batch.terminal) {
+        try {
+          body.append(element("p", "muted", "Обновляем локальный каталог…"));
+          await api("/api/catalog/refresh", {method: "POST", body: {}});
+          saveInteractiveState();
+          location.reload();
+        } catch (error) {
+          body.append(element("p", "notice-inline", error.message));
+        }
+        return;
+      }
+    }
+  }
+
+  function analysisPreview(preview, selector) {
+    const {dialog, body} = modal(
+      preview.source ? "Профили публикации" :
+        (preview.selected_count === 1 ? "Анализ профиля" : "Анализ выбранных профилей"),
+    );
+    body.append(element(
+      "p", "workflow-summary",
+      `Выбрано ${preview.selected_count} · доступно ${preview.photo_count} локальных фото. `
+        + "На этом шаге запрос в DeepSeek не выполняется.",
+    ));
+    if (preview.source) {
+      const source = preview.source;
+      body.append(element(
+        "p", "muted",
+        `${clean(source.channel_title || source.title, `@${source.username}`)} #${source.post_id}`,
+      ));
+    }
+    const adultInputs = [];
+    const photoInputs = [];
+    const list = element("div", "workflow-list");
+    (preview.items || []).forEach((item) => {
+      const row = element("div", "workflow-row");
+      row.append(element(
+        "strong", "", clean(item.display_name || item.username, `ID ${item.author_id}`),
+      ));
+      row.append(element("span", "muted", `ID ${item.author_id} · ${item.photo_count} фото`));
+      if (preview.selected_count === 1) {
+        const photos = element("div", "photo-choices");
+        const defaults = new Set(item.selected_photo_ids || []);
+        (item.photos || []).filter((photo) => photo.available).forEach((photo) => {
+          const label = element("label", "check-row");
+          const input = element("input", "");
+          input.type = "checkbox";
+          input.value = String(photo.photo_id);
+          input.checked = defaults.has(String(photo.photo_id));
+          photoInputs.push(input);
+          label.append(input, element("span", "", `${photo.photo_id} · ${dateText(photo.date)}`));
+          photos.append(label);
+        });
+        row.append(photos);
+        const previous = item.previous;
+        if (previous) row.append(element(
+          "span", "muted",
+          `Предыдущий: ${previous.result_status || previous.attempt_state || "—"}`,
+        ));
+      }
+      if ((item.selected_photo_ids || []).length) {
+        const label = element("label", "check-row adult-check");
+        const input = element("input", "");
+        input.type = "checkbox";
+        input.value = String(item.author_id);
+        adultInputs.push(input);
+        label.append(
+          input,
+          element("span", "", "18+ подтверждено сведениями вне фотографии"),
+        );
+        row.append(label);
+      } else {
+        row.append(element("span", "workflow-reason", item.reason || "Будет пропущен"));
+      }
+      list.append(row);
+    });
+    body.append(list);
+    if (preview.has_more) body.append(element(
+      "p", "muted",
+      "Непоказанные профили не считаются совершеннолетними автоматически и будут пропущены.",
+    ));
+    const externalLabel = element("label", "check-row external-check");
+    const external = element("input", "");
+    external.type = "checkbox";
+    externalLabel.append(
+      external,
+      element("span", "", "Я подтверждаю отправку выбранных фото во внешний DeepSeek"),
+    );
+    const feedback = element("p", "notice-inline");
+    const start = element("button", "primary-action", "Запустить анализ");
+    start.type = "button";
+    start.addEventListener("click", async () => {
+      const confirmed = adultInputs.filter((input) => input.checked).map((input) => Number(input.value));
+      if (!confirmed.length) {
+        feedback.textContent = "Подтверди 18+ хотя бы для одного профиля.";
+        return;
+      }
+      if (!external.checked) {
+        feedback.textContent = "Подтверди внешнюю отправку фотографий.";
+        return;
+      }
+      const photoIds = {};
+      if (preview.selected_count === 1) {
+        const selected = photoInputs.filter((input) => input.checked).map((input) => input.value);
+        if (selected.length < 1 || selected.length > 4) {
+          feedback.textContent = "Выбери от одной до четырёх фотографий.";
+          return;
+        }
+        photoIds[String(preview.items[0].author_id)] = selected;
+      }
+      start.disabled = true;
+      try {
+        const result = await api("/api/ai/start", {
+          method: "POST",
+          body: {
+            ...selector,
+            confirmed_author_ids: confirmed,
+            photo_ids: photoIds,
+            operation_id: operationId(),
+          },
+        });
+        renderBatch(body, result.batch);
+        pollBatch(dialog, body, result.batch.id);
+      } catch (error) {
+        feedback.textContent = error.message;
+        start.disabled = false;
+      }
+    });
+    body.append(externalLabel, feedback, start);
+  }
+
+  async function loadAnalysis(selector) {
+    try {
+      const result = await api("/api/ai/preview", {method: "POST", body: selector});
+      analysisPreview(result.preview, selector);
+    } catch (error) {
+      showNotice(error.message, true);
+    }
+  }
+
+  function beginAnalysis(selector) {
+    ensureAI(() => loadAnalysis(selector));
+  }
+
+  function initInteractive() {
+    if (!interactiveEnabled) return;
+    const selected = element("button", "secondary", `Анализировать выбранные (${selectedProfiles.size})`);
+    selected.id = "analyze-selected";
+    selected.type = "button";
+    selected.hidden = true;
+    selected.addEventListener("click", () => {
+      const ids = [...selectedProfiles];
+      if (!ids.length) showNotice("Сначала выбери один или несколько профилей.", true);
+      else beginAnalysis({author_ids: ids});
+    });
+    toolbar.append(selected);
+    const settings = element("button", "", "AI настройки");
+    settings.id = "ai-settings";
+    settings.type = "button";
+    settings.addEventListener("click", () => ensureAI(() => {
+      showNotice("Новый API-ключ сохранён; он проверится при следующем запросе.");
+    }, true));
+    document.querySelector(".switcher").append(settings);
+    const footer = document.querySelector("footer");
+    if (footer) footer.append(" · интерактивный localhost-режим");
+    api("/api/config").then((config) => {
+      const labels = {
+        not_configured: "Добавить API-ключ",
+        key_saved: "Ключ сохранён",
+        verified: "DeepSeek подключён",
+        authorization_error: "Ошибка авторизации",
+      };
+      settings.textContent = labels[config.key_status]
+        || (config.configured ? "AI настройки" : "Добавить API-ключ");
+      if (!config.configured) showNotice("DeepSeek не подключён. Добавь API-ключ для анализа.");
+      else if (config.key_status === "authorization_error") {
+        showNotice("DeepSeek отклонил сохранённый ключ. Замени его в AI настройках.", true);
+      }
+    }).catch((error) => showNotice(error.message, true));
+  }
+
+  function selectionControls(profile) {
+    const actions = element("div", "interactive-actions");
+    const label = element("label", "check-row");
+    const checkbox = element("input", "");
+    checkbox.type = "checkbox";
+    checkbox.checked = selectedProfiles.has(Number(profile.author_id));
+    checkbox.addEventListener("change", () => {
+      const id = Number(profile.author_id);
+      if (checkbox.checked) selectedProfiles.add(id);
+      else selectedProfiles.delete(id);
+      saveInteractiveState();
+      const global = byId("analyze-selected");
+      if (global) global.textContent = `Анализировать выбранные (${selectedProfiles.size})`;
+    });
+    label.append(checkbox, element("span", "", "Выбрать"));
+    const analyze = element("button", "secondary", "Анализировать профиль");
+    analyze.type = "button";
+    analyze.addEventListener("click", () => beginAnalysis({author_ids: [Number(profile.author_id)]}));
+    actions.append(label, analyze);
+    return actions;
   }
 
   function localMediaURL(url) {
@@ -434,6 +812,7 @@
     button.append(body);
     button.addEventListener("click", () => navigate({type: "profile", id: Number(profile.author_id), origin}));
     card.append(button);
+    if (interactiveEnabled) card.append(selectionControls(profile));
     return card;
   }
 
@@ -483,6 +862,14 @@
     button.addEventListener("click", () => navigate({type: "post", id: Number(post.source_id)}));
     card.append(button);
     postPreview(post, card);
+    if (interactiveEnabled) {
+      const actions = element("div", "interactive-actions");
+      const analyze = element("button", "secondary", "Анализировать профили");
+      analyze.type = "button";
+      analyze.addEventListener("click", () => beginAnalysis({source_id: Number(post.source_id)}));
+      actions.append(analyze);
+      card.append(actions);
+    }
     return card;
   }
 
@@ -549,7 +936,10 @@
 
   function renderList(view) {
     currentRoute = listRoute(view);
+    saveInteractiveState();
     syncToolbar(view);
+    const analyzeSelected = byId("analyze-selected");
+    if (analyzeSelected) analyzeSelected.hidden = view !== "profiles";
     byId("title").textContent = view === "posts" ? "Сохранённые публикации" : "Все профили";
     const source = view === "profiles" ? filteredProfiles() : filteredPosts();
     const items = sorted(source, view);
@@ -629,6 +1019,22 @@
     ]));
     heading.append(body);
     root.append(heading);
+    if (interactiveEnabled) {
+      const actions = element("div", "detail-actions");
+      const analyzeAll = element("button", "primary-action", "Анализировать все локальные профили публикации");
+      analyzeAll.type = "button";
+      analyzeAll.addEventListener("click", () => beginAnalysis({source_id: Number(sourceId)}));
+      const analyzeSelected = element("button", "secondary", "Анализировать выбранные");
+      analyzeSelected.type = "button";
+      analyzeSelected.addEventListener("click", () => {
+        const relatedIds = new Set((post.profile_ids || []).map(Number));
+        const ids = [...selectedProfiles].filter((id) => relatedIds.has(id));
+        if (!ids.length) showNotice("Сначала выбери профили этой публикации.", true);
+        else beginAnalysis({author_ids: ids});
+      });
+      actions.append(analyzeAll, analyzeSelected);
+      root.append(actions);
+    }
 
     if ((post.media || []).length) {
       root.append(element("h2", "section-title", "Медиа публикации"));
@@ -727,6 +1133,14 @@
     if (latest) identity.append(element("span", "psl-badge", `PSL ${scoreText(latest.raw_psl_min)}–${scoreText(latest.raw_psl_max)}`));
     heading.append(identity);
     root.append(heading);
+    if (interactiveEnabled) {
+      const actions = element("div", "detail-actions");
+      const analyze = element("button", "primary-action", "Анализировать профиль");
+      analyze.type = "button";
+      analyze.addEventListener("click", () => beginAnalysis({author_ids: [Number(authorId)]}));
+      actions.append(analyze);
+      root.append(actions);
+    }
 
     root.append(element("h2", "section-title", "История username"));
     const usernames = profile.username_history || [];
@@ -899,6 +1313,8 @@
   byId("summary").textContent = `${posts.length} публикаций · ${profiles.length} профилей · ${videos.length} кружков`;
   byId("generated").textContent = `Снимок: ${dateText(catalog.generated_at)}`;
   byId("notice").hidden = true;
+  restoreInteractiveState();
+  initInteractive();
   const initialRoute = parseRoute();
   history.replaceState({hoard: true, route: initialRoute, depth: 0, scrollY: 0}, "", routeHash(initialRoute));
   renderRoute(initialRoute);

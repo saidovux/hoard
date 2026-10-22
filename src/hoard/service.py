@@ -13,7 +13,7 @@ from functools import partial
 from .ai import AICore, AIRequest, create_default_core, read_ai_config, write_ai_config
 from .ai.chat_service import AIChatService
 from .ai.config import AIConfig
-from .ai.errors import AIConfigurationError
+from .ai.errors import AIAuthenticationError, AIConfigurationError
 from .ai.ipc_api import AIIPC
 from .archive_paths import telegram_catalog_file
 from .catalog import build_catalog_from_db
@@ -63,6 +63,7 @@ class Service:
             ai_config = AIConfig()
         self._injected_ai_core = ai_core is not None
         self.ai_core = ai_core or create_default_core(ai_config)
+        self._ai_key_state = "key_saved" if self.ai_core.is_configured() else "not_configured"
         self.ai_service = AIChatService(self.store.ai, self.ai_core, self.store.telegram)
         self.ai_runner = JobRunner(
             self.store,
@@ -115,10 +116,24 @@ class Service:
         return jid
 
     async def _ai_request(self, payload: dict) -> str:
-        return await self.ai_service.execute_legacy(payload)
+        try:
+            result = await self.ai_service.execute_legacy(payload)
+        except AIAuthenticationError:
+            self._ai_key_state = "authorization_error"
+            raise
+        else:
+            self._ai_key_state = "verified"
+            return result
 
     async def _ai_chat(self, payload: dict) -> str:
-        return await self.ai_service.execute_attempt(str(payload.get("attempt_id") or ""))
+        try:
+            result = await self.ai_service.execute_attempt(str(payload.get("attempt_id") or ""))
+        except AIAuthenticationError:
+            self._ai_key_state = "authorization_error"
+            raise
+        else:
+            self._ai_key_state = "verified"
+            return result
 
     @staticmethod
     def _scan_error(exc: Exception) -> str:
@@ -284,6 +299,7 @@ class Service:
                 "timeout": config.timeout,
                 "max_parallel": config.max_parallel,
                 "configured": self.ai_core.is_configured(config.provider),
+                "key_status": self._ai_key_state,
             }
         if method == "ai_config_set":
             current = read_ai_config()
@@ -301,11 +317,13 @@ class Service:
             if not self._injected_ai_core:
                 self.ai_core = create_default_core(config)
                 self.ai_service.core = self.ai_core
+            self._ai_key_state = "key_saved"
             return {
-                "message": "AI-конфигурация сохранена в закрытом локальном файле",
+                "message": "Ключ сохранён; он будет проверен при первом AI-запросе",
                 "provider": config.provider,
                 "model": config.model,
                 "configured": True,
+                "key_status": self._ai_key_state,
             }
         if method.startswith("ai_"):
             return await self.ai_ipc.handle(method, args)
@@ -402,10 +420,10 @@ class Service:
             self.store.remove_source(int(args["id"]))
             return {"message": "Источник отключён; файлы не удалены"}
         if method == "telegram_report":
-            result = await self._telegram_report(
-                {"archive_root": str(args.get("archive_root") or "") or None}
-            )
-            return {"message": result}
+            requested_root = str(args.get("archive_root") or "") or None
+            result = await self._telegram_report({"archive_root": requested_root})
+            root = self.store.telegram.archive_root(requested_root)
+            return {"message": result, "catalog": str(telegram_catalog_file(root))}
         if method == "telegram_enrich":
             jobs = 0
             for source in self.store.sources():

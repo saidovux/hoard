@@ -369,6 +369,218 @@ class AIChatService:
                     pass
             raise
 
+    @staticmethod
+    def _author_ids(value: Any) -> list[int]:
+        if not isinstance(value, list):
+            raise ValueError("author_ids должен быть списком локальных Telegram ID")
+        result: list[int] = []
+        seen: set[int] = set()
+        for raw in value:
+            try:
+                author_id = int(raw)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("author_ids содержит некорректный Telegram ID") from exc
+            if author_id <= 0:
+                raise ValueError("author_ids содержит некорректный Telegram ID")
+            if author_id not in seen:
+                seen.add(author_id)
+                result.append(author_id)
+        return result
+
+    def _telegram_psl_candidates(
+        self,
+        *,
+        author_ids: Any = None,
+        source_id: Any = None,
+        source_url: Any = None,
+        photo_ids: Any = None,
+        confirmed_author_ids: Any = None,
+    ) -> tuple[list[dict[str, Any]], int | None]:
+        """Resolve and validate an entirely local selection without provider calls."""
+        if self.telegram_storage is None:
+            raise ValueError("Telegram-хранилище недоступно")
+        selected_source: int | None = None
+        has_source = source_id not in {None, ""} or bool(str(source_url or "").strip())
+        if has_source and author_ids is not None:
+            raise ValueError("Выбери author_ids или публикацию, но не оба режима сразу")
+        if has_source:
+            selected_source = self.telegram_storage.resolve_source_id(
+                source_url if str(source_url or "").strip() else source_id
+            )
+            identifiers = self.telegram_storage.source_profiles(selected_source)
+        else:
+            identifiers = self._author_ids(author_ids)
+        confirmed = set(self._author_ids(confirmed_author_ids or []))
+        raw_photo_map = photo_ids if isinstance(photo_ids, dict) else {}
+        candidates: list[dict[str, Any]] = []
+        for author_id in identifiers:
+            try:
+                profile = self.telegram_storage.get_profile(author_id)
+            except ValueError:
+                # Explicit IDs are never expanded or replaced by usernames.
+                candidates.append(
+                    {
+                        "author_id": author_id,
+                        "display_name": "",
+                        "username": "",
+                        "photos": [],
+                        "selected_photo_ids": [],
+                        "photo_count": 0,
+                        "adult_confirmed": author_id in confirmed,
+                        "ready": False,
+                        "reason": "Профиль не найден в локальном архиве",
+                        "previous": None,
+                    }
+                )
+                continue
+            available = [item for item in profile.get("photos", []) if item.get("available")]
+            requested = raw_photo_map.get(str(author_id), raw_photo_map.get(author_id))
+            reason = ""
+            selected: list[dict[str, Any]] = []
+            if requested is not None:
+                if not isinstance(requested, list):
+                    reason = "Список фотографий профиля имеет неверный формат"
+                else:
+                    try:
+                        selected = self.telegram_storage.selected_profile_photos(
+                            author_id, requested
+                        )
+                    except ValueError as exc:
+                        reason = str(exc)
+            else:
+                selected = available[:MAX_MESSAGE_ATTACHMENTS]
+            if not selected and not reason:
+                reason = "Нет доступных локальных фотографий"
+            if selected and sum(int(item.get("size") or 0) for item in selected) > (
+                MAX_MESSAGE_ATTACHMENT_BYTES
+            ):
+                selected = []
+                reason = "Фотографии превышают лимит 24 MiB на запрос"
+            adult_confirmed = author_id in confirmed
+            if selected and not adult_confirmed and not reason:
+                reason = "Совершеннолетие не подтверждено сведениями вне фотографии"
+            previous_page = self.storage.list_telegram_analyses(
+                author_id=author_id, successful_only=False, limit=1, offset=0
+            )
+            photos = [
+                {
+                    "photo_id": str(item["photo_id"]),
+                    "date": str(item.get("photo_date") or ""),
+                    "size": int(item.get("size") or 0),
+                    "available": bool(item.get("available")),
+                }
+                for item in profile.get("photos", [])
+            ]
+            candidates.append(
+                {
+                    "author_id": author_id,
+                    "display_name": str(profile.get("display_name") or ""),
+                    "username": str(profile.get("current_username") or ""),
+                    "photos": photos,
+                    "selected_photo_ids": [str(item["photo_id"]) for item in selected],
+                    "photo_count": len(available),
+                    "adult_confirmed": adult_confirmed,
+                    "ready": bool(selected and adult_confirmed and not reason),
+                    "reason": reason,
+                    "previous": (previous_page.get("items") or [None])[0],
+                }
+            )
+        return candidates, selected_source
+
+    def preview_telegram_psl_batch(self, values: dict[str, Any]) -> dict[str, Any]:
+        candidates, selected_source = self._telegram_psl_candidates(
+            author_ids=values.get("author_ids"),
+            source_id=values.get("source_id"),
+            source_url=values.get("source_url"),
+            photo_ids=values.get("photo_ids"),
+            confirmed_author_ids=values.get("confirmed_author_ids"),
+        )
+        if not candidates:
+            raise ValueError("В выбранной публикации нет сохранённых локальных профилей")
+        try:
+            limit = max(1, min(100, int(values.get("limit", 100))))
+            offset = max(0, int(values.get("offset", 0)))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("limit и offset должны быть целыми числами") from exc
+        page = candidates[offset : offset + limit]
+        source = (
+            self.telegram_storage.source_summary(selected_source)
+            if selected_source is not None
+            else None
+        )
+        return {
+            "source": source,
+            "selected_count": len(candidates),
+            "photo_count": sum(int(item["photo_count"]) for item in candidates),
+            "ready_count": sum(1 for item in candidates if item["ready"]),
+            "skipped_count": sum(1 for item in candidates if not item["ready"]),
+            "items": page,
+            "limit": limit,
+            "offset": offset,
+            "has_more": offset + len(page) < len(candidates),
+            "external_request_made": False,
+        }
+
+    def queue_telegram_psl_batch(self, values: dict[str, Any]) -> dict[str, Any]:
+        operation = str(values.get("operation_id") or "").strip()
+        if not operation or len(operation.encode("utf-8")) > 120:
+            raise ValueError("operation_id обязателен и не должен превышать 120 байт")
+        operation_key = f"telegram.psl.batch:{operation}"
+        existing = self.storage.telegram_batch_by_operation(operation_key)
+        if existing is not None:
+            return existing
+        candidates, selected_source = self._telegram_psl_candidates(
+            author_ids=values.get("author_ids"),
+            source_id=values.get("source_id"),
+            source_url=values.get("source_url"),
+            photo_ids=values.get("photo_ids"),
+            confirmed_author_ids=values.get("confirmed_author_ids"),
+        )
+        if not candidates:
+            raise ValueError("В выбранной публикации нет сохранённых локальных профилей")
+        items = [
+            {
+                "author_id": item["author_id"],
+                "state": "pending" if item["ready"] else "skipped",
+                "reason": "" if item["ready"] else item["reason"],
+                "photo_count": len(item["selected_photo_ids"]),
+            }
+            for item in candidates
+        ]
+        batch = self.storage.create_telegram_batch(
+            operation_key=operation_key,
+            source_id=selected_source,
+            selected_count=len(candidates),
+            items=items,
+        )
+        content = str(values.get("content") or "").strip() or (
+            "Analyze these explicitly selected local images using the PSL contract."
+        )
+        for item in candidates:
+            if not item["ready"]:
+                continue
+            try:
+                analysis = self.queue_telegram_psl(
+                    author_id=item["author_id"],
+                    photo_ids=item["selected_photo_ids"],
+                    content=content,
+                    operation_id=f"batch:{operation}:{item['author_id']}",
+                    adult_confirmed=True,
+                    prompt_id=values.get("prompt_id"),
+                    prompt_version_id=values.get("prompt_version_id"),
+                    provider=values.get("provider"),
+                    model=values.get("model"),
+                )
+            except Exception as exc:
+                self.storage.fail_telegram_batch_item(
+                    str(batch["id"]), item["author_id"], str(exc) or type(exc).__name__
+                )
+            else:
+                self.storage.link_telegram_batch_analysis(
+                    str(batch["id"]), item["author_id"], str(analysis["id"])
+                )
+        return self.storage.telegram_batch(str(batch["id"]))
+
     def _selected_memory(self, chat: dict, memory_ids: list[Any]) -> list[dict]:
         identifiers = [str(item) for item in memory_ids]
         if len(identifiers) != len(set(identifiers)) or len(identifiers) > 50:

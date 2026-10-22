@@ -1,14 +1,16 @@
-# Hoard 0.6.0
+# Hoard 0.7.0
 
 Hoard is a local-first Linux and Windows archive for Telegram posts, profiles and video notes
 found in a channel post's comments. It uses Telethon, SQLite, an autonomous offline HTML catalog
 and terminal interfaces. A private background daemon performs all Telegram work; closing an
 interface does not stop downloads.
 
-This release completes the original functional roadmap with a modern autonomous HTML media
-catalog. It combines saved publications, profiles, photos, video notes and explicitly requested
-PSL history without a web server or browser network access. AI analysis is never started
-automatically. The project has no web server, Redis, Docker or Electron.
+This release adds one minimal AI workflow across the TUI and an explicit local browser client.
+It combines saved publications, profiles, photos, video notes and explicitly requested PSL
+history. The portable `telegram_archive.html` remains fully autonomous and makes no browser
+network requests. `hoard web` is a separate, short-lived loopback client; AI analysis is never
+started automatically. The project has no persistent or remotely accessible web service, Redis,
+Docker or Electron.
 
 ## Terminal interfaces
 
@@ -193,6 +195,34 @@ outside the selected archive may require its original absolute location (or driv
 one HTML file by itself is not promised to contain or relocate media. The catalog warns that it
 contains personal data and should be reviewed before sharing.
 
+## Local interactive Web
+
+Run the browser workflow explicitly:
+
+```bash
+hoard web
+```
+
+Hoard rebuilds the same catalog through daemon IPC, binds a short-lived HTTP session to a random
+`127.0.0.1` port and opens it in the default browser. The browser view reuses the packaged catalog
+HTML, CSS and JavaScript; no CDN or third-party browser dependency is loaded. A one-time bootstrap
+URL creates an HttpOnly, SameSite session cookie. Exact Host and Origin checks, a separate CSRF
+token, a strict content security policy and closed write routes prevent unrelated local pages from
+driving Hoard. The server never listens on a LAN address and expires after inactivity.
+
+Interactive mode adds contextual actions to saved publications and profiles. It can analyze one
+profile, selected profiles, or every locally linked profile of a saved publication. Before any
+provider request it shows a local preview, lets the user choose one profile's photos, requires a
+profile-specific 18+ confirmation based on information outside the images, and separately
+confirms external DeepSeek transmission. Unknown post links do not start Telegram collection.
+Progress shows queued, completed, skipped and failed profiles, each skip reason and an estimated
+USD cost when a matching user tariff exists. Otherwise cost is explicitly unknown. Finished
+results refresh automatically without a manual HTML rebuild.
+
+The autonomous `<archive>/telegram_archive.html` does not contain a session, API key or active
+backend configuration and keeps working through `file://` exactly as before. Closing the Web or
+TUI client does not stop the daemon or its durable AI groups.
+
 Optional enrichment obtains post text/media and up to 30 latest profile photos visible to the
 authorized account:
 
@@ -214,11 +244,14 @@ DeepSeek is its first provider through a generic provider interface. The default
 `deepseek-flash`. The core accepts text and explicitly selected JPEG, PNG, GIF or WebP images, and
 supports normal responses and JSON Output with local Draft 2020-12 JSON Schema validation.
 
-Set `DEEPSEEK_API_KEY` for the daemon environment, or open **AI → Настроить ключ** to store it in
-the private `~/.config/hoard/ai.json` file. The key field is masked and the daemon never returns
-the saved secret. The key is never placed in job payloads, responses, HTML or public logs. AI
-requests have no automatic provider retry: an error, truncated response, empty response or
-interrupted paid job requires an explicit user decision.
+Set `DEEPSEEK_API_KEY` for the daemon environment, or choose **Добавить API-ключ** in TUI/Web to
+store it in the private `~/.config/hoard/ai.json` file. First-run onboarding asks only for the key;
+models, tariffs, prompts, memory and concurrency remain optional advanced tools. The UI labels a
+new key as saved but unverified until a provider request succeeds and distinguishes an
+authentication error. The key field is masked and the daemon never returns the saved secret. The
+key is never placed in job payloads, responses, HTML or public logs. AI requests have no automatic
+provider retry: an error, truncated response, empty response or interrupted paid job requires an
+explicit user decision.
 
 The single Hoard daemon owns two independent job pools. `hoard start`, `stop` and `pause` control
 the Telegram pool; the AI pool follows the daemon lifecycle and keeps working when the Telegram
@@ -258,8 +291,9 @@ ai_memory_create/get/list/update/delete
 ai_attachment_import/get/delete
 ai_price_create/list/delete
 ai_attempt_get/list/retry  ai_job_state  ai_statistics
-ai_telegram_profile_get/photos/photo_get
+ai_telegram_profile_get/list  ai_telegram_source_get  ai_telegram_photos/photo_get
 ai_telegram_psl_start  ai_telegram_analysis_get/list
+ai_telegram_batch_preview/start/get
 ```
 
 Lists and history are paginated, and both IPC directions retain the 64 KiB message limit. New chat
@@ -275,11 +309,17 @@ paid DeepSeek requests.
 
 ## Telegram AI and subjective PSL
 
-In **Архив → Профили**, select a saved profile and choose **AI-анализ профиля**. Hoard shows only
-photos already stored by explicit Telegram enrichment; it never downloads a new photo just for
-AI. Choose one to four available photos, a Telegram prompt/version and a model. Before queueing,
-you must explicitly confirm both that the person is known to be at least 18 from information
-outside the image and that the selected photos/text may be sent to DeepSeek.
+In **Архив → Профили**, analyze one saved profile or mark several and choose **Анализировать
+выбранные**. In **Источники**, choose **Анализировать профили** for a saved publication. The same
+actions are available in `hoard web`. Hoard resolves stable `author_id` values from SQLite, uses
+the complete `tg_profile_sources` relation and defaults to the four newest available local photos
+per profile; it never downloads a new photo or expands Telegram collection for AI. A single
+profile still allows manual photo choice without typing IDs.
+
+Before queueing, the preview requires a separate 18+ confirmation for every profile based on
+information outside the image and then confirms transmission to DeepSeek. Unconfirmed profiles,
+missing/corrupt photos and over-limit selections are retained in a small durable batch as skipped
+with an explicit reason. Repeating one batch operation ID returns the original paid attempts.
 
 The PSL result is a subjective, non-scientific visual estimate, not a fact or measurement. The
 versioned JSON contract stores `presentation`, approximate `estimated_age`, `raw_psl_min`,
@@ -295,6 +335,10 @@ the provider may have charged for it and never retries automatically. A manual r
 new paid attempt linked to the original operation. Historical results, actual model, usage,
 currency-separated estimated costs and selected photo IDs remain in SQLite. The offline HTML
 exports only the minimal validated result and compact status history described above.
+
+The built-in PSL instructions first reject animals, drawings, anime, fictional characters, memes,
+logos, clearly synthetic avatars and unrelated or uncertain images. Images are never treated as
+proof of account ownership, and Hoard does not identify people by face or recognize celebrities.
 
 ## Background operation
 
@@ -330,6 +374,7 @@ hoard scan
 hoard add https://t.me/examplechannel/123 --output ~/Videos/hoard --interval 120
 hoard telegram report
 hoard telegram enrich
+hoard web
 hoard shutdown
 ```
 

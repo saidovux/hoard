@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import uuid
 from collections.abc import Awaitable, Callable
 from typing import Any, ClassVar
 
@@ -23,8 +24,9 @@ from textual.widgets import (
     TextArea,
 )
 
+from .ai_dialogs import AIKeyDialog, TelegramAIDialog, TelegramAnalysisDialog
 from .api import HoardAPI, IPCStatusAPI
-from .dialogs import AuthDialog
+from .dialogs import AuthDialog, ConfirmDialog
 from .navigation import SECTIONS, section_index
 from .screens import (
     ActivityScreen,
@@ -212,6 +214,218 @@ class HoardApp(App[None]):
             on_authorized()
         else:
             self.open_auth(on_authorized)
+
+    def ensure_ai(self, on_ready: Callable[[], None]) -> None:
+        """Resume the initiating action after the one-field DeepSeek onboarding."""
+        self.run_worker(
+            self._ensure_ai(on_ready), name="ai-configuration-check", exit_on_error=False
+        )
+
+    async def _ensure_ai(self, on_ready: Callable[[], None]) -> None:
+        try:
+            config = await self.api.ai_call("ai_config_get")
+        except Exception as exc:
+            self.set_notice(str(exc) or type(exc).__name__, error=True)
+            return
+        if config.get("configured") or "key_status" not in config:
+            on_ready()
+            return
+        self.push_screen(
+            AIKeyDialog(),
+            lambda key: self.run_worker(
+                self._save_ai_key(key, on_ready),
+                name="ai-key-save",
+                exit_on_error=False,
+            )
+            if key
+            else None,
+        )
+
+    async def _save_ai_key(self, key: str, on_ready: Callable[[], None]) -> None:
+        try:
+            result = await self.api.ai_call(
+                "ai_config_set", {"provider": "deepseek", "api_key": key}
+            )
+        except Exception as exc:
+            self.set_notice(str(exc) or type(exc).__name__, error=True)
+            return
+        self.set_notice(str(result.get("message") or "Ключ сохранён"))
+        await self.refresh_status()
+        on_ready()
+
+    def open_telegram_analysis(self, selector: dict[str, Any]) -> None:
+        self.ensure_ai(
+            lambda: self.run_worker(
+                self._preview_telegram_analysis(selector),
+                name="telegram-analysis-preview",
+                exit_on_error=False,
+            )
+        )
+
+    async def _preview_telegram_analysis(self, selector: dict[str, Any]) -> None:
+        try:
+            result = await self.api.ai_call(
+                "ai_telegram_batch_preview", {**selector, "limit": 100, "offset": 0}
+            )
+        except Exception as exc:
+            self.set_notice(str(exc) or type(exc).__name__, error=True)
+            return
+        preview = result.get("preview")
+        if preview is None and len(selector.get("author_ids") or []) == 1:
+            await self._open_legacy_telegram_analysis(int(selector["author_ids"][0]))
+            return
+        if not isinstance(preview, dict):
+            self.set_notice("Daemon не вернул preview анализа.", error=True)
+            return
+        self.push_screen(
+            TelegramAnalysisDialog(preview),
+            lambda choices: self._confirm_telegram_analysis(selector, choices),
+        )
+
+    async def _open_legacy_telegram_analysis(self, author_id: int) -> None:
+        """Compatibility with pre-0.7 test doubles and older daemon contracts."""
+        try:
+            profile, prompts, analyses = await asyncio.gather(
+                self.api.ai_call("ai_telegram_profile_get", {"author_id": author_id}),
+                self.api.ai_call("ai_prompt_list", {"scope": "telegram", "limit": 100}),
+                self.api.ai_call(
+                    "ai_telegram_analysis_list", {"author_id": author_id, "limit": 20}
+                ),
+            )
+        except Exception as exc:
+            self.set_notice(str(exc) or type(exc).__name__, error=True)
+            return
+        self.push_screen(
+            TelegramAIDialog(
+                profile["profile"],
+                list(prompts.get("items") or []),
+                list(analyses.get("items") or []),
+            ),
+            lambda values: self._confirm_legacy_telegram_analysis(author_id, values),
+        )
+
+    def _confirm_legacy_telegram_analysis(
+        self, author_id: int, values: dict[str, Any] | None
+    ) -> None:
+        if not values or values.get("open_photo_id"):
+            return
+        self.push_screen(
+            ConfirmDialog(
+                "Подтвердить взрослого и внешний запрос?",
+                "Я подтверждаю 18+ по сведениям вне изображения. Фото будут отправлены "
+                "DeepSeek; запрос может быть платным, автоматического повтора не будет.",
+                confirm_label="18+ · отправить",
+            ),
+            lambda confirmed: self.run_worker(
+                self._start_legacy_telegram_analysis(author_id, values), exit_on_error=False
+            )
+            if confirmed
+            else None,
+        )
+
+    async def _start_legacy_telegram_analysis(
+        self, author_id: int, values: dict[str, Any]
+    ) -> None:
+        try:
+            await self.api.ai_call(
+                "ai_telegram_psl_start",
+                {
+                    "author_id": author_id,
+                    "photo_ids": values["photo_ids"],
+                    "content": values["content"],
+                    "prompt_version_id": values["prompt_version_id"],
+                    "provider": "deepseek",
+                    "model": values["model"],
+                    "operation_id": uuid.uuid4().hex,
+                    "adult_confirmed": True,
+                    "external_confirmed": True,
+                },
+            )
+        except Exception as exc:
+            self.set_notice(str(exc) or type(exc).__name__, error=True)
+            return
+        self.set_notice("Telegram AI-анализ поставлен в очередь.")
+
+    def _confirm_telegram_analysis(
+        self, selector: dict[str, Any], choices: dict[str, Any] | None
+    ) -> None:
+        if not choices:
+            return
+        self.push_screen(
+            ConfirmDialog(
+                "Отправить фотографии в DeepSeek?",
+                "В DeepSeek будут отправлены только показанные локальные фотографии "
+                "подтверждённых профилей. Запрос может быть платным; автоматического "
+                "повтора не будет. "
+                "PSL субъективен и не является научной оценкой.",
+                confirm_label="Отправить",
+            ),
+            lambda confirmed: self.run_worker(
+                self._start_telegram_analysis(selector, choices),
+                name="telegram-analysis-start",
+                exit_on_error=False,
+            )
+            if confirmed
+            else None,
+        )
+
+    async def _start_telegram_analysis(
+        self, selector: dict[str, Any], choices: dict[str, Any]
+    ) -> None:
+        try:
+            result = await self.api.ai_call(
+                "ai_telegram_batch_start",
+                {
+                    **selector,
+                    **choices,
+                    "operation_id": uuid.uuid4().hex,
+                    "external_confirmed": True,
+                },
+            )
+        except Exception as exc:
+            self.set_notice(str(exc) or type(exc).__name__, error=True)
+            return
+        batch = result["batch"]
+        self.set_notice(
+            f"Группа создана: {batch.get('selected_count', 0)} профилей; "
+            f"в очереди {batch.get('queued', 0)}; пропущено {batch.get('skipped', 0)}."
+        )
+        await self._poll_telegram_batch(str(batch["id"]))
+
+    async def _poll_telegram_batch(self, batch_id: str) -> None:
+        for _ in range(60):
+            await asyncio.sleep(1)
+            try:
+                result = await self.api.ai_call(
+                    "ai_telegram_batch_get", {"id": batch_id, "limit": 100}
+                )
+            except Exception as exc:
+                self.set_notice(str(exc) or type(exc).__name__, error=True)
+                return
+            batch = result["batch"]
+            cost = (
+                f"≈ ${batch['estimated_cost_usd']}"
+                if batch.get("estimated_cost_usd") is not None
+                else "стоимость неизвестна"
+            )
+            self.set_notice(
+                f"AI: очередь {batch.get('queued', 0)} · готово {batch.get('completed', 0)} · "
+                f"пропущено {batch.get('skipped', 0)} · ошибки {batch.get('errors', 0)} · {cost}",
+                error=bool(batch.get("errors")),
+            )
+            if batch.get("terminal"):
+                return
+        self.set_notice("Группа продолжает выполняться в daemon; её можно открыть позже.")
+
+    def open_web_interface(self) -> None:
+        try:
+            from hoard.web import launch_web_process
+
+            launch_web_process()
+        except (OSError, RuntimeError) as exc:
+            self.set_notice(str(exc), error=True)
+            return
+        self.set_notice("Локальный веб-интерфейс запускается в браузере.")
 
     @staticmethod
     def _is_text_entry(widget: Widget | None) -> bool:

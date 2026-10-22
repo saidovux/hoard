@@ -161,6 +161,30 @@ class AIIPC:
             if self.telegram_storage is None:
                 raise ValueError("Telegram-хранилище недоступно")
             return {"profile": self.telegram_storage.get_profile(int(args.get("author_id") or 0))}
+        if method == "ai_telegram_profile_list":
+            if self.telegram_storage is None:
+                raise ValueError("Telegram-хранилище недоступно")
+            raw_ids = args.get("author_ids")
+            author_ids = None
+            if raw_ids is not None:
+                if not isinstance(raw_ids, list):
+                    raise ValueError("author_ids должен быть списком")
+                author_ids = [int(item) for item in raw_ids]
+            source_id = args.get("source_id")
+            return self.telegram_storage.profile_summaries(
+                author_ids=author_ids,
+                source_id=int(source_id) if source_id not in {None, ""} else None,
+                query=str(args.get("query") or ""),
+                limit=args.get("limit", 100),
+                offset=args.get("offset", 0),
+            )
+        if method == "ai_telegram_source_get":
+            if self.telegram_storage is None:
+                raise ValueError("Telegram-хранилище недоступно")
+            source_id = self.telegram_storage.resolve_source_id(
+                args.get("source_url") or args.get("source_id")
+            )
+            return {"source": self.telegram_storage.source_summary(source_id)}
         if method == "ai_telegram_photos":
             if self.telegram_storage is None:
                 raise ValueError("Telegram-хранилище недоступно")
@@ -202,6 +226,24 @@ class AIIPC:
             return {
                 "analysis": analysis,
                 "message": "Telegram AI-анализ поставлен в очередь",
+            }
+        if method == "ai_telegram_batch_preview":
+            return {"preview": self.chats.preview_telegram_psl_batch(args)}
+        if method == "ai_telegram_batch_start":
+            if args.get("external_confirmed") is not True:
+                raise ValueError("Подтверди отправку выбранных фото внешнему AI-провайдеру")
+            if not self.chats.core.is_configured("deepseek"):
+                raise ValueError("DeepSeek не подключён; сначала добавь API-ключ")
+            batch = self.chats.queue_telegram_psl_batch(args)
+            self.runner.wakeup()
+            return {"batch": batch, "message": "Группа Telegram AI поставлена в очередь"}
+        if method == "ai_telegram_batch_get":
+            return {
+                "batch": self.storage.telegram_batch(
+                    self._id(args),
+                    limit=args.get("limit", 100),
+                    offset=args.get("offset", 0),
+                )
             }
         if method == "ai_telegram_analysis_get":
             return {"analysis": self.storage.telegram_analysis(self._id(args))}

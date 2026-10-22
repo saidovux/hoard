@@ -27,7 +27,15 @@ background service.
   the shared source, job and event primitives for future modules.
 - `catalog.py` opens SQLite independently and generates a static browser snapshot without owning a
   Telegram client. The template lives in the installed `hoard.templates.telegram` package.
-- The socket and all XDG state directories are user-only. There is no TCP/HTTP listener.
+- `web.py` is the only HTTP exception. An explicit `hoard web` command rebuilds the catalog through
+  daemon IPC, binds a short-lived `ThreadingHTTPServer` to `127.0.0.1:0`, and reuses the exact
+  catalog template. It never opens SQLite or calls a provider. Exact Host/Origin checks, a random
+  bootstrap/session token, HttpOnly SameSite cookie, independent CSRF token and CSP protect every
+  write. Only media paths already validated into the current catalog snapshot and still contained
+  by that archive root are served.
+- The socket and all XDG state directories are user-only. No persistent or remotely reachable
+  TCP/HTTP listener exists; the loopback browser session starts only by explicit user action and
+  expires after inactivity.
 
 Closing or cancelling the interface does not signal the service. Collector pause/stop cancels
 active jobs through `JobRunner`, which returns interrupted jobs to `queued`; the daemon stays
@@ -100,6 +108,8 @@ AI storage uses the same daemon-owned connection but a separate additive schema:
 - `ai_prices` as user-owned effective-period tariffs whose rows are snapshotted into attempts.
 - `ai_telegram_analyses` and `ai_telegram_analysis_photos`, atomically linking a Telegram ID,
   prompt/schema version, immutable selected-photo snapshot, paid attempt and validated result.
+- `ai_telegram_batches` and `ai_telegram_batch_items`, a minimal durable grouping of existing PSL
+  attempts with per-`author_id` skip reasons and idempotent operation keys.
 
 The AI schema records its own version in `schema_versions`. Deletion is soft where history refers
 to an object, critical queue/context writes are transactional, and no transaction stays open over
@@ -168,6 +178,20 @@ Back/Forward without a server or router dependency. Lists and galleries are pagi
 lazy, the lightbox creates one full-size node at a time, and videos use `preload=none` without
 autoplay. Missing round-six fields remain optional so an older normalized snapshot degrades to an
 unscored profile rather than breaking rendering.
+
+## Interactive loopback catalog
+
+`hoard web` first asks the daemon to rebuild the ordinary snapshot, then serves that exact bundled
+HTML from a random `127.0.0.1` port. Interactive controls are activated by a small in-memory
+bootstrap object; without it the same JavaScript performs no HTTP request, preserving autonomous
+`file://` behavior. Filters, pages, selected `author_id` values and hash routes are mirrored to
+`sessionStorage` before an automatic post-analysis refresh.
+
+Browser writes map to a closed set of daemon IPC calls: key save, PSL preview, batch start and
+catalog refresh. The API key crosses the browser boundary only in the explicit save request and is
+never returned. The browser process does not read SQLite. Media serving accepts only resolved
+files in the snapshot's explicit current-archive allowlist and supports bounded byte ranges;
+SQLite, Telegram sessions, AI attachments and arbitrary filesystem paths have no route.
 
 ## Progress and errors
 
@@ -241,7 +265,7 @@ must fit 64 KiB; oversized pages return an explicit smaller-page error. Job fail
 a safe generic summary, while the attempt keeps a stable code. Chat content, provider error text,
 images and API keys do not enter events or common job diagnostics.
 
-## AI workspace and Telegram PSL — round 5
+## AI workspace and Telegram PSL
 
 The Textual AI workspace calls the same daemon IPC for chat CRUD/history, provider/model and
 prompt-version selection, prompt and memory editing, private attachment import, tariffs,
@@ -257,7 +281,7 @@ roots before importing private copies. Jobs contain only an attempt ID. The orig
 photo IDs, source path/digest snapshot and private attachment links are frozen transactionally;
 opening an existing analysis performs only a read. No new Telegram download is triggered.
 
-`psl.py` defines schema version 1. Its five metrics are visual `presentation`, approximate
+`psl.py` defines schema version 2. Its five metrics are visual `presentation`, approximate
 `estimated_age`, `raw_psl_min`, `raw_psl_max` and `boosted_psl`; numeric scores are bounded to
 0–8. The workflow also stores `completed`, `insufficient_data`, `ineligible` or `invalid_result`.
 Scores are valid only for clearly adult female visual presentation. Male/unknown presentation,
@@ -271,12 +295,20 @@ ambiguity remains `outcome_unknown` without a domain result; invalid provider JS
 new attempt/analysis row and points `root_analysis_id` to the original. The round-six catalog
 consumes these rows in one batch while retaining the same storage contract.
 
+The 0.7 selection contract accepts either stable local `author_id` values or one saved
+`source_id`/post URL. Source links are resolved against `sources` and the complete
+`tg_profile_sources` relation; unknown links fail without scheduling Telegram work. Preview
+revalidates local files, defaults to four newest photos, reports prior analysis and makes no
+provider call. Start requires per-profile adult confirmation plus external-provider confirmation,
+then delegates every eligible item to the existing `queue_telegram_psl()`. A durable batch only
+groups those attempts and skipped reasons; it is not a second runner or retry system.
+
 ## Current scope
 
-The original six-round functional plan is complete. The interactive product includes the Telegram
-archive, static local catalog with minimal validated PSL history, explicit AI chats and manually
-initiated Telegram-photo PSL. Optional media/rclone adapters remain dormant code paths and are not
-presented as user-facing tools. There is no browser service, PSL automation, multi-user
-infrastructure or collection beyond source posts, video-note authors and the visible profile
-photos explicitly requested for this module. AI does not expand Telegram collection on its own;
-subsequent work is stabilization and compatibility rather than new subsystems.
+The product includes the Telegram archive, autonomous static catalog, an explicit short-lived
+loopback browser client, AI chats and manually initiated Telegram-photo PSL for one, selected or
+publication-linked local profiles. Optional media/rclone adapters remain dormant code paths and
+are not presented as user-facing tools. There is no persistent browser service, remote access,
+PSL automation, multi-user infrastructure or collection beyond source posts, video-note authors
+and the visible profile photos explicitly requested for this module. AI does not expand Telegram
+collection on its own.
