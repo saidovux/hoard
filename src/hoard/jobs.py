@@ -120,7 +120,12 @@ class JobRunner:
                     self._active[job["id"]] = asyncio.create_task(self._run_one(job))
                 self._wakeup.clear()
                 try:
-                    await asyncio.wait_for(self._wakeup.wait(), timeout=2)
+                    # ``wait_for(Event.wait())`` creates a helper task whose
+                    # cancellation can stall on Python 3.11's Windows loops.
+                    # Timeout the runner task itself so shutdown cancellation
+                    # remains direct and deterministic.
+                    async with asyncio.timeout(2):
+                        await self._wakeup.wait()
                 except TimeoutError:
                     pass
         finally:
