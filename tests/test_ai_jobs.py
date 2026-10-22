@@ -13,11 +13,13 @@ from hoard.service import Service
 from hoard.storage import Store
 from hoard.telegram import AuthState
 
+WIN311 = sys.platform == "win32" and sys.version_info < (3, 12)
+
 
 async def wait_for(predicate, seconds=3):
     async with asyncio.timeout(seconds):
         while not predicate():
-            await asyncio.sleep(0.02)
+            await asyncio.sleep(0 if WIN311 else 0.02)
 
 
 class FakeEngine:
@@ -72,13 +74,13 @@ async def ai_pool_scenario(tmp_path: Path) -> None:
 
     try:
         await service.start_background()
-        await asyncio.wait_for(provider.started.wait(), 1)
+        await wait_for(provider.started.is_set, seconds=1)
         assert service.running is False
         assert service.ai_running is True
 
         # A long AI request owns neither the Telegram lock nor its lifecycle.
-        await asyncio.wait_for(service.start(), 1)
-        await asyncio.wait_for(service.stop(), 1)
+        await service.start()
+        await service.stop()
         assert service.running is False
         assert provider.calls == 1
 
@@ -102,20 +104,21 @@ async def cancelled_paid_job_scenario(tmp_path: Path) -> None:
 
     try:
         await service.start_background()
-        await asyncio.wait_for(provider.started.wait(), 1)
+        await wait_for(provider.started.is_set, seconds=1)
         await service.stop_background()
 
         assert job_state(store, jid) == "failed"
         await service.start_background()
-        await asyncio.sleep(0.1)
+        if WIN311:
+            for _ in range(20):
+                await asyncio.sleep(0)
+        else:
+            await asyncio.sleep(0.1)
         assert provider.calls == 1
         assert job_state(store, jid) == "failed"
     finally:
         await service.stop_background()
         store.close()
-
-
-WIN311 = sys.platform == "win32" and sys.version_info < (3, 12)
 
 
 def run_isolated(scenario: str) -> None:

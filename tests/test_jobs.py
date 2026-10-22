@@ -1,13 +1,16 @@
 import asyncio
+import sys
 
 from hoard.jobs import JobRunner
 from hoard.storage import Store
+
+WIN311 = sys.platform == "win32" and sys.version_info < (3, 12)
 
 
 async def wait_for(predicate, seconds=3):
     async with asyncio.timeout(seconds):
         while not predicate():
-            await asyncio.sleep(0.02)
+            await asyncio.sleep(0 if WIN311 else 0.02)
 
 
 async def test_queue_executes_generic_tasks_and_persists(tmp_path):
@@ -42,7 +45,7 @@ async def test_interrupted_job_is_retried_not_lost(tmp_path):
     store.enqueue("sleep", {})
     runner = JobRunner(store, {"sleep": hanging})
     await runner.start()
-    await asyncio.wait_for(started.wait(), 3)
+    await wait_for(started.is_set)
     await runner.stop()
     assert store.recent_jobs()[0]["state"] == "queued"
     calls = []

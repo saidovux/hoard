@@ -20,11 +20,13 @@ from hoard.service import Service
 from hoard.storage import Store
 from hoard.telegram import AuthState
 
+_WIN311 = sys.platform == "win32" and sys.version_info < (3, 12)
+
 
 async def wait_for(predicate, seconds=4):
     async with asyncio.timeout(seconds):
         while not predicate():
-            await asyncio.sleep(0.02)
+            await asyncio.sleep(0 if _WIN311 else 0.02)
 
 
 class FakeEngine:
@@ -241,7 +243,7 @@ async def test_duplicate_operation_and_concurrent_branch_create_one_paid_job(tmp
         await send(service, conversation["id"], operation="different")
 
     await service.start_background()
-    await asyncio.wait_for(provider.started.wait(), 2)
+    await wait_for(provider.started.is_set, seconds=2)
     provider.release.set()
     await wait_for(lambda: store.ai.attempt(first["id"])["state"] == "completed")
     assert len(provider.requests) == 1
@@ -690,9 +692,6 @@ _ASYNC_SCENARIOS = (
     test_ai_job_error_does_not_copy_provider_or_chat_text_to_general_log,
     test_statistics_filters_and_unknown_cost_count,
 )
-_WIN311 = sys.platform == "win32" and sys.version_info < (3, 12)
-
-
 if _WIN311 and __name__ != "__main__":
     for _scenario in _ASYNC_SCENARIOS:
         globals()[_scenario.__name__] = pytest.mark.skip(
