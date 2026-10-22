@@ -1,9 +1,9 @@
 """Cross-platform pytest configuration."""
 
 import asyncio
+import contextlib
 import inspect
 import sys
-import threading
 
 import pytest
 
@@ -21,24 +21,14 @@ if sys.platform == "win32" and sys.version_info < (3, 12):
             yield
             return
 
-        loop = asyncio.get_running_loop()
-        stopped = threading.Event()
+        async def heartbeat() -> None:
+            while True:
+                await asyncio.sleep(0)
 
-        def wake_loop() -> None:
-            while not stopped.wait(0.01):
-                try:
-                    loop.call_soon_threadsafe(lambda: None)
-                except RuntimeError:
-                    return
-
-        worker = threading.Thread(
-            target=wake_loop,
-            name="pytest-win311-loop-wakeup",
-            daemon=True,
-        )
-        worker.start()
+        worker = asyncio.create_task(heartbeat(), name="pytest-win311-loop-heartbeat")
         try:
             yield
         finally:
-            stopped.set()
-            worker.join(timeout=1)
+            worker.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await worker
