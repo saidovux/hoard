@@ -1,4 +1,4 @@
-"""Independent Hoard AI core; Telegram is only a future consumer."""
+"""Independent Hoard AI core with explicit Telegram consumers at the service boundary."""
 from __future__ import annotations
 
 from .config import AIConfig, read_ai_config, write_ai_config

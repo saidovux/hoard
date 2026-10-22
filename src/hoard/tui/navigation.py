@@ -17,6 +17,7 @@ SECTIONS = (
     Section("sources", "Источники"),
     Section("activity", "Активность"),
     Section("archive", "Архив"),
+    Section("ai", "AI"),
 )
 
 

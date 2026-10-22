@@ -1,13 +1,13 @@
-# Hoard 0.4.0.6
+# Hoard 0.5.0
 
 Hoard is a local-first Linux and Windows archive for Telegram posts, profiles and video notes
 found in a channel post's comments. It uses Telethon, SQLite, an autonomous offline HTML catalog
 and terminal interfaces. A private background daemon performs all Telegram work; closing an
 interface does not stop downloads.
 
-This release exposes only the working Telegram archiver in its user interface. It also contains
-the provider-neutral AI Core and durable AI infrastructure for future modules, without an AI menu
-or automatic profile analysis. The project has no web server, Redis, Docker or Electron.
+This release adds an explicit AI workspace and optional, manually initiated analysis of locally
+saved Telegram profile photos. It never analyzes a profile on its own. The project has no web
+server, Redis, Docker or Electron.
 
 ## Terminal interfaces
 
@@ -17,10 +17,12 @@ The round-three interface is a complete Telegram workspace:
 hoard tui
 ```
 
-Its implemented sections are **Обзор**, **Telegram**, **Источники**, **Активность** and **Архив**.
+Its implemented sections are **Обзор**, **Telegram**, **Источники**, **Активность**, **Архив** and
+**AI**.
 They cover login including 2FA, collector start/pause/stop, source validation and editing,
-selected-source or global scans, downloads, profile summaries, jobs, errors, enrichment and
-manual HTML generation. All operations use the private daemon IPC layer; the TUI never opens
+selected-source or global scans, downloads, profile summaries, jobs, errors, enrichment,
+manual HTML generation, AI chats and AI settings. All operations use the private daemon IPC
+layer; the TUI never opens
 SQLite or creates a Telegram client. Only the visible Activity screen polls, with one status
 request in flight at a time.
 
@@ -176,17 +178,18 @@ and durable retries when a temporary failure becomes due; it does not rewind sou
 Start the collector first if it is stopped. Stories, hidden data and unrelated message history
 are not requested. The offline report remains usable without enrichment.
 
-## Hoard AI infrastructure — rounds 1 and 4
+## Hoard AI workspace — 0.5.0
 
 `hoard.ai` is an independent subsystem; it does not import Telegram or change Telegram archives.
 DeepSeek is its first provider through a generic provider interface. The default model is
 `deepseek-flash`. The core accepts text and explicitly selected JPEG, PNG, GIF or WebP images, and
 supports normal responses and JSON Output with local Draft 2020-12 JSON Schema validation.
 
-Set `DEEPSEEK_API_KEY` for the daemon environment, or store it in the private
-`~/.config/hoard/ai.json` file through `hoard.ai.write_ai_config`. The key is never placed in job
-payloads, responses, HTML or public logs. AI requests have no automatic provider retry: an error,
-truncated response, empty response or interrupted paid job requires an explicit caller decision.
+Set `DEEPSEEK_API_KEY` for the daemon environment, or open **AI → Настроить ключ** to store it in
+the private `~/.config/hoard/ai.json` file. The key field is masked and the daemon never returns
+the saved secret. The key is never placed in job payloads, responses, HTML or public logs. AI
+requests have no automatic provider retry: an error, truncated response, empty response or
+interrupted paid job requires an explicit user decision.
 
 The single Hoard daemon owns two independent job pools. `hoard start`, `stop` and `pause` control
 the Telegram pool; the AI pool follows the daemon lifecycle and keeps working when the Telegram
@@ -194,11 +197,12 @@ collector is stopped. Their concurrency limits are separate: `HOARD_MAX_JOBS` fo
 pool and `HOARD_AI_MAX_JOBS` (default `2`) for AI. A long DeepSeek request therefore cannot occupy
 a Telegram worker or Telegram lock.
 
-Round 4 adds daemon-owned persistence for versioned prompts, chats, messages, explicitly selected
-memory, private image attachments, request attempts, usage and user-configured tariff snapshots.
-It does not add an AI TUI/CLI screen, Telegram AI, PSL or HTML controls yet. Opening or viewing a
-chat never sends a request. Only `ai_chat_send` creates a paid operation, requires an
-`operation_id`, assembles its frozen context from SQLite and queues the existing AI runner.
+The AI screen provides persistent chats with rename/archive, paginated history, text and up to
+four explicitly selected local images, provider/model/prompt-version selection, versioned prompt
+editing and activation, scoped memory, tariff entry, general/Telegram statistics and attempt
+state. Opening a chat or a saved result never sends anything. **Отправить** first shows exactly
+what crosses the external-provider boundary and may cost money. Only the confirmed send creates a
+paid operation with a unique `operation_id`, frozen context and private attachment references.
 
 The daemon records `queued`, `running`, `completed`, `failed` and `outcome_unknown` attempts.
 Duplicate operation IDs resolve to the original attempt, only one generation can run per chat,
@@ -215,15 +219,18 @@ currency conversion and labels the result as an estimated cost. Missing usage or
 components produce `partial` or `unknown`, never a fictional zero; completed attempts retain the
 exact tariff snapshot used at the time.
 
-The bounded daemon IPC contracts are ready for the round-five UI and integrations:
+The bounded daemon IPC contracts used by the UI include:
 
 ```text
-ai_prompt_create/get/list/update/delete/versions/activate
+ai_config_get/set
+ai_prompt_create/get/list/update/delete/versions/version_get/activate
 ai_chat_create/get/list/update/delete/history/send
 ai_memory_create/get/list/update/delete
 ai_attachment_import/get/delete
 ai_price_create/list/delete
-ai_attempt_get/retry  ai_job_state  ai_statistics
+ai_attempt_get/list/retry  ai_job_state  ai_statistics
+ai_telegram_profile_get/photos/photo_get
+ai_telegram_psl_start  ai_telegram_analysis_get/list
 ```
 
 Lists and history are paginated, and both IPC directions retain the 64 KiB message limit. New chat
@@ -236,6 +243,29 @@ the explicit send action. Memory is never inferred from Telegram profiles, never
 unrelated scopes and is presented to the model as user-selected data rather than system
 instructions. Provider behavior and orchestration are covered with fakes; the test suite makes no
 paid DeepSeek requests.
+
+## Telegram AI and subjective PSL
+
+In **Архив → Профили**, select a saved profile and choose **AI-анализ профиля**. Hoard shows only
+photos already stored by explicit Telegram enrichment; it never downloads a new photo just for
+AI. Choose one to four available photos, a Telegram prompt/version and a model. Before queueing,
+you must explicitly confirm both that the person is known to be at least 18 from information
+outside the image and that the selected photos/text may be sent to DeepSeek.
+
+The PSL result is a subjective, non-scientific visual estimate, not a fact or measurement. The
+versioned JSON contract stores `presentation`, approximate `estimated_age`, `raw_psl_min`,
+`raw_psl_max` and `boosted_psl`, with scores limited to 0–8. Female PSL values are accepted only
+for clearly adult female visual presentation. Male/unknown presentation, a possible minor,
+uncertain adulthood or insufficient images receives no score. Terminal result status is
+`completed`, `insufficient_data`, `ineligible` or `invalid_result`.
+
+The daemon verifies the Telegram ID, photo ownership and archive path, copies a frozen snapshot
+to the private AI attachment directory and atomically links it to the attempt. Duplicate operation
+IDs return the existing attempt. Connection ambiguity becomes `outcome_unknown`; Hoard warns that
+the provider may have charged for it and never retries automatically. A manual retry creates a
+new paid attempt linked to the original operation. Historical results, actual model, usage,
+currency-separated estimated costs and selected photo IDs remain in SQLite. The offline HTML is
+intentionally unchanged until round 6.
 
 ## Background operation
 
@@ -308,5 +338,6 @@ exception class details. Automated tests use fake Telegram clients and require n
 code or network access. Live login and downloads still require your own authorized Telegram
 account and content you are permitted to archive. Automated browser verification is attempted
 when a compatible browser is available; generation and security behavior are covered without one.
+GitHub Actions is manual-dispatch only and is not required for release verification.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for implementation details.

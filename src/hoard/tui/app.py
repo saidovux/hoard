@@ -28,6 +28,7 @@ from .dialogs import AuthDialog
 from .navigation import SECTIONS, section_index
 from .screens import (
     ActivityScreen,
+    AIWorkspaceScreen,
     ArchiveScreen,
     OverviewScreen,
     SourcesScreen,
@@ -96,6 +97,7 @@ class HoardApp(App[None]):
         "sources": SourcesScreen,
         "activity": ActivityScreen,
         "archive": ArchiveScreen,
+        "ai": AIWorkspaceScreen,
     }
     BINDINGS = [
         Binding("q", "quit", "Выход"),

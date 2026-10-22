@@ -10,7 +10,7 @@ import shutil
 import signal
 from functools import partial
 
-from .ai import AICore, AIRequest, create_default_core, read_ai_config
+from .ai import AICore, AIRequest, create_default_core, read_ai_config, write_ai_config
 from .ai.chat_service import AIChatService
 from .ai.config import AIConfig
 from .ai.errors import AIConfigurationError
@@ -61,8 +61,9 @@ class Service:
             # A broken optional AI config must not take down Telegram management.
             # The unconfigured provider will report an actionable error only if used.
             ai_config = AIConfig()
+        self._injected_ai_core = ai_core is not None
         self.ai_core = ai_core or create_default_core(ai_config)
-        self.ai_service = AIChatService(self.store.ai, self.ai_core)
+        self.ai_service = AIChatService(self.store.ai, self.ai_core, self.store.telegram)
         self.ai_runner = JobRunner(
             self.store,
             {"ai.request": self._ai_request, "ai.chat": self._ai_chat},
@@ -74,7 +75,9 @@ class Service:
             include_job_id=True,
             redact_errors=True,
         )
-        self.ai_ipc = AIIPC(self.store.ai, self.ai_service, self.ai_runner)
+        self.ai_ipc = AIIPC(
+            self.store.ai, self.ai_service, self.ai_runner, self.store.telegram
+        )
         self.stop_requested = asyncio.Event()
         self.collector_state = "stopped"
 
@@ -273,6 +276,37 @@ class Service:
             }
 
     async def handle(self, method: str, args: dict) -> dict:
+        if method == "ai_config_get":
+            config = read_ai_config()
+            return {
+                "provider": config.provider,
+                "model": config.model,
+                "timeout": config.timeout,
+                "max_parallel": config.max_parallel,
+                "configured": self.ai_core.is_configured(config.provider),
+            }
+        if method == "ai_config_set":
+            current = read_ai_config()
+            api_key = str(args.get("api_key") or "").strip()
+            if not api_key:
+                raise ValueError("Укажи новый API-ключ; сохранённый ключ никогда не возвращается")
+            config = AIConfig(
+                provider=str(args.get("provider") or current.provider),
+                api_key=api_key,
+                model=str(args.get("model") or current.model),
+                timeout=float(args.get("timeout", current.timeout)),
+                max_parallel=int(args.get("max_parallel", current.max_parallel)),
+            )
+            write_ai_config(config)
+            if not self._injected_ai_core:
+                self.ai_core = create_default_core(config)
+                self.ai_service.core = self.ai_core
+            return {
+                "message": "AI-конфигурация сохранена в закрытом локальном файле",
+                "provider": config.provider,
+                "model": config.model,
+                "configured": True,
+            }
         if method.startswith("ai_"):
             return await self.ai_ipc.handle(method, args)
         if method == "status":

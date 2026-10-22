@@ -21,8 +21,8 @@ background service.
 - `ai/` is provider-neutral and has no Telegram dependency. It defines requests, responses,
   stable errors, configuration, response validation and the provider contract; `deepseek.py`
   implements the first provider over outbound HTTPS. `storage.py`, `chat_service.py`,
-  `pricing.py` and `ipc_api.py` keep AI persistence, orchestration, cost calculation and daemon
-  contracts out of the main service module.
+  `pricing.py`, `psl.py` and `ipc_api.py` keep AI persistence, orchestration, versioned PSL
+  validation, cost calculation and daemon contracts out of the main service module.
 - `telegram_storage.py` owns Telegram-specific tables and migrations while `storage.py` retains
   the shared source, job and event primitives for future modules.
 - `catalog.py` opens SQLite independently and generates a static browser snapshot without owning a
@@ -50,10 +50,11 @@ collector, shutdown or Telegram command.
 
 The Textual theme sets background, surface and panel to `#000000`; TCSS also fixes computed
 backgrounds for containers, navigation components, focus/hover/selected states, inputs, tables,
-buttons, menus and modals. Round 3 exposes Overview, Telegram, Sources, Activity and Archive.
-The Telegram workspace mirrors daemon authorization states, controls the existing collector,
-uses `source_add` as an upsert and renders downloads, profiles and jobs returned by `status`.
-AI chat and settings remain hidden until their implementation rounds.
+buttons, menus and modals. The workspace exposes Overview, Telegram, Sources, Activity, Archive
+and AI. The Telegram workspace mirrors daemon authorization states, controls the existing
+collector, uses `source_add` as an upsert and renders downloads, profiles and jobs returned by
+`status`. The modular AI screen and dialogs expose only implemented IPC operations and never
+import storage, provider transports or Telegram.
 
 ## Telegram authorization
 
@@ -97,6 +98,8 @@ AI storage uses the same daemon-owned connection but a separate additive schema:
 - `ai_memory` and immutable `ai_memory_versions` selected explicitly per request;
 - `ai_attempts`, `ai_attempt_messages` and `ai_attempt_memory` as frozen execution journals;
 - `ai_prices` as user-owned effective-period tariffs whose rows are snapshotted into attempts.
+- `ai_telegram_analyses` and `ai_telegram_analysis_photos`, atomically linking a Telegram ID,
+  prompt/schema version, immutable selected-photo snapshot, paid attempt and validated result.
 
 The AI schema records its own version in `schema_versions`. Deletion is soft where history refers
 to an object, critical queue/context writes are transactional, and no transaction stays open over
@@ -167,7 +170,8 @@ event loop.
 Callers construct `AIRequest` values from messages and, only after an explicit action, `AIImage`
 bytes. Image signatures, per-image size, image count and total encoded request size are checked
 before transmission. Images are accepted only in `user` messages. No filesystem discovery or
-automatic Telegram profile analysis exists in the core.
+automatic Telegram profile analysis exists in the core; the higher-level workflow remains an
+explicit daemon operation.
 
 JSON requests set `response_format={"type":"json_object"}` and must explicitly instruct the model
 to return JSON. A result is successful only when content is non-empty and `finish_reason` is
@@ -218,12 +222,41 @@ must fit 64 KiB; oversized pages return an explicit smaller-page error. Job fail
 a safe generic summary, while the attempt keeps a stable code. Chat content, provider error text,
 images and API keys do not enter events or common job diagnostics.
 
+## AI workspace and Telegram PSL — round 5
+
+The Textual AI workspace calls the same daemon IPC for chat CRUD/history, provider/model and
+prompt-version selection, prompt and memory editing, private attachment import, tariffs,
+currency-separated statistics and attempt inspection. API-key writes are atomic mode-`0600` file
+updates; reads return only configuration metadata and a configured flag. Every paid send requires
+an explicit external-provider confirmation and a caller operation ID. The UI polls only the
+newly created attempt for a bounded time, displays only a confirmed completed response, and
+leaves `outcome_unknown` visible for a separately confirmed manual retry.
+
+Telegram PSL begins from one saved `author_id` and one to four saved `photo_id` values. The daemon
+rechecks profile ownership, `saved` status, file size and containment within remembered archive
+roots before importing private copies. Jobs contain only an attempt ID. The original Telegram
+photo IDs, source path/digest snapshot and private attachment links are frozen transactionally;
+opening an existing analysis performs only a read. No new Telegram download is triggered.
+
+`psl.py` defines schema version 1. Its five metrics are visual `presentation`, approximate
+`estimated_age`, `raw_psl_min`, `raw_psl_max` and `boosted_psl`; numeric scores are bounded to
+0–8. The workflow also stores `completed`, `insufficient_data`, `ineligible` or `invalid_result`.
+Scores are valid only for clearly adult female visual presentation. Male/unknown presentation,
+possible minors, uncertain adulthood and insufficient images retain null scores. Adult status is
+confirmed explicitly outside image inference before queueing. The result is documented and shown
+as subjective and non-scientific.
+
+The AI attempt and domain result finish in one SQLite transaction. A connection/cancellation
+ambiguity remains `outcome_unknown` without a domain result; invalid provider JSON/domain data is
+`failed` plus `invalid_result`. A manual paid retry reuses the frozen photo attachments, creates a
+new attempt/analysis row and points `root_analysis_id` to the original. Latest successful and full
+history queries are available for the round-six catalog, but round 5 does not change HTML.
+
 ## Current scope
 
-The interactive product is the Telegram archive and its static local catalog. The AI backend is
-complete through persistent IPC contracts but remains hidden until the round-five interface and
-explicit Telegram AI workflows are implemented. Optional media/rclone adapters remain dormant
-code paths and are not presented as user-facing tools. There is no browser service, AI user
-interface, PSL automation, multi-user infrastructure or collection beyond source posts,
-video-note authors and the visible profile photos explicitly requested for this module. AI
-infrastructure does not expand Telegram collection on its own.
+The interactive product includes the Telegram archive, static local catalog, explicit AI chats
+and manually initiated Telegram-photo PSL. Optional media/rclone adapters remain dormant code
+paths and are not presented as user-facing tools. There is no browser service, PSL automation,
+multi-user infrastructure or collection beyond source posts, video-note authors and the visible
+profile photos explicitly requested for this module. AI does not expand Telegram collection on
+its own, and Telegram AI results are not added to HTML before round 6.

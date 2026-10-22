@@ -66,6 +66,10 @@ class HoardAPI(Protocol):
 
     async def retry_job(self, job_id: int) -> dict[str, Any]: ...
 
+    async def ai_call(
+        self, method: str, args: dict[str, Any] | None = None
+    ) -> dict[str, Any]: ...
+
 
 # Compatibility for round-two tests and third-party imports of the protocol name.
 StatusAPI = HoardAPI
@@ -155,3 +159,15 @@ class IPCStatusAPI:
 
     async def retry_job(self, job_id: int) -> dict[str, Any]:
         return await request("job_retry", {"id": job_id}, timeout=self.CONTROL_TIMEOUT)
+
+    async def ai_call(
+        self, method: str, args: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        if not method.startswith("ai_"):
+            raise ValueError("AI IPC method must start with ai_")
+        timeout = self.NETWORK_TIMEOUT if method in {
+            "ai_chat_send",
+            "ai_attempt_retry",
+            "ai_telegram_psl_start",
+        } else self.CONTROL_TIMEOUT
+        return await request(method, args or {}, timeout=timeout)

@@ -124,6 +124,7 @@ async def send(service, chat_id, content="hello", operation="operation-1", **ext
                 "chat_id": chat_id,
                 "content": content,
                 "operation_id": operation,
+                "external_confirmed": True,
                 **extra,
             },
         )
@@ -193,6 +194,45 @@ async def test_chat_generation_uses_frozen_prompt_versions_and_persists_history(
     assert provider.requests[0].messages[0].content == "Version one"
     assert provider.requests[1].messages[0].content == "Version two"
     await service.stop_background()
+    store.close()
+
+
+async def test_chat_can_explicitly_select_an_older_prompt_version(tmp_path):
+    provider = SequenceProvider(response("selected old version"))
+    service, store = service_with(tmp_path, provider)
+    selected = await prompt(service, instructions="Version one")
+    conversation = await chat(service, selected["id"])
+    await service.handle(
+        "ai_prompt_update", {"id": selected["id"], "instructions": "Version two"}
+    )
+    versions = await service.handle(
+        "ai_prompt_versions", {"id": selected["id"], "limit": 20}
+    )
+    old_version = next(item for item in versions["items"] if item["version"] == 1)
+    attempt = await send(
+        service,
+        conversation["id"],
+        prompt_version_id=old_version["id"],
+    )
+    await service.ai_service.execute_attempt(attempt["id"])
+    assert provider.requests[0].messages[0].content == "Version one"
+    assert store.ai.attempt(attempt["id"])["prompt_version_id"] == old_version["id"]
+    store.close()
+
+
+async def test_chat_paid_send_requires_explicit_external_confirmation(tmp_path):
+    service, store = service_with(tmp_path, SequenceProvider(response()))
+    conversation = await chat(service)
+    with pytest.raises(ValueError, match="внешнему"):
+        await service.handle(
+            "ai_chat_send",
+            {
+                "chat_id": conversation["id"],
+                "content": "do not send",
+                "operation_id": "not-confirmed",
+            },
+        )
+    assert store.db.execute("SELECT COUNT(*) FROM jobs WHERE kind='ai.chat'").fetchone()[0] == 0
     store.close()
 
 
@@ -616,7 +656,7 @@ def test_ai_schema_is_idempotent_and_preserves_existing_telegram_rows(tmp_path):
     ] == "value"
     assert second.db.execute(
         "SELECT version FROM schema_versions WHERE module='ai'"
-    ).fetchone()[0] == 1
+    ).fetchone()[0] == 2
     second.close()
 
 

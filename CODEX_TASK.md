@@ -13,7 +13,7 @@ Before publishing a Hoard release or completed implementation round:
 7. Never force-push or replace unexpected remote history.
 8. After all checks pass, create the requested commit, run `git fetch origin`, verify the local
    commit is a fast-forward of `origin/main`, and automatically push to `origin/main`.
-9. Verify `git ls-remote origin refs/heads/main` matches local HEAD and inspect GitHub Actions.
-   If introduced changes fail CI, fix them in a new commit and repeat the normal push. If access,
-   history or Actions availability blocks verification, report `PUSH BLOCKED` or the unavailable
-   check accurately.
+9. Verify `git ls-remote origin refs/heads/main` matches local HEAD. Successful local syntax,
+   lint, tests, wheel inspection and clean-install smoke checks are sufficient to close a round.
+   GitHub Actions is manual-only: do not start, restart or inspect it without separate user
+   permission. If access or remote history blocks safe publication, report `PUSH BLOCKED`.

@@ -491,6 +491,66 @@ class TelegramStorage:
     def profile_ids(self) -> list[int]:
         return [int(row[0]) for row in self.db.execute("SELECT author_id FROM tg_profiles")]
 
+    def get_profile(self, author_id: int) -> dict[str, Any]:
+        row = self.db.execute(
+            "SELECT * FROM tg_profiles WHERE author_id=?", (int(author_id),)
+        ).fetchone()
+        if row is None:
+            raise ValueError("Telegram-профиль не найден в локальном архиве")
+        result = dict(row)
+        result["photos"] = self.profile_photos(author_id)
+        return result
+
+    def profile_photos(
+        self, author_id: int, *, include_path: bool = False
+    ) -> list[dict[str, Any]]:
+        profile = self.db.execute(
+            "SELECT 1 FROM tg_profiles WHERE author_id=?", (int(author_id),)
+        ).fetchone()
+        if profile is None:
+            raise ValueError("Telegram-профиль не найден в локальном архиве")
+        roots = self.allowed_media_roots(self.archive_root())
+        result: list[dict[str, Any]] = []
+        for row in self.db.execute(
+            """SELECT * FROM tg_profile_photos WHERE author_id=? AND status='saved'
+            ORDER BY photo_date DESC,photo_id""",
+            (int(author_id),),
+        ):
+            item = dict(row)
+            try:
+                path = Path(str(item["file_path"])).expanduser().resolve(strict=True)
+                valid = path.is_file() and any(path_is_within(path, root) for root in roots)
+                if valid and int(item.get("size") or 0) > 0:
+                    valid = path.stat().st_size == int(item["size"])
+            except (OSError, RuntimeError, ValueError):
+                valid = False
+                path = Path(str(item["file_path"]))
+            item["available"] = bool(valid)
+            if include_path and valid:
+                item["file_path"] = str(path)
+            else:
+                item.pop("file_path", None)
+            result.append(item)
+        return result
+
+    def selected_profile_photos(
+        self, author_id: int, photo_ids: list[Any]
+    ) -> list[dict[str, Any]]:
+        identifiers = [str(value).strip() for value in photo_ids]
+        if not 1 <= len(identifiers) <= 4 or len(identifiers) != len(set(identifiers)):
+            raise ValueError("Выбери от 1 до 4 уникальных локальных фотографий")
+        photos = {
+            str(item["photo_id"]): item
+            for item in self.profile_photos(author_id, include_path=True)
+        }
+        selected: list[dict[str, Any]] = []
+        for photo_id in identifiers:
+            item = photos.get(photo_id)
+            if item is None or not item.get("available") or not item.get("file_path"):
+                raise ValueError("Выбранное фото не принадлежит профилю или недоступно локально")
+            selected.append(item)
+        return selected
+
     def recent_profiles(self, count: int = 80) -> list[dict[str, Any]]:
         """Return presentation-safe profile summaries for the daemon status response."""
         return [

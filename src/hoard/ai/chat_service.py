@@ -6,10 +6,11 @@ import hashlib
 import json
 from typing import Any
 
-from .errors import AIConnectionError, AIError
+from .errors import AIConnectionError, AIError, AIResponseError
 from .executor import AICore
 from .models import AIImage, AIMessage, AIRequest, AIResponse, AIUsage
 from .pricing import CostEstimate, estimate_cost
+from .psl import DEFAULT_PSL_INSTRUCTIONS, PSL_JSON_SCHEMA, PSL_SCHEMA_VERSION, validate_psl_result
 from .storage import (
     DEFAULT_CONTEXT_CHARS,
     MAX_MESSAGE_ATTACHMENT_BYTES,
@@ -24,9 +25,10 @@ from .storage import (
 class AIChatService:
     """Coordinates SQLite snapshots, the existing AICore and the AI JobRunner."""
 
-    def __init__(self, storage: AIStorage, core: AICore):
+    def __init__(self, storage: AIStorage, core: AICore, telegram_storage=None):
         self.storage = storage
         self.core = core
+        self.telegram_storage = telegram_storage
 
     def queue_message(
         self,
@@ -36,6 +38,7 @@ class AIChatService:
         operation_id: Any,
         memory_ids: list[Any] | None = None,
         attachment_ids: list[Any] | None = None,
+        prompt_version_id: Any = None,
     ) -> dict:
         text = bounded_text(content, field="Сообщение")
         operation = str(operation_id or "").strip()
@@ -50,7 +53,12 @@ class AIChatService:
 
         chat = self.storage.get_chat(chat_id)
         prompt = None
-        if chat.get("prompt_id"):
+        selected_version = str(prompt_version_id or "").strip()
+        if selected_version:
+            prompt = self.storage.get_prompt_version(selected_version)
+            if prompt["scope"] != chat["scope"]:
+                raise ValueError("Версия промпта и чат должны иметь одну область")
+        elif chat.get("prompt_id"):
             prompt = self.storage.get_prompt(str(chat["prompt_id"]))["current_version"]
         config = {
             "provider": str((prompt or {}).get("provider") or chat["provider"]),
@@ -168,6 +176,198 @@ class AIChatService:
             )
         return self.storage.attempt(attempt_id)
 
+    def queue_telegram_psl(
+        self,
+        *,
+        author_id: Any,
+        photo_ids: list[Any],
+        content: Any,
+        operation_id: Any,
+        adult_confirmed: Any,
+        prompt_id: Any = None,
+        prompt_version_id: Any = None,
+        provider: Any = None,
+        model: Any = None,
+    ) -> dict:
+        """Freeze local Telegram photos and queue one explicitly confirmed paid request."""
+        if self.telegram_storage is None:
+            raise ValueError("Telegram-хранилище недоступно")
+        try:
+            selected_author = int(author_id)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Нужен корректный Telegram ID") from exc
+        if selected_author <= 0:
+            raise ValueError("Нужен корректный Telegram ID")
+        if adult_confirmed is not True:
+            raise ValueError("Перед запросом явно подтверди, что человеку исполнилось 18 лет")
+        operation = str(operation_id or "").strip()
+        if not operation or len(operation.encode("utf-8")) > 200:
+            raise ValueError("operation_id обязателен и не должен превышать 200 байт")
+        operation_key = f"telegram.psl:{selected_author}:{operation}"
+        existing = self.storage.telegram_analysis_by_operation(operation_key)
+        if existing is not None:
+            return existing
+
+        text = bounded_text(content, field="Запрос")
+        photos = self.telegram_storage.selected_profile_photos(selected_author, photo_ids)
+        if sum(int(item.get("size") or 0) for item in photos) > MAX_MESSAGE_ATTACHMENT_BYTES:
+            raise ValueError("Общий размер выбранных фото превышает 24 MiB")
+
+        version_id = str(prompt_version_id or "").strip()
+        if version_id:
+            prompt = self.storage.get_prompt_version(version_id)
+        else:
+            selected_prompt_id = str(prompt_id or "").strip()
+            selected_prompt = (
+                self.storage.get_prompt(selected_prompt_id)
+                if selected_prompt_id
+                else self.storage.ensure_psl_prompt()
+            )
+            prompt = selected_prompt["current_version"]
+            prompt["scope"] = selected_prompt["scope"]
+        if prompt["scope"] != "telegram":
+            raise ValueError("Для Telegram AI нужен промпт области telegram")
+
+        selected_provider = str(provider or prompt.get("provider") or "deepseek").strip()
+        selected_model = str(model or prompt.get("model") or "deepseek-chat").strip()
+        if not selected_provider or not selected_model:
+            raise ValueError("Укажи провайдера и модель")
+        config = {
+            "provider": selected_provider,
+            "model": selected_model,
+            "response_format": "json",
+            "json_schema": PSL_JSON_SCHEMA,
+            "max_tokens": prompt.get("max_tokens"),
+            "temperature": prompt.get("temperature"),
+            "context_limit": int(prompt.get("context_limit") or DEFAULT_CONTEXT_CHARS),
+        }
+        if len(text) + len(str(prompt["instructions"])) + len(DEFAULT_PSL_INSTRUCTIONS) > config[
+            "context_limit"
+        ]:
+            raise ValueError("Промпт и запрос превышают лимит контекста")
+
+        imported: list[tuple[dict, dict]] = []
+        try:
+            for photo in photos:
+                attachment = self.storage.import_attachment(str(photo["file_path"]))
+                imported.append((photo, attachment))
+            if sum(int(attachment["size"]) for _photo, attachment in imported) > (
+                MAX_MESSAGE_ATTACHMENT_BYTES
+            ):
+                raise ValueError("Общий размер выбранных фото превышает 24 MiB")
+            timestamp = now_utc()
+            analysis_id = new_id()
+            attempt_id = new_id()
+            chat_id = new_id()
+            message_id = new_id()
+            metadata = {
+                "analysis": "telegram.psl",
+                "schema_version": PSL_SCHEMA_VERSION,
+                "author_id": selected_author,
+                "photo_count": len(imported),
+                "subjective_not_scientific": True,
+                "adult_confirmed": True,
+            }
+            with self.storage.db:
+                self.storage.db.execute(
+                    """INSERT INTO ai_chats(id,title,scope,provider,model,prompt_id,archived,
+                    created_at,updated_at,internal) VALUES(?,?,?,?,?,?,1,?,?,1)""",
+                    (
+                        chat_id,
+                        f"Telegram PSL · {selected_author}",
+                        "telegram",
+                        selected_provider,
+                        selected_model,
+                        prompt["prompt_id"],
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+                self.storage.db.execute(
+                    """INSERT INTO ai_messages(id,chat_id,sequence,role,content,state,
+                    attempt_id,created_at) VALUES(?,?,1,'user',?,'pending',?,?)""",
+                    (message_id, chat_id, text, attempt_id, timestamp),
+                )
+                for position, (_photo, attachment) in enumerate(imported):
+                    self.storage.db.execute(
+                        """INSERT INTO ai_message_attachments(message_id,attachment_id,position)
+                        VALUES(?,?,?)""",
+                        (message_id, attachment["id"], position),
+                    )
+                self.storage.db.execute(
+                    """INSERT INTO ai_attempts(id,operation_key,chat_id,user_message_id,scope,
+                    entity_kind,entity_id,provider,requested_model,prompt_version_id,
+                    request_config,context_metadata,state,created_at)
+                    VALUES(?,?,?,?,?,'telegram.psl',?,?,?,?,?,?,'queued',?)""",
+                    (
+                        attempt_id,
+                        operation_key,
+                        chat_id,
+                        message_id,
+                        "telegram",
+                        analysis_id,
+                        selected_provider,
+                        selected_model,
+                        prompt["id"],
+                        self.storage._json(config),
+                        self.storage._json(metadata),
+                        timestamp,
+                    ),
+                )
+                self.storage.db.execute(
+                    """INSERT INTO ai_telegram_analyses(id,operation_key,author_id,attempt_id,
+                    prompt_version_id,schema_version,adult_confirmed,created_at)
+                    VALUES(?,?,?,?,?,?,1,?)""",
+                    (
+                        analysis_id,
+                        operation_key,
+                        selected_author,
+                        attempt_id,
+                        prompt["id"],
+                        PSL_SCHEMA_VERSION,
+                        timestamp,
+                    ),
+                )
+                for position, (photo, attachment) in enumerate(imported):
+                    self.storage.db.execute(
+                        """INSERT INTO ai_telegram_analysis_photos(analysis_id,photo_id,
+                        attachment_id,position,source_path,source_sha256,size)
+                        VALUES(?,?,?,?,?,?,?)""",
+                        (
+                            analysis_id,
+                            str(photo["photo_id"]),
+                            attachment["id"],
+                            position,
+                            str(photo["file_path"]),
+                            attachment["sha256"],
+                            int(attachment["size"]),
+                        ),
+                    )
+                self.storage.db.execute(
+                    """INSERT INTO ai_attempt_messages(attempt_id,message_id,position)
+                    VALUES(?,?,0)""",
+                    (attempt_id, message_id),
+                )
+                job = self.storage.db.execute(
+                    "INSERT INTO jobs(kind,payload,unique_key) VALUES('ai.chat',?,?)",
+                    (
+                        self.storage._json({"attempt_id": attempt_id}),
+                        f"ai-attempt:{attempt_id}",
+                    ),
+                )
+                self.storage.db.execute(
+                    "UPDATE ai_attempts SET job_id=? WHERE id=?",
+                    (int(job.lastrowid), attempt_id),
+                )
+            return self.storage.telegram_analysis(analysis_id)
+        except Exception:
+            for _photo, attachment in imported:
+                try:
+                    self.storage.delete_attachment(str(attachment["id"]))
+                except ValueError:
+                    pass
+            raise
+
     def _selected_memory(self, chat: dict, memory_ids: list[Any]) -> list[dict]:
         identifiers = [str(item) for item in memory_ids]
         if len(identifiers) != len(set(identifiers)) or len(identifiers) > 50:
@@ -208,6 +408,8 @@ class AIChatService:
             if row is None:
                 raise ValueError("Снимок промпта не найден")
             messages.append(AIMessage("system", str(row["instructions"])))
+        if attempt.get("entity_kind") == "telegram.psl":
+            messages.append(AIMessage("system", DEFAULT_PSL_INSTRUCTIONS))
 
         memory_rows = list(
             self.storage.db.execute(
@@ -375,7 +577,20 @@ class AIChatService:
         except Exception:
             self._finish_error(attempt_id, "outcome_unknown", None, "internal_error")
             raise
-        self._finish(attempt_id, "completed", response, None)
+        analysis_result = None
+        attempt = self.storage.attempt(attempt_id)
+        if attempt.get("entity_kind") == "telegram.psl":
+            try:
+                analysis_result = validate_psl_result(response.structured)
+            except ValueError as exc:
+                self._finish(
+                    attempt_id,
+                    "failed",
+                    response,
+                    "invalid_psl_result",
+                )
+                raise AIResponseError("AI вернул несогласованный PSL-результат") from exc
+        self._finish(attempt_id, "completed", response, None, analysis_result=analysis_result)
         return response.content
 
     def _finish_error(
@@ -389,6 +604,7 @@ class AIChatService:
         state: str,
         response: AIResponse | None,
         error_code: str | None,
+        analysis_result: dict[str, Any] | None = None,
     ) -> None:
         attempt = self.storage.attempt(attempt_id)
         usage: AIUsage | None = response.usage if response else None
@@ -407,6 +623,7 @@ class AIChatService:
             error_code=error_code,
             cost=cost,
             price=price,
+            analysis_result=analysis_result,
         )
 
     def retry_attempt(self, attempt_id: str, operation_id: Any) -> dict:
@@ -423,6 +640,11 @@ class AIChatService:
         if original.get("chat_id") and self.storage.active_attempt(str(original["chat_id"])):
             raise ValueError("В этом диалоге уже выполняется генерация")
         new_attempt = new_id()
+        original_analysis = None
+        new_analysis_id = None
+        if original.get("entity_kind") == "telegram.psl":
+            original_analysis = self.storage.telegram_analysis(str(original["entity_id"]))
+            new_analysis_id = new_id()
         timestamp = now_utc()
         with self.storage.db:
             if original.get("chat_id"):
@@ -447,7 +669,7 @@ class AIChatService:
                         original["user_message_id"],
                         original["scope"],
                         original["entity_kind"],
-                        original["entity_id"],
+                        new_analysis_id or original["entity_id"],
                         original["provider"],
                         original["requested_model"],
                         original["prompt_version_id"],
@@ -470,6 +692,29 @@ class AIChatService:
                     "UPDATE ai_messages SET state='pending' WHERE id=?",
                     (original["user_message_id"],),
                 )
+                if original_analysis is not None and new_analysis_id is not None:
+                    self.storage.db.execute(
+                        """INSERT INTO ai_telegram_analyses(id,operation_key,root_analysis_id,
+                        author_id,attempt_id,prompt_version_id,schema_version,adult_confirmed,
+                        created_at) VALUES(?,?,?,?,?,?,?,1,?)""",
+                        (
+                            new_analysis_id,
+                            operation_key,
+                            original_analysis.get("root_analysis_id") or original_analysis["id"],
+                            original_analysis["author_id"],
+                            new_attempt,
+                            original_analysis["prompt_version_id"],
+                            original_analysis["schema_version"],
+                            timestamp,
+                        ),
+                    )
+                    self.storage.db.execute(
+                        """INSERT INTO ai_telegram_analysis_photos(
+                        analysis_id,photo_id,attachment_id,position,source_path,source_sha256,size)
+                        SELECT ?,photo_id,attachment_id,position,source_path,source_sha256,size
+                        FROM ai_telegram_analysis_photos WHERE analysis_id=?""",
+                        (new_analysis_id, original_analysis["id"]),
+                    )
             else:
                 job_row = self.storage.db.execute(
                     "SELECT payload FROM jobs WHERE id=?", (original["job_id"],)

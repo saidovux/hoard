@@ -12,10 +12,12 @@ import pytest
 if TYPE_CHECKING:
     from textual.widgets import DataTable, Input, OptionList, Static
 
+    from hoard.tui.ai_dialogs import AIRecordDialog, TelegramAIDialog
     from hoard.tui.app import HelpScreen, HoardApp
     from hoard.tui.dialogs import AuthDialog, ConfirmDialog, SourceDialog
     from hoard.tui.screens import (
         ActivityScreen,
+        AIWorkspaceScreen,
         ArchiveScreen,
         OverviewScreen,
         SourcesScreen,
@@ -32,12 +34,15 @@ def load_textual_after_existing_async_tests():
     from textual.widgets import OptionList as OptionListClass
     from textual.widgets import Static as StaticClass
 
+    from hoard.tui.ai_dialogs import AIRecordDialog as AIRecordDialogClass
+    from hoard.tui.ai_dialogs import TelegramAIDialog as TelegramAIDialogClass
     from hoard.tui.app import HelpScreen as HelpScreenClass
     from hoard.tui.app import HoardApp as HoardAppClass
     from hoard.tui.dialogs import AuthDialog as AuthDialogClass
     from hoard.tui.dialogs import ConfirmDialog as ConfirmDialogClass
     from hoard.tui.dialogs import SourceDialog as SourceDialogClass
     from hoard.tui.screens import ActivityScreen as ActivityScreenClass
+    from hoard.tui.screens import AIWorkspaceScreen as AIWorkspaceScreenClass
     from hoard.tui.screens import ArchiveScreen as ArchiveScreenClass
     from hoard.tui.screens import OverviewScreen as OverviewScreenClass
     from hoard.tui.screens import SourcesScreen as SourcesScreenClass
@@ -49,6 +54,8 @@ def load_textual_after_existing_async_tests():
 
     globals().update(
         ActivityScreen=ActivityScreenClass,
+        AIRecordDialog=AIRecordDialogClass,
+        AIWorkspaceScreen=AIWorkspaceScreenClass,
         ArchiveScreen=ArchiveScreenClass,
         AuthDialog=AuthDialogClass,
         ConfirmDialog=ConfirmDialogClass,
@@ -66,6 +73,7 @@ def load_textual_after_existing_async_tests():
         SourcesScreen=SourcesScreenClass,
         Static=StaticClass,
         TelegramScreen=TelegramScreenClass,
+        TelegramAIDialog=TelegramAIDialogClass,
     )
 
 
@@ -235,6 +243,23 @@ class FakeAPI:
 
     async def retry_job(self, job_id: int) -> dict:
         return await self._operation("retry_job", {"id": job_id})
+
+    async def ai_call(self, method: str, args: dict[str, Any] | None = None) -> dict:
+        defaults = {
+            "ai_prompt_list": {"items": [], "has_more": False},
+            "ai_chat_list": {"items": [], "has_more": False},
+            "ai_memory_list": {"items": [], "has_more": False},
+            "ai_price_list": {"items": [], "has_more": False},
+            "ai_attempt_list": {"items": [], "has_more": False},
+            "ai_statistics": {"attempts": 0, "unknown_cost": 0, "estimated_costs": {}},
+            "ai_config_get": {
+                "provider": "deepseek",
+                "model": "deepseek-chat",
+                "timeout": 120,
+                "configured": False,
+            },
+        }
+        return await self._operation(method, args, defaults.get(method, {"message": "Готово"}))
 
 
 async def wait_for_startup(app: HoardApp, pilot) -> None:
@@ -948,7 +973,7 @@ async def test_all_round_three_workspaces_survive_supported_sizes(size):
     app = HoardApp(FakeAPI())
     async with app.run_test(size=size) as pilot:
         await wait_for_startup(app, pilot)
-        for section in ("telegram", "sources", "activity", "archive", "overview"):
+        for section in ("telegram", "sources", "activity", "archive", "ai", "overview"):
             app.open_section(section)
             await pilot.pause()
             workspace = app.screen.query_one("#workspace")
@@ -957,6 +982,124 @@ async def test_all_round_three_workspaces_survive_supported_sizes(size):
             for table in app.screen.query(DataTable):
                 assert table.size.width >= 0
                 assert table.size.height >= 0
+
+
+@pytest.mark.asyncio
+async def test_ai_workspace_lists_real_records_and_keeps_strict_black_theme():
+    api = FakeAPI()
+    api.queue(
+        "ai_prompt_list",
+        {
+            "items": [
+                {
+                    "id": "prompt-1",
+                    "name": "Assistant",
+                    "scope": "general",
+                    "version": 2,
+                    "version_id": "prompt-version-2",
+                    "model": "deepseek-chat",
+                    "response_format": "text",
+                    "active": 1,
+                }
+            ]
+        },
+    )
+    api.queue(
+        "ai_chat_list",
+        {
+            "items": [
+                {
+                    "id": "chat-1",
+                    "title": "Local chat",
+                    "provider": "deepseek",
+                    "model": "deepseek-chat",
+                    "prompt_id": "prompt-1",
+                    "message_count": 3,
+                }
+            ]
+        },
+    )
+    app = HoardApp(api)
+    async with app.run_test(size=(110, 35)) as pilot:
+        await wait_for_startup(app, pilot)
+        app.open_section("ai")
+        await wait_for_condition(
+            pilot,
+            lambda: isinstance(app.screen, AIWorkspaceScreen)
+            and app.screen.query_one("#ai-table", DataTable).row_count == 1,
+        )
+        assert "Local chat" in str(app.screen.query_one("#ai-table", DataTable).get_row_at(0))
+        for node in [app.screen, *app.screen.query("*")]:
+            assert node.styles.background.hex == "#000000", repr(node)
+        await pilot.click("#ai-config")
+        await wait_for_condition(pilot, lambda: isinstance(app.screen, AIRecordDialog))
+        key = app.screen.query_one("#record-key", Input)
+        assert key.password
+        await pilot.press("escape")
+
+
+@pytest.mark.asyncio
+async def test_telegram_ai_requires_visible_adult_and_external_confirmation():
+    status = status_fixture()
+    status["profiles"] = [
+        {
+            "display_name": "Synthetic",
+            "current_username": "synthetic",
+            "author_id": 99,
+            "source_count": 1,
+            "photo_count": 1,
+            "last_seen": "2026-10-22",
+            "photo_error": "",
+        }
+    ]
+    api = FakeAPI(status)
+    api.queue(
+        "ai_telegram_profile_get",
+        {
+            "profile": {
+                "author_id": 99,
+                "display_name": "Synthetic",
+                "photos": [
+                    {
+                        "photo_id": "photo-1",
+                        "photo_date": "2026-10-22",
+                        "available": True,
+                    }
+                ],
+            }
+        },
+    )
+    api.queue(
+        "ai_prompt_list",
+        {
+            "items": [
+                {
+                    "id": "telegram-prompt",
+                    "version_id": "telegram-prompt-v1",
+                    "name": "Telegram PSL",
+                    "version": 1,
+                }
+            ]
+        },
+    )
+    api.queue("ai_telegram_analysis_list", {"items": []})
+    app = HoardApp(api)
+    async with app.run_test(size=(100, 32)) as pilot:
+        await wait_for_startup(app, pilot)
+        app.open_section("archive")
+        await pilot.pause()
+        await pilot.click("#mode-profiles")
+        await pilot.click("#telegram-ai")
+        await wait_for_condition(pilot, lambda: isinstance(app.screen, TelegramAIDialog))
+        app.screen.query_one("#telegram-ai-photo-ids", Input).value = "photo-1"
+        app.screen.query_one("#telegram-ai-submit").press()
+        await wait_for_condition(pilot, lambda: isinstance(app.screen, ConfirmDialog))
+        message = str(app.screen.query_one(".dialog-message", Static).content)
+        assert "18" in message
+        assert "DeepSeek" in message
+        assert "платным" in message
+        app.screen.query_one("#cancel").press()
+        assert not any(name == "ai_telegram_psl_start" for name, _ in api.calls)
 
 
 def test_cli_module_keeps_textual_lazy_for_noninteractive_commands():

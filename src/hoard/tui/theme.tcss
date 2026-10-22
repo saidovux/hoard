@@ -257,15 +257,57 @@ SelectOverlay > .option-list--option-hover {
     color: #888888;
 }
 
-#sources-table, #archive-table {
+#sources-table, #archive-table, #ai-table {
     width: 100%;
     height: 18;
     min-height: 8;
     border: solid #262626;
 }
 
-.compact #sources-table, .compact #archive-table {
+.compact #sources-table, .compact #archive-table, .compact #ai-table {
     height: 12;
+}
+
+#archive-actions {
+    grid-size: 4;
+    grid-columns: 1fr 1fr 1fr 1fr;
+}
+
+.ai-mode-row {
+    grid-size: 5;
+    grid-columns: 1fr 1fr 1fr 1fr 1fr;
+}
+
+#ai-actions {
+    grid-size: 4;
+    grid-columns: 1fr 1fr 1fr 1fr;
+    min-height: 6;
+}
+
+#ai-summary, #ai-statistics, #ai-history, #telegram-ai-photos, #telegram-ai-previous {
+    height: auto;
+    min-height: 3;
+    margin-bottom: 1;
+}
+
+#ai-chat-pane {
+    height: auto;
+}
+
+#ai-message, #record-content, #record-schema, #telegram-ai-content {
+    height: 7;
+    min-height: 4;
+    margin-bottom: 1;
+}
+
+.ai-record-dialog, .telegram-ai-dialog {
+    width: 80;
+}
+
+.compact #archive-actions, .compact .ai-mode-row, .compact #ai-actions {
+    grid-size: 1;
+    grid-columns: 1fr;
+    min-height: 3;
 }
 
 ModalScreen {

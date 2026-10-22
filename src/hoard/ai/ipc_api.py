@@ -8,10 +8,11 @@ from .storage import AIStorage
 
 
 class AIIPC:
-    def __init__(self, storage: AIStorage, chats: AIChatService, runner):
+    def __init__(self, storage: AIStorage, chats: AIChatService, runner, telegram_storage=None):
         self.storage = storage
         self.chats = chats
         self.runner = runner
+        self.telegram_storage = telegram_storage
 
     @staticmethod
     def _id(args: dict[str, Any]) -> str:
@@ -38,6 +39,8 @@ class AIIPC:
             return self.storage.prompt_versions(
                 self._id(args), limit=args.get("limit", 20), offset=args.get("offset", 0)
             )
+        if method == "ai_prompt_version_get":
+            return {"version": self.storage.get_prompt_version(self._id(args))}
         if method == "ai_prompt_activate":
             return {
                 "prompt": self.storage.activate_prompt(str(args.get("scope") or ""), self._id(args))
@@ -65,6 +68,8 @@ class AIIPC:
                 self._id(args), limit=args.get("limit", 20), offset=args.get("offset", 0)
             )
         if method == "ai_chat_send":
+            if args.get("external_confirmed") is not True:
+                raise ValueError("Подтверди отправку данных внешнему AI-провайдеру")
             attempt = self.chats.queue_message(
                 chat_id=str(args.get("chat_id") or ""),
                 content=args.get("content"),
@@ -79,6 +84,7 @@ class AIIPC:
                     if isinstance(args.get("attachment_ids"), list)
                     else []
                 ),
+                prompt_version_id=args.get("prompt_version_id"),
             )
             self.runner.wakeup()
             return {"attempt": attempt, "message": "AI-запрос поставлен в очередь"}
@@ -123,6 +129,14 @@ class AIIPC:
 
         if method == "ai_attempt_get":
             return {"attempt": self.storage.attempt(self._id(args))}
+        if method == "ai_attempt_list":
+            return self.storage.list_attempts(
+                scope=str(args["scope"]) if args.get("scope") else None,
+                chat_id=str(args["chat_id"]) if args.get("chat_id") else None,
+                state=str(args["state"]) if args.get("state") else None,
+                limit=args.get("limit", 20),
+                offset=args.get("offset", 0),
+            )
         if method == "ai_job_state":
             if args.get("job_id") is not None:
                 job_id = int(args["job_id"])
@@ -143,4 +157,59 @@ class AIIPC:
             return {"attempt": attempt, "message": "Создана новая AI-попытка"}
         if method == "ai_statistics":
             return self.storage.statistics(args)
+        if method == "ai_telegram_profile_get":
+            if self.telegram_storage is None:
+                raise ValueError("Telegram-хранилище недоступно")
+            return {"profile": self.telegram_storage.get_profile(int(args.get("author_id") or 0))}
+        if method == "ai_telegram_photos":
+            if self.telegram_storage is None:
+                raise ValueError("Telegram-хранилище недоступно")
+            return {
+                "items": self.telegram_storage.profile_photos(int(args.get("author_id") or 0))
+            }
+        if method == "ai_telegram_photo_get":
+            if self.telegram_storage is None:
+                raise ValueError("Telegram-хранилище недоступно")
+            photo_id = str(args.get("photo_id") or "")
+            selected = self.telegram_storage.selected_profile_photos(
+                int(args.get("author_id") or 0), [photo_id]
+            )[0]
+            return {
+                "photo": {
+                    "photo_id": selected["photo_id"],
+                    "file_path": selected["file_path"],
+                    "size": selected["size"],
+                }
+            }
+        if method == "ai_telegram_psl_start":
+            if args.get("external_confirmed") is not True:
+                raise ValueError("Подтверди отправку выбранных фото внешнему AI-провайдеру")
+            raw_photos = args.get("photo_ids")
+            if not isinstance(raw_photos, list):
+                raise ValueError("photo_ids должен быть списком")
+            analysis = self.chats.queue_telegram_psl(
+                author_id=args.get("author_id"),
+                photo_ids=raw_photos,
+                content=args.get("content"),
+                operation_id=args.get("operation_id"),
+                adult_confirmed=args.get("adult_confirmed"),
+                prompt_id=args.get("prompt_id"),
+                prompt_version_id=args.get("prompt_version_id"),
+                provider=args.get("provider"),
+                model=args.get("model"),
+            )
+            self.runner.wakeup()
+            return {
+                "analysis": analysis,
+                "message": "Telegram AI-анализ поставлен в очередь",
+            }
+        if method == "ai_telegram_analysis_get":
+            return {"analysis": self.storage.telegram_analysis(self._id(args))}
+        if method == "ai_telegram_analysis_list":
+            return self.storage.list_telegram_analyses(
+                author_id=int(args["author_id"]) if args.get("author_id") is not None else None,
+                successful_only=bool(args.get("successful_only", False)),
+                limit=args.get("limit", 20),
+                offset=args.get("offset", 0),
+            )
         raise ValueError(f"Неизвестная AI-команда: {method}")

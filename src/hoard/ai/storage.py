@@ -12,8 +12,9 @@ from typing import Any
 
 from .models import AIImage, AIUsage
 from .pricing import CostEstimate, decimal_text
+from .psl import DEFAULT_PSL_INSTRUCTIONS, PSL_JSON_SCHEMA
 
-AI_SCHEMA_VERSION = 1
+AI_SCHEMA_VERSION = 2
 MAX_TEXT_BYTES = 32 * 1024
 MAX_NAME_BYTES = 300
 MAX_PAGE = 100
@@ -244,6 +245,38 @@ class AIStorage:
                 PRIMARY KEY(attempt_id, memory_id),
                 UNIQUE(attempt_id, position)
             );
+            CREATE TABLE IF NOT EXISTS ai_telegram_analyses (
+                id TEXT PRIMARY KEY,
+                operation_key TEXT NOT NULL UNIQUE,
+                root_analysis_id TEXT REFERENCES ai_telegram_analyses(id),
+                author_id INTEGER NOT NULL,
+                attempt_id TEXT NOT NULL UNIQUE REFERENCES ai_attempts(id),
+                prompt_version_id TEXT NOT NULL REFERENCES ai_prompt_versions(id),
+                schema_version INTEGER NOT NULL,
+                adult_confirmed INTEGER NOT NULL CHECK(adult_confirmed=1),
+                result_status TEXT CHECK(result_status IS NULL OR result_status IN
+                    ('completed','insufficient_data','ineligible','invalid_result')),
+                presentation TEXT CHECK(presentation IS NULL OR presentation IN
+                    ('female','male','unknown')),
+                estimated_age INTEGER,
+                raw_psl_min REAL,
+                raw_psl_max REAL,
+                boosted_psl REAL,
+                actual_model TEXT,
+                analyzed_at TEXT,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS ai_telegram_analysis_photos (
+                analysis_id TEXT NOT NULL REFERENCES ai_telegram_analyses(id) ON DELETE CASCADE,
+                photo_id TEXT NOT NULL,
+                attachment_id TEXT NOT NULL REFERENCES ai_attachments(id),
+                position INTEGER NOT NULL,
+                source_path TEXT NOT NULL,
+                source_sha256 TEXT NOT NULL,
+                size INTEGER NOT NULL,
+                PRIMARY KEY(analysis_id, photo_id),
+                UNIQUE(analysis_id, position)
+            );
             CREATE INDEX IF NOT EXISTS ai_prompts_scope_idx
                 ON ai_prompts(scope, updated_at DESC);
             CREATE INDEX IF NOT EXISTS ai_prompt_versions_prompt_idx
@@ -260,11 +293,20 @@ class AIStorage:
                 ON ai_attempts(created_at DESC);
             CREATE INDEX IF NOT EXISTS ai_attempts_filters_idx
                 ON ai_attempts(provider, actual_model, scope, chat_id, created_at);
+            CREATE INDEX IF NOT EXISTS ai_telegram_analyses_author_idx
+                ON ai_telegram_analyses(author_id, created_at DESC);
             CREATE UNIQUE INDEX IF NOT EXISTS ai_attempts_chat_active_idx
                 ON ai_attempts(chat_id)
                 WHERE chat_id IS NOT NULL AND state IN ('queued','running');
             """
         )
+        chat_columns = {
+            str(row["name"]) for row in self.db.execute("PRAGMA table_info(ai_chats)")
+        }
+        if "internal" not in chat_columns:
+            self.db.execute(
+                "ALTER TABLE ai_chats ADD COLUMN internal INTEGER NOT NULL DEFAULT 0"
+            )
         self.db.execute(
             """INSERT INTO schema_versions(module,version) VALUES('ai',?)
             ON CONFLICT(module) DO UPDATE SET
@@ -273,6 +315,7 @@ class AIStorage:
             (AI_SCHEMA_VERSION,),
         )
         self.db.commit()
+        self.ensure_psl_prompt()
 
     @staticmethod
     def _json(value: Any) -> str:
@@ -301,6 +344,43 @@ class AIStorage:
         result = dict(row)
         result["json_schema"] = self._decode(result["json_schema"])
         return result
+
+    def get_prompt_version(self, version_id: str) -> dict:
+        row = self.db.execute(
+            """SELECT v.*,p.name,p.scope FROM ai_prompt_versions v
+            JOIN ai_prompts p ON p.id=v.prompt_id
+            WHERE v.id=? AND p.deleted_at IS NULL""",
+            (str(version_id),),
+        ).fetchone()
+        if row is None:
+            raise ValueError("Версия промпта не найдена")
+        result = dict(row)
+        result["json_schema"] = self._decode(result["json_schema"])
+        return result
+
+    def ensure_psl_prompt(self) -> dict:
+        """Install one editable Telegram prompt while retaining every historical version."""
+        row = self.db.execute(
+            """SELECT id FROM ai_prompts WHERE scope='telegram' AND name='Telegram PSL'
+            AND deleted_at IS NULL ORDER BY created_at LIMIT 1"""
+        ).fetchone()
+        if row is None:
+            prompt = self.create_prompt(
+                {
+                    "name": "Telegram PSL",
+                    "scope": "telegram",
+                    "instructions": DEFAULT_PSL_INSTRUCTIONS,
+                    "provider": "deepseek",
+                    "model": "deepseek-chat",
+                    "response_format": "json",
+                    "json_schema": PSL_JSON_SCHEMA,
+                    "temperature": 0,
+                    "context_limit": DEFAULT_CONTEXT_CHARS,
+                }
+            )
+        else:
+            prompt = self.get_prompt(str(row["id"]))
+        return prompt
 
     def create_prompt(self, values: dict[str, Any]) -> dict:
         prompt_id = new_id()
@@ -386,7 +466,7 @@ class AIStorage:
             parameters = (validate_scope(scope),)
         return self._page(
             f"""SELECT p.id,p.name,p.scope,p.created_at,p.updated_at,
-            v.version,v.provider,v.model,v.response_format,
+            v.id AS version_id,v.version,v.provider,v.model,v.response_format,
             CASE WHEN a.prompt_id IS NULL THEN 0 ELSE 1 END AS active
             FROM ai_prompts p
             JOIN ai_prompt_versions v ON v.id=(SELECT id FROM ai_prompt_versions
@@ -497,7 +577,7 @@ class AIStorage:
         self, *, scope: str | None, archived: bool | None, limit: Any, offset: Any
     ) -> dict:
         page_limit, page_offset = paging(limit, offset)
-        clauses = ["c.deleted_at IS NULL"]
+        clauses = ["c.deleted_at IS NULL", "c.internal=0"]
         parameters: list[Any] = []
         if scope is not None:
             clauses.append("c.scope=?")
@@ -878,6 +958,99 @@ class AIStorage:
         ).fetchone()
         return self.attempt(str(row["id"])) if row else None
 
+    def list_attempts(
+        self,
+        *,
+        scope: str | None,
+        chat_id: str | None,
+        state: str | None,
+        limit: Any,
+        offset: Any,
+    ) -> dict:
+        page_limit, page_offset = paging(limit, offset)
+        clauses = ["1=1"]
+        parameters: list[Any] = []
+        if scope is not None:
+            clauses.append("scope=?")
+            parameters.append(validate_scope(scope))
+        if chat_id is not None:
+            clauses.append("chat_id=?")
+            parameters.append(str(chat_id))
+        if state is not None:
+            selected_state = str(state)
+            if selected_state not in _STATES:
+                raise ValueError("Неизвестное состояние AI-попытки")
+            clauses.append("state=?")
+            parameters.append(selected_state)
+        result = self._page(
+            f"""SELECT id,job_id,chat_id,scope,entity_kind,entity_id,provider,
+            requested_model,actual_model,state,error_code,estimated_cost,cost_currency,
+            cost_status,created_at,sent_at,completed_at FROM ai_attempts
+            WHERE {' AND '.join(clauses)} ORDER BY created_at DESC,id LIMIT ? OFFSET ?""",
+            tuple(parameters),
+            limit=page_limit,
+            offset=page_offset,
+        )
+        return result
+
+    def telegram_analysis(self, analysis_id: str) -> dict:
+        row = self.db.execute(
+            "SELECT * FROM ai_telegram_analyses WHERE id=?", (str(analysis_id),)
+        ).fetchone()
+        if row is None:
+            raise ValueError("Telegram AI-анализ не найден")
+        result = dict(row)
+        result["attempt"] = self.attempt(str(result["attempt_id"]))
+        result["photos"] = [
+            dict(photo)
+            for photo in self.db.execute(
+                """SELECT photo_id,attachment_id,position,source_sha256,size
+                FROM ai_telegram_analysis_photos WHERE analysis_id=? ORDER BY position""",
+                (str(analysis_id),),
+            )
+        ]
+        return result
+
+    def telegram_analysis_by_operation(self, operation_key: str) -> dict | None:
+        row = self.db.execute(
+            "SELECT id FROM ai_telegram_analyses WHERE operation_key=?", (operation_key,)
+        ).fetchone()
+        return self.telegram_analysis(str(row["id"])) if row else None
+
+    def list_telegram_analyses(
+        self,
+        *,
+        author_id: int | None,
+        successful_only: bool,
+        limit: Any,
+        offset: Any,
+    ) -> dict:
+        page_limit, page_offset = paging(limit, offset)
+        clauses = ["1=1"]
+        parameters: list[Any] = []
+        if author_id is not None:
+            clauses.append("a.author_id=?")
+            parameters.append(int(author_id))
+        if successful_only:
+            clauses.append("a.result_status='completed'")
+        rows = [
+            dict(row)
+            for row in self.db.execute(
+                f"""SELECT a.*,t.state AS attempt_state,t.error_code,t.estimated_cost,
+                t.cost_currency,t.cost_status,t.requested_model
+                FROM ai_telegram_analyses a JOIN ai_attempts t ON t.id=a.attempt_id
+                WHERE {' AND '.join(clauses)} ORDER BY a.created_at DESC,a.id
+                LIMIT ? OFFSET ?""",
+                (*parameters, page_limit + 1, page_offset),
+            )
+        ]
+        return {
+            "items": rows[:page_limit],
+            "limit": page_limit,
+            "offset": page_offset,
+            "has_more": len(rows) > page_limit,
+        }
+
     def job_state(self, job_id: int) -> dict:
         row = self.db.execute(
             """SELECT id,kind,state,attempts,result,created_at,updated_at
@@ -945,6 +1118,7 @@ class AIStorage:
         error_code: str | None,
         cost: CostEstimate,
         price: dict[str, Any] | None,
+        analysis_result: dict[str, Any] | None = None,
     ) -> dict:
         if state not in _STATES - {"queued", "running"}:
             raise ValueError("Invalid terminal attempt state")
@@ -1007,6 +1181,30 @@ class AIStorage:
                 self.db.execute(
                     "UPDATE ai_chats SET updated_at=? WHERE id=?", (timestamp, current["chat_id"])
                 )
+            if current.get("entity_kind") == "telegram.psl":
+                if state == "completed" and analysis_result is not None:
+                    self.db.execute(
+                        """UPDATE ai_telegram_analyses SET result_status=?,presentation=?,
+                        estimated_age=?,raw_psl_min=?,raw_psl_max=?,boosted_psl=?,
+                        actual_model=?,analyzed_at=? WHERE id=? AND analyzed_at IS NULL""",
+                        (
+                            analysis_result["status"],
+                            analysis_result["presentation"],
+                            analysis_result["estimated_age"],
+                            analysis_result["raw_psl_min"],
+                            analysis_result["raw_psl_max"],
+                            analysis_result["boosted_psl"],
+                            getattr(response, "model", None),
+                            timestamp,
+                            current["entity_id"],
+                        ),
+                    )
+                elif error_code in {"invalid_json", "json_schema_mismatch", "invalid_psl_result"}:
+                    self.db.execute(
+                        """UPDATE ai_telegram_analyses SET result_status='invalid_result',
+                        actual_model=?,analyzed_at=? WHERE id=? AND analyzed_at IS NULL""",
+                        (getattr(response, "model", None), timestamp, current["entity_id"]),
+                    )
         return self.attempt(attempt_id)
 
     def statistics(self, filters: dict[str, Any]) -> dict:

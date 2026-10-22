@@ -15,6 +15,8 @@ Local-first Telegram archive and extensible small-tool core, Python >=3.11. Keep
 - Recheck Python syntax, tests, CLI, IPC and `pytest -q` after changes. Live Telegram tests require user's authorization and should be run against permitted content.
 - Every completed and locally verified Hoard round must be published automatically to
   `origin/main`: build and inspect the wheel, audit staged files, commit, fetch, verify a
-  fast-forward, push normally, verify the remote HEAD and inspect GitHub Actions. Never push with
-  failing local checks and never force-push. Report `PUSH BLOCKED` when access or history prevents
-  safe publication.
+  fast-forward, push normally and verify the remote HEAD. Passing local syntax, lint, tests,
+  wheel build and clean-install checks is sufficient to close a round. GitHub Actions is manual
+  only and must not be started, restarted or inspected without the user's separate permission.
+  Never push with failing local checks and never force-push. Report `PUSH BLOCKED` when access or
+  history prevents safe publication.
