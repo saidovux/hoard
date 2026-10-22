@@ -164,5 +164,6 @@ async def isolated_main(scenario: str) -> None:
 
 if __name__ == "__main__":
     if WIN311:
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+        # Isolated jobs use the same Proactor policy as the production daemon.
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
     asyncio.run(isolated_main(sys.argv[1]))

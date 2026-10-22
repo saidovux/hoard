@@ -669,7 +669,7 @@ async def test_statistics_filters_and_unknown_cost_count(tmp_path):
 
 # Python 3.11's Windows selector loop can stall when pytest creates and tears down
 # many loops around daemon-runner tests. Exercise every async scenario in its own
-# isolated process there, matching the established test_ai_jobs compatibility strategy.
+# process with the production-default Proactor loop there.
 _ASYNC_SCENARIOS = (
     test_prompt_crud_versions_activation_and_pagination,
     test_chat_generation_uses_frozen_prompt_versions_and_persists_history,
@@ -723,7 +723,7 @@ if __name__ == "__main__":
     except KeyError:
         raise SystemExit("unknown Windows 3.11 scenario") from None
     if _WIN311:
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
         faulthandler.dump_traceback_later(5)
     try:
         with tempfile.TemporaryDirectory(prefix="hoard-ai-infrastructure-") as directory:
