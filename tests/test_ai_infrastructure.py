@@ -667,8 +667,8 @@ async def test_statistics_filters_and_unknown_cost_count(tmp_path):
 
 
 # Python 3.11's Windows selector loop can stall when pytest creates and tears down
-# many loops around daemon-runner tests. Exercise every async scenario in one isolated
-# process there, matching the established test_ai_jobs compatibility strategy.
+# many loops around daemon-runner tests. Exercise every async scenario in its own
+# isolated process there, matching the established test_ai_jobs compatibility strategy.
 _ASYNC_SCENARIOS = (
     test_prompt_crud_versions_activation_and_pagination,
     test_chat_generation_uses_frozen_prompt_versions_and_persists_history,
@@ -692,34 +692,38 @@ _ASYNC_SCENARIOS = (
 _WIN311 = sys.platform == "win32" and sys.version_info < (3, 12)
 
 
-async def _run_windows_scenarios(root: Path) -> None:
-    for scenario in _ASYNC_SCENARIOS:
-        directory = root / scenario.__name__
-        directory.mkdir()
-        await scenario(directory)
-
-
 if _WIN311 and __name__ != "__main__":
     for _scenario in _ASYNC_SCENARIOS:
         globals()[_scenario.__name__] = pytest.mark.skip(
-            reason="covered together in the Windows 3.11 isolated-loop scenario"
+            reason="covered in an isolated Windows 3.11 process"
         )(_scenario)
 
-    def test_windows311_ai_infrastructure_in_isolated_loop():
+    @pytest.mark.parametrize("scenario", _ASYNC_SCENARIOS, ids=lambda item: item.__name__)
+    def test_windows311_ai_infrastructure_in_isolated_process(scenario):
         completed = subprocess.run(
-            [sys.executable, str(Path(__file__).resolve()), "windows311"],
+            [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "windows311",
+                scenario.__name__,
+            ],
             capture_output=True,
             text=True,
-            timeout=40,
+            timeout=15,
             check=False,
         )
         assert completed.returncode == 0, completed.stdout + completed.stderr
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 2 or sys.argv[1] != "windows311":
-        raise SystemExit("expected windows311 scenario")
+    if len(sys.argv) != 3 or sys.argv[1] != "windows311":
+        raise SystemExit("expected windows311 and a scenario name")
+    scenarios = {scenario.__name__: scenario for scenario in _ASYNC_SCENARIOS}
+    try:
+        selected_scenario = scenarios[sys.argv[2]]
+    except KeyError:
+        raise SystemExit("unknown Windows 3.11 scenario") from None
     if _WIN311:
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     with tempfile.TemporaryDirectory(prefix="hoard-ai-infrastructure-") as directory:
-        asyncio.run(_run_windows_scenarios(Path(directory)))
+        asyncio.run(selected_scenario(Path(directory)))
