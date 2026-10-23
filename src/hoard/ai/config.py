@@ -9,6 +9,8 @@ from pathlib import Path
 from ..paths import config_dir, ensure_private
 from .errors import AIConfigurationError
 
+DEFAULT_DEEPSEEK_MODEL = "deepseek-flash"
+
 
 def ai_config_file() -> Path:
     return config_dir() / "ai.json"
@@ -18,7 +20,7 @@ def ai_config_file() -> Path:
 class AIConfig:
     provider: str = "deepseek"
     api_key: str = field(default="", repr=False)
-    model: str = "deepseek-flash"
+    model: str = DEFAULT_DEEPSEEK_MODEL
     timeout: float = 120.0
     max_parallel: int = 2
 
@@ -52,7 +54,9 @@ def read_ai_config() -> AIConfig:
     if not isinstance(deepseek, dict):
         raise AIConfigurationError("Раздел deepseek в ai.json должен быть объектом")
     api_key = os.environ.get("DEEPSEEK_API_KEY") or deepseek.get("api_key", "")
-    model = os.environ.get("DEEPSEEK_MODEL") or deepseek.get("model", "deepseek-flash")
+    model = os.environ.get("DEEPSEEK_MODEL") or deepseek.get(
+        "model", DEFAULT_DEEPSEEK_MODEL
+    )
     raw_parallel = os.environ.get("HOARD_AI_MAX_JOBS", data.get("max_parallel", 2))
     raw_timeout = os.environ.get("HOARD_AI_TIMEOUT", deepseek.get("timeout", 120))
     try:

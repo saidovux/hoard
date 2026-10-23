@@ -25,6 +25,7 @@
   const postSearchIndex = new Map();
   const sectionPages = new Map();
   const selectedProfiles = new Set();
+  const validProfileId = (value) => Number.isSafeInteger(Number(value)) && Number(value) > 0;
   let currentRoute = null;
   let inputTimer = null;
 
@@ -58,7 +59,7 @@
       });
       (saved.selectedProfiles || []).forEach((id) => {
         const value = Number(id);
-        if (profileMap.has(value)) selectedProfiles.add(value);
+        if (profileMap.has(value) && validProfileId(value)) selectedProfiles.add(value);
       });
     } catch (_) { /* Broken browser state is non-authoritative. */ }
   }
@@ -238,6 +239,31 @@
     return [...bytes].map((value) => value.toString(16).padStart(2, "0")).join("");
   }
 
+  function operationStorageKey(selector, photoIds) {
+    const authors = Array.isArray(selector.author_ids)
+      ? selector.author_ids.map(Number).filter(validProfileId).sort((a, b) => a - b)
+      : [];
+    const photos = Object.fromEntries(Object.keys(photoIds).sort().map((id) => [
+      id, [...photoIds[id]].map(String),
+    ]));
+    return `hoard.ai.operation:${JSON.stringify({
+      authors,
+      source_id: Number.isSafeInteger(Number(selector.source_id)) ? Number(selector.source_id) : null,
+      source_url: String(selector.source_url || ""),
+      photos,
+    })}`;
+  }
+
+  function savedOperation(key) {
+    let value = "";
+    try { value = sessionStorage.getItem(key) || ""; } catch (_) { /* unavailable */ }
+    if (!/^[a-f0-9]{32}$/.test(value)) {
+      value = operationId();
+      try { sessionStorage.setItem(key, value); } catch (_) { /* unavailable */ }
+    }
+    return value;
+  }
+
   function batchSummary(batch) {
     const cost = batch.estimated_cost_usd === null || batch.estimated_cost_usd === undefined
       ? "стоимость неизвестна"
@@ -262,7 +288,7 @@
     body.append(list);
   }
 
-  async function pollBatch(dialog, body, batchId) {
+  async function pollBatch(dialog, body, batchId, operationKey) {
     for (let index = 0; index < 120 && dialog.open; index += 1) {
       await new Promise((resolve) => window.setTimeout(resolve, 1500));
       let result;
@@ -274,6 +300,7 @@
       const batch = result.batch;
       renderBatch(body, batch);
       if (batch.terminal) {
+        try { sessionStorage.removeItem(operationKey); } catch (_) { /* unavailable */ }
         try {
           body.append(element("p", "muted", "Обновляем локальный каталог…"));
           await api("/api/catalog/refresh", {method: "POST", body: {}});
@@ -304,7 +331,6 @@
         `${clean(source.channel_title || source.title, `@${source.username}`)} #${source.post_id}`,
       ));
     }
-    const adultInputs = [];
     const photoInputs = [];
     const list = element("div", "workflow-list");
     (preview.items || []).forEach((item) => {
@@ -333,26 +359,26 @@
           `Предыдущий: ${previous.result_status || previous.attempt_state || "—"}`,
         ));
       }
-      if ((item.selected_photo_ids || []).length) {
-        const label = element("label", "check-row adult-check");
-        const input = element("input", "");
-        input.type = "checkbox";
-        input.value = String(item.author_id);
-        adultInputs.push(input);
-        label.append(
-          input,
-          element("span", "", "18+ подтверждено сведениями вне фотографии"),
-        );
-        row.append(label);
+      if ((item.selected_photo_ids || []).length && validProfileId(item.author_id)) {
+        row.append(element("span", "muted", "Возрастной допуск: 18+ автоматически"));
       } else {
         row.append(element("span", "workflow-reason", item.reason || "Будет пропущен"));
       }
       list.append(row);
     });
     body.append(list);
+    const defaultPhotoIds = {};
+    (preview.items || []).forEach((item) => {
+      if (validProfileId(item.author_id) && (item.selected_photo_ids || []).length) {
+        defaultPhotoIds[String(item.author_id)] = [...item.selected_photo_ids].map(String);
+      }
+    });
+    if (Object.keys(defaultPhotoIds).length) {
+      savedOperation(operationStorageKey(selector, defaultPhotoIds));
+    }
     if (preview.has_more) body.append(element(
       "p", "muted",
-      "Непоказанные профили не считаются совершеннолетними автоматически и будут пропущены.",
+      "Непоказанные профили будут обработаны с тем же автоматическим допуском 18+.",
     ));
     const externalLabel = element("label", "check-row external-check");
     const external = element("input", "");
@@ -365,16 +391,17 @@
     const start = element("button", "primary-action", "Запустить анализ");
     start.type = "button";
     start.addEventListener("click", async () => {
-      const confirmed = adultInputs.filter((input) => input.checked).map((input) => Number(input.value));
-      if (!confirmed.length) {
-        feedback.textContent = "Подтверди 18+ хотя бы для одного профиля.";
-        return;
-      }
       if (!external.checked) {
         feedback.textContent = "Подтверди внешнюю отправку фотографий.";
         return;
       }
       const photoIds = {};
+      const photoSnapshots = {};
+      (preview.items || []).forEach((item) => {
+        if (!validProfileId(item.author_id) || !(item.selected_photo_ids || []).length) return;
+        photoIds[String(item.author_id)] = [...item.selected_photo_ids].map(String);
+        if (item.photo_snapshot) photoSnapshots[String(item.author_id)] = String(item.photo_snapshot);
+      });
       if (preview.selected_count === 1) {
         const selected = photoInputs.filter((input) => input.checked).map((input) => input.value);
         if (selected.length < 1 || selected.length > 4) {
@@ -382,20 +409,28 @@
           return;
         }
         photoIds[String(preview.items[0].author_id)] = selected;
+        if (JSON.stringify(selected) !== JSON.stringify(preview.items[0].selected_photo_ids || [])) {
+          delete photoSnapshots[String(preview.items[0].author_id)];
+        }
       }
+      if (!Object.keys(photoIds).length) {
+        feedback.textContent = "Нет подходящих пользовательских профилей с локальными фото.";
+        return;
+      }
+      const storageKey = operationStorageKey(selector, photoIds);
       start.disabled = true;
       try {
         const result = await api("/api/ai/start", {
           method: "POST",
           body: {
             ...selector,
-            confirmed_author_ids: confirmed,
             photo_ids: photoIds,
-            operation_id: operationId(),
+            photo_snapshots: photoSnapshots,
+            operation_id: savedOperation(storageKey),
           },
         });
         renderBatch(body, result.batch);
-        pollBatch(dialog, body, result.batch.id);
+        pollBatch(dialog, body, result.batch.id, storageKey);
       } catch (error) {
         feedback.textContent = error.message;
         start.disabled = false;
@@ -456,12 +491,14 @@
 
   function selectionControls(profile) {
     const actions = element("div", "interactive-actions");
+    if (!validProfileId(profile.author_id)) return actions;
     const label = element("label", "check-row");
     const checkbox = element("input", "");
     checkbox.type = "checkbox";
     checkbox.checked = selectedProfiles.has(Number(profile.author_id));
     checkbox.addEventListener("change", () => {
       const id = Number(profile.author_id);
+      if (!validProfileId(id)) return;
       if (checkbox.checked) selectedProfiles.add(id);
       else selectedProfiles.delete(id);
       saveInteractiveState();
@@ -1133,7 +1170,7 @@
     if (latest) identity.append(element("span", "psl-badge", `PSL ${scoreText(latest.raw_psl_min)}–${scoreText(latest.raw_psl_max)}`));
     heading.append(identity);
     root.append(heading);
-    if (interactiveEnabled) {
+    if (interactiveEnabled && validProfileId(authorId)) {
       const actions = element("div", "detail-actions");
       const analyze = element("button", "primary-action", "Анализировать профиль");
       analyze.type = "button";

@@ -311,10 +311,10 @@ class HoardApp(App[None]):
             return
         self.push_screen(
             ConfirmDialog(
-                "Подтвердить взрослого и внешний запрос?",
-                "Я подтверждаю 18+ по сведениям вне изображения. Фото будут отправлены "
+                "Отправить фотографии в DeepSeek?",
+                "Возрастной допуск 18+ применяется автоматически. Фото будут отправлены "
                 "DeepSeek; запрос может быть платным, автоматического повтора не будет.",
-                confirm_label="18+ · отправить",
+                confirm_label="Отправить",
             ),
             lambda confirmed: self.run_worker(
                 self._start_legacy_telegram_analysis(author_id, values), exit_on_error=False
@@ -351,6 +351,7 @@ class HoardApp(App[None]):
     ) -> None:
         if not choices:
             return
+        operation_id = uuid.uuid4().hex
         self.push_screen(
             ConfirmDialog(
                 "Отправить фотографии в DeepSeek?",
@@ -361,7 +362,7 @@ class HoardApp(App[None]):
                 confirm_label="Отправить",
             ),
             lambda confirmed: self.run_worker(
-                self._start_telegram_analysis(selector, choices),
+                self._start_telegram_analysis(selector, choices, operation_id),
                 name="telegram-analysis-start",
                 exit_on_error=False,
             )
@@ -370,7 +371,7 @@ class HoardApp(App[None]):
         )
 
     async def _start_telegram_analysis(
-        self, selector: dict[str, Any], choices: dict[str, Any]
+        self, selector: dict[str, Any], choices: dict[str, Any], operation_id: str
     ) -> None:
         try:
             result = await self.api.ai_call(
@@ -378,7 +379,7 @@ class HoardApp(App[None]):
                 {
                     **selector,
                     **choices,
-                    "operation_id": uuid.uuid4().hex,
+                    "operation_id": operation_id,
                     "external_confirmed": True,
                 },
             )

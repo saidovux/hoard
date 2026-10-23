@@ -1,4 +1,4 @@
-# Hoard 0.7.0
+# Hoard 0.7.1
 
 Hoard is a local-first Linux and Windows archive for Telegram posts, profiles and video notes
 found in a channel post's comments. It uses Telethon, SQLite, an autonomous offline HTML catalog
@@ -212,9 +212,9 @@ driving Hoard. The server never listens on a LAN address and expires after inact
 
 Interactive mode adds contextual actions to saved publications and profiles. It can analyze one
 profile, selected profiles, or every locally linked profile of a saved publication. Before any
-provider request it shows a local preview, lets the user choose one profile's photos, requires a
-profile-specific 18+ confirmation based on information outside the images, and separately
-confirms external DeepSeek transmission. Unknown post links do not start Telegram collection.
+provider request it shows a local preview, lets the user choose one profile's photos, applies the
+configured automatic 18+ admission to local user profiles, and separately confirms external
+DeepSeek transmission. Unknown post links do not start Telegram collection.
 Progress shows queued, completed, skipped and failed profiles, each skip reason and an estimated
 USD cost when a matching user tariff exists. Otherwise cost is explicitly unknown. Finished
 results refresh automatically without a manual HTML rebuild.
@@ -316,10 +316,10 @@ the complete `tg_profile_sources` relation and defaults to the four newest avail
 per profile; it never downloads a new photo or expands Telegram collection for AI. A single
 profile still allows manual photo choice without typing IDs.
 
-Before queueing, the preview requires a separate 18+ confirmation for every profile based on
-information outside the image and then confirms transmission to DeepSeek. Unconfirmed profiles,
-missing/corrupt photos and over-limit selections are retained in a small durable batch as skipped
-with an explicit reason. Repeating one batch operation ID returns the original paid attempts.
+Before queueing, local user profiles receive automatic 18+ admission and the UI confirms
+transmission to DeepSeek. Channels/chats, missing or changed photos and over-limit selections are
+retained in a small durable batch as skipped with an explicit reason. Repeating one logical action
+returns the original paid attempts.
 
 The PSL result is a subjective, non-scientific visual estimate, not a fact or measurement. The
 versioned JSON contract stores `presentation`, approximate `estimated_age`, `raw_psl_min`,

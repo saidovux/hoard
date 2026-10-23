@@ -1108,7 +1108,7 @@ async def test_telegram_ai_requires_visible_adult_and_external_confirmation():
 
 
 @pytest.mark.asyncio
-async def test_minimal_telegram_analysis_picker_uses_default_photos_and_per_profile_adult():
+async def test_minimal_telegram_analysis_picker_uses_default_photos_and_one_operation_id():
     status = status_fixture()
     status["profiles"] = [
         {
@@ -1132,8 +1132,8 @@ async def test_minimal_telegram_analysis_picker_uses_default_photos_and_per_prof
             "preview": {
                 "selected_count": 1,
                 "photo_count": 1,
-                "ready_count": 0,
-                "skipped_count": 1,
+                "ready_count": 1,
+                "skipped_count": 0,
                 "items": [
                     {
                         "author_id": 99,
@@ -1149,12 +1149,28 @@ async def test_minimal_telegram_analysis_picker_uses_default_photos_and_per_prof
                             }
                         ],
                         "selected_photo_ids": ["photo-1"],
-                        "reason": "Совершеннолетие не подтверждено",
+                        "photo_snapshot": "snapshot-1",
+                        "reason": "",
                         "previous": None,
                     }
                 ],
             }
         },
+    )
+    api.queue(
+        "ai_telegram_batch_start",
+        {
+            "batch": {
+                "id": "batch-1",
+                "selected_count": 1,
+                "queued": 1,
+                "skipped": 0,
+            }
+        },
+    )
+    api.queue(
+        "ai_telegram_batch_get",
+        {"batch": {"id": "batch-1", "terminal": True, "completed": 1}},
     )
     app = HoardApp(api)
     async with app.run_test(size=(100, 32)) as pilot:
@@ -1165,14 +1181,23 @@ async def test_minimal_telegram_analysis_picker_uses_default_photos_and_per_prof
         await pilot.click("#telegram-ai")
         await wait_for_condition(pilot, lambda: isinstance(app.screen, TelegramAnalysisDialog))
         photos = app.screen.query_one("#analysis-photos", SelectionList)
-        adults = app.screen.query_one("#analysis-adults", SelectionList)
         assert photos.selected == ["photo-1"]
-        adults.select(99)
         app.screen.query_one("#analysis-submit").press()
         await wait_for_condition(pilot, lambda: isinstance(app.screen, ConfirmDialog))
         message = str(app.screen.query_one(".dialog-message", Static).content)
         assert "локальные фотографии" in message
         assert "DeepSeek" in message
+        app.screen.query_one("#confirm").press()
+        await wait_for_condition(
+            pilot, lambda: any(name == "ai_telegram_batch_start" for name, _ in api.calls)
+        )
+        start_args = next(
+            args for name, args in api.calls if name == "ai_telegram_batch_start"
+        )
+        assert len(start_args["operation_id"]) == 32
+        assert start_args["photo_ids"] == {"99": ["photo-1"]}
+        assert start_args["photo_snapshots"] == {"99": "snapshot-1"}
+        assert "confirmed_author_ids" not in start_args
 
 
 def test_cli_module_keeps_textual_lazy_for_noninteractive_commands():

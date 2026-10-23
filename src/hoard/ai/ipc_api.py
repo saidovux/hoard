@@ -216,7 +216,7 @@ class AIIPC:
                 photo_ids=raw_photos,
                 content=args.get("content"),
                 operation_id=args.get("operation_id"),
-                adult_confirmed=args.get("adult_confirmed"),
+                adult_confirmed=True,
                 prompt_id=args.get("prompt_id"),
                 prompt_version_id=args.get("prompt_version_id"),
                 provider=args.get("provider"),
@@ -234,7 +234,7 @@ class AIIPC:
                 raise ValueError("Подтверди отправку выбранных фото внешнему AI-провайдеру")
             if not self.chats.core.is_configured("deepseek"):
                 raise ValueError("DeepSeek не подключён; сначала добавь API-ключ")
-            batch = self.chats.queue_telegram_psl_batch(args)
+            batch = await self.chats.queue_telegram_psl_batch(args)
             self.runner.wakeup()
             return {"batch": batch, "message": "Группа Telegram AI поставлена в очередь"}
         if method == "ai_telegram_batch_get":

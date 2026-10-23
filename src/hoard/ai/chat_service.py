@@ -6,6 +6,7 @@ import hashlib
 import json
 from typing import Any
 
+from .config import DEFAULT_DEEPSEEK_MODEL
 from .errors import AIConnectionError, AIError, AIResponseError
 from .executor import AICore
 from .models import AIImage, AIMessage, AIRequest, AIResponse, AIUsage
@@ -199,7 +200,7 @@ class AIChatService:
         if selected_author <= 0:
             raise ValueError("Нужен корректный Telegram ID")
         if adult_confirmed is not True:
-            raise ValueError("Перед запросом явно подтверди, что человеку исполнилось 18 лет")
+            raise ValueError("Для локального пользовательского профиля требуется допуск 18+")
         operation = str(operation_id or "").strip()
         if not operation or len(operation.encode("utf-8")) > 200:
             raise ValueError("operation_id обязателен и не должен превышать 200 байт")
@@ -212,6 +213,10 @@ class AIChatService:
         photos = self.telegram_storage.selected_profile_photos(selected_author, photo_ids)
         if sum(int(item.get("size") or 0) for item in photos) > MAX_MESSAGE_ATTACHMENT_BYTES:
             raise ValueError("Общий размер выбранных фото превышает 24 MiB")
+        fingerprints, _snapshot = self._photo_fingerprints(photos)
+        inflight = self.storage.inflight_telegram_analysis(selected_author, fingerprints)
+        if inflight is not None:
+            return inflight
 
         version_id = str(prompt_version_id or "").strip()
         if version_id:
@@ -229,7 +234,9 @@ class AIChatService:
             raise ValueError("Для Telegram AI нужен промпт области telegram")
 
         selected_provider = str(provider or prompt.get("provider") or "deepseek").strip()
-        selected_model = str(model or prompt.get("model") or "deepseek-chat").strip()
+        selected_model = str(
+            model or prompt.get("model") or DEFAULT_DEEPSEEK_MODEL
+        ).strip()
         if not selected_provider or not selected_model:
             raise ValueError("Укажи провайдера и модель")
         config = {
@@ -370,22 +377,48 @@ class AIChatService:
             raise
 
     @staticmethod
-    def _author_ids(value: Any) -> list[int]:
+    def _author_ids(value: Any, *, field: str = "author_ids") -> list[int]:
         if not isinstance(value, list):
-            raise ValueError("author_ids должен быть списком локальных Telegram ID")
+            raise ValueError(f"{field} должен быть списком локальных Telegram ID")
         result: list[int] = []
         seen: set[int] = set()
         for raw in value:
+            if isinstance(raw, bool) or not isinstance(raw, (int, str)):
+                raise ValueError(f"{field} содержит некорректный Telegram ID")
             try:
                 author_id = int(raw)
             except (TypeError, ValueError) as exc:
-                raise ValueError("author_ids содержит некорректный Telegram ID") from exc
-            if author_id <= 0:
-                raise ValueError("author_ids содержит некорректный Telegram ID")
+                raise ValueError(f"{field} содержит некорректный Telegram ID") from exc
+            if author_id == 0 or (isinstance(raw, str) and str(author_id) != raw.strip()):
+                raise ValueError(f"{field} содержит некорректный Telegram ID")
             if author_id not in seen:
                 seen.add(author_id)
                 result.append(author_id)
         return result
+
+    @staticmethod
+    def _photo_fingerprints(
+        photos: list[dict[str, Any]],
+    ) -> tuple[list[tuple[str, int]], str]:
+        """Hash the exact ordered local files selected for one paid request."""
+        selection = hashlib.sha256()
+        fingerprints: list[tuple[str, int]] = []
+        for photo in photos:
+            path = str(photo.get("file_path") or "")
+            digest = hashlib.sha256()
+            with open(path, "rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            value = digest.hexdigest()
+            size = int(photo.get("size") or 0)
+            fingerprints.append((value, size))
+            selection.update(str(photo["photo_id"]).encode("utf-8"))
+            selection.update(b"\0")
+            selection.update(str(size).encode("ascii"))
+            selection.update(b"\0")
+            selection.update(value.encode("ascii"))
+            selection.update(b"\0")
+        return fingerprints, selection.hexdigest()
 
     def _telegram_psl_candidates(
         self,
@@ -394,6 +427,7 @@ class AIChatService:
         source_id: Any = None,
         source_url: Any = None,
         photo_ids: Any = None,
+        photo_snapshots: Any = None,
         confirmed_author_ids: Any = None,
     ) -> tuple[list[dict[str, Any]], int | None]:
         """Resolve and validate an entirely local selection without provider calls."""
@@ -410,10 +444,27 @@ class AIChatService:
             identifiers = self.telegram_storage.source_profiles(selected_source)
         else:
             identifiers = self._author_ids(author_ids)
-        confirmed = set(self._author_ids(confirmed_author_ids or []))
         raw_photo_map = photo_ids if isinstance(photo_ids, dict) else {}
+        raw_snapshot_map = photo_snapshots if isinstance(photo_snapshots, dict) else {}
         candidates: list[dict[str, Any]] = []
         for author_id in identifiers:
+            if author_id <= 0:
+                candidates.append(
+                    {
+                        "author_id": author_id,
+                        "display_name": "",
+                        "username": "",
+                        "photos": [],
+                        "selected_photo_ids": [],
+                        "photo_snapshot": "",
+                        "photo_count": 0,
+                        "adult_confirmed": False,
+                        "ready": False,
+                        "reason": "Это канал или чат, а не профиль человека",
+                        "previous": None,
+                    }
+                )
+                continue
             try:
                 profile = self.telegram_storage.get_profile(author_id)
             except ValueError:
@@ -426,15 +477,22 @@ class AIChatService:
                         "photos": [],
                         "selected_photo_ids": [],
                         "photo_count": 0,
-                        "adult_confirmed": author_id in confirmed,
+                        "photo_snapshot": "",
+                        "adult_confirmed": True,
                         "ready": False,
                         "reason": "Профиль не найден в локальном архиве",
                         "previous": None,
                     }
                 )
                 continue
-            available = [item for item in profile.get("photos", []) if item.get("available")]
+            stored_photos = self.telegram_storage.profile_photos(
+                author_id, include_path=True
+            )
+            available = [item for item in stored_photos if item.get("available")]
             requested = raw_photo_map.get(str(author_id), raw_photo_map.get(author_id))
+            expected_snapshot = str(
+                raw_snapshot_map.get(str(author_id), raw_snapshot_map.get(author_id, "")) or ""
+            )
             reason = ""
             selected: list[dict[str, Any]] = []
             if requested is not None:
@@ -446,7 +504,11 @@ class AIChatService:
                             author_id, requested
                         )
                     except ValueError as exc:
-                        reason = str(exc)
+                        reason = (
+                            "Фото изменились после предпросмотра"
+                            if expected_snapshot
+                            else str(exc)
+                        )
             else:
                 selected = available[:MAX_MESSAGE_ATTACHMENTS]
             if not selected and not reason:
@@ -456,9 +518,22 @@ class AIChatService:
             ):
                 selected = []
                 reason = "Фотографии превышают лимит 24 MiB на запрос"
-            adult_confirmed = author_id in confirmed
-            if selected and not adult_confirmed and not reason:
-                reason = "Совершеннолетие не подтверждено сведениями вне фотографии"
+            snapshot = ""
+            if selected and not reason:
+                try:
+                    _fingerprints, snapshot = self._photo_fingerprints(selected)
+                except OSError:
+                    selected = []
+                    reason = (
+                        "Фото изменились после предпросмотра"
+                        if expected_snapshot
+                        else "Локальные фотографии недоступны"
+                    )
+                if expected_snapshot and snapshot != expected_snapshot:
+                    selected = []
+                    snapshot = ""
+                    reason = "Фото изменились после предпросмотра"
+            adult_confirmed = True
             previous_page = self.storage.list_telegram_analyses(
                 author_id=author_id, successful_only=False, limit=1, offset=0
             )
@@ -478,6 +553,7 @@ class AIChatService:
                     "username": str(profile.get("current_username") or ""),
                     "photos": photos,
                     "selected_photo_ids": [str(item["photo_id"]) for item in selected],
+                    "photo_snapshot": snapshot,
                     "photo_count": len(available),
                     "adult_confirmed": adult_confirmed,
                     "ready": bool(selected and adult_confirmed and not reason),
@@ -493,6 +569,7 @@ class AIChatService:
             source_id=values.get("source_id"),
             source_url=values.get("source_url"),
             photo_ids=values.get("photo_ids"),
+            photo_snapshots=values.get("photo_snapshots"),
             confirmed_author_ids=values.get("confirmed_author_ids"),
         )
         if not candidates:
@@ -521,19 +598,21 @@ class AIChatService:
             "external_request_made": False,
         }
 
-    def queue_telegram_psl_batch(self, values: dict[str, Any]) -> dict[str, Any]:
+    async def queue_telegram_psl_batch(self, values: dict[str, Any]) -> dict[str, Any]:
         operation = str(values.get("operation_id") or "").strip()
         if not operation or len(operation.encode("utf-8")) > 120:
             raise ValueError("operation_id обязателен и не должен превышать 120 байт")
         operation_key = f"telegram.psl.batch:{operation}"
         existing = self.storage.telegram_batch_by_operation(operation_key)
         if existing is not None:
-            return existing
+            await self.resume_telegram_psl_batch(str(existing["id"]))
+            return self.storage.telegram_batch(str(existing["id"]))
         candidates, selected_source = self._telegram_psl_candidates(
             author_ids=values.get("author_ids"),
             source_id=values.get("source_id"),
             source_url=values.get("source_url"),
             photo_ids=values.get("photo_ids"),
+            photo_snapshots=values.get("photo_snapshots"),
             confirmed_author_ids=values.get("confirmed_author_ids"),
         )
         if not candidates:
@@ -544,6 +623,8 @@ class AIChatService:
                 "state": "pending" if item["ready"] else "skipped",
                 "reason": "" if item["ready"] else item["reason"],
                 "photo_count": len(item["selected_photo_ids"]),
+                "photo_ids": item["selected_photo_ids"],
+                "photo_snapshot": item["photo_snapshot"],
             }
             for item in candidates
         ]
@@ -552,34 +633,75 @@ class AIChatService:
             source_id=selected_source,
             selected_count=len(candidates),
             items=items,
+            request_payload={
+                "operation_id": operation,
+                "content": str(values.get("content") or ""),
+                "prompt_id": values.get("prompt_id"),
+                "prompt_version_id": values.get("prompt_version_id"),
+                "provider": values.get("provider"),
+                "model": values.get("model"),
+            },
         )
-        content = str(values.get("content") or "").strip() or (
+        await self.resume_telegram_psl_batch(str(batch["id"]))
+        return self.storage.telegram_batch(str(batch["id"]))
+
+    async def resume_telegram_psl_batch(self, batch_id: str) -> dict[str, Any]:
+        """Resume durable pending items without duplicating paid attempts."""
+        request = self.storage.telegram_batch_request(batch_id)
+        operation = str(request.get("operation_id") or "").strip()
+        if not operation:
+            # Compatibility for a batch written by 0.7.0 before request payloads existed.
+            batch = self.storage.telegram_batch(batch_id)
+            operation = str(batch["operation_key"]).removeprefix("telegram.psl.batch:")
+        content = str(request.get("content") or "").strip() or (
             "Analyze these explicitly selected local images using the PSL contract."
         )
-        for item in candidates:
-            if not item["ready"]:
+        for item in self.storage.pending_telegram_batch_items(batch_id):
+            await asyncio.sleep(0)
+            photo_ids = list(item.get("photo_ids") or [])
+            candidate_args: dict[str, Any] = {
+                "author_ids": [int(item["author_id"])],
+            }
+            if photo_ids:
+                candidate_args["photo_ids"] = {str(item["author_id"]): photo_ids}
+                candidate_args["photo_snapshots"] = {
+                    str(item["author_id"]): str(item.get("photo_snapshot") or "")
+                }
+            candidates, _source = self._telegram_psl_candidates(**candidate_args)
+            candidate = candidates[0]
+            if not candidate["ready"]:
+                self.storage.skip_telegram_batch_item(
+                    batch_id, int(item["author_id"]), str(candidate["reason"])
+                )
                 continue
+            photo_ids = list(candidate["selected_photo_ids"])
             try:
                 analysis = self.queue_telegram_psl(
                     author_id=item["author_id"],
-                    photo_ids=item["selected_photo_ids"],
+                    photo_ids=photo_ids,
                     content=content,
                     operation_id=f"batch:{operation}:{item['author_id']}",
                     adult_confirmed=True,
-                    prompt_id=values.get("prompt_id"),
-                    prompt_version_id=values.get("prompt_version_id"),
-                    provider=values.get("provider"),
-                    model=values.get("model"),
+                    prompt_id=request.get("prompt_id"),
+                    prompt_version_id=request.get("prompt_version_id"),
+                    provider=request.get("provider"),
+                    model=request.get("model"),
                 )
             except Exception as exc:
                 self.storage.fail_telegram_batch_item(
-                    str(batch["id"]), item["author_id"], str(exc) or type(exc).__name__
+                    batch_id,
+                    int(item["author_id"]),
+                    f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__,
                 )
             else:
                 self.storage.link_telegram_batch_analysis(
-                    str(batch["id"]), item["author_id"], str(analysis["id"])
+                    batch_id, int(item["author_id"]), str(analysis["id"])
                 )
-        return self.storage.telegram_batch(str(batch["id"]))
+        return self.storage.telegram_batch(batch_id)
+
+    async def resume_pending_telegram_batches(self) -> None:
+        for batch_id in self.storage.pending_telegram_batches():
+            await self.resume_telegram_psl_batch(batch_id)
 
     def _selected_memory(self, chat: dict, memory_ids: list[Any]) -> list[dict]:
         identifiers = [str(item) for item in memory_ids]
@@ -613,6 +735,7 @@ class AIChatService:
         attempt = self.storage.attempt(attempt_id)
         config = attempt["request_config"]
         messages: list[AIMessage] = []
+        prompt_instructions = ""
         if attempt.get("prompt_version_id"):
             row = self.storage.db.execute(
                 "SELECT instructions FROM ai_prompt_versions WHERE id=?",
@@ -620,8 +743,12 @@ class AIChatService:
             ).fetchone()
             if row is None:
                 raise ValueError("Снимок промпта не найден")
-            messages.append(AIMessage("system", str(row["instructions"])))
-        if attempt.get("entity_kind") == "telegram.psl":
+            prompt_instructions = str(row["instructions"])
+            messages.append(AIMessage("system", prompt_instructions))
+        if (
+            attempt.get("entity_kind") == "telegram.psl"
+            and prompt_instructions != DEFAULT_PSL_INSTRUCTIONS
+        ):
             messages.append(AIMessage("system", DEFAULT_PSL_INSTRUCTIONS))
 
         memory_rows = list(

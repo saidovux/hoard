@@ -245,12 +245,21 @@ class ArchiveScreen(WorkspaceScreen):
 
     def _open_telegram_ai(self) -> None:
         author_id = self._selected_profile_id()
-        if author_id is not None:
+        if author_id is not None and author_id > 0:
             self.hoard_app.open_telegram_analysis({"author_ids": [author_id]})
+        elif author_id is not None:
+            self.hoard_app.set_notice(
+                "Каналы и чаты нельзя анализировать как профиль человека.", error=True
+            )
 
     def _toggle_profile_selection(self) -> None:
         author_id = self._selected_profile_id()
         if author_id is None:
+            return
+        if author_id <= 0:
+            self.hoard_app.set_notice(
+                "Каналы и чаты нельзя выбирать для анализа профиля.", error=True
+            )
             return
         if author_id in self._selected_profiles:
             self._selected_profiles.remove(author_id)

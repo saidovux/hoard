@@ -656,8 +656,36 @@ def test_ai_schema_is_idempotent_and_preserves_existing_telegram_rows(tmp_path):
     ] == "value"
     assert second.db.execute(
         "SELECT version FROM schema_versions WHERE module='ai'"
-    ).fetchone()[0] == 3
+    ).fetchone()[0] == 4
     second.close()
+
+
+def test_user_edited_psl_prompt_survives_store_reopen(tmp_path):
+    filename = tmp_path / "edited-psl.sqlite3"
+    first = Store(filename)
+    prompt = first.ai.ensure_psl_prompt()
+    edited = first.ai.update_prompt(
+        prompt["id"],
+        {
+            "instructions": "My deliberately edited PSL instructions.",
+            "provider": "deepseek",
+            "model": "deepseek-flash",
+            "response_format": "json",
+            "json_schema": prompt["current_version"]["json_schema"],
+        },
+    )
+    edited_version = edited["current_version"]["id"]
+    with first.db:
+        first.db.execute(
+            "DELETE FROM tg_settings WHERE key='ai_psl_builtin_instructions_sha256'"
+        )
+    first.close()
+
+    reopened = Store(filename)
+    current = reopened.ai.get_prompt(prompt["id"])["current_version"]
+    assert current["id"] == edited_version
+    assert current["instructions"] == "My deliberately edited PSL instructions."
+    reopened.close()
 
 
 def test_migration_adds_ai_schema_to_minimal_legacy_database(tmp_path):

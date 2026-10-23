@@ -299,8 +299,9 @@ The 0.7 selection contract accepts either stable local `author_id` values or one
 `source_id`/post URL. Source links are resolved against `sources` and the complete
 `tg_profile_sources` relation; unknown links fail without scheduling Telegram work. Preview
 revalidates local files, defaults to four newest photos, reports prior analysis and makes no
-provider call. Start requires per-profile adult confirmation plus external-provider confirmation,
-then delegates every eligible item to the existing `queue_telegram_psl()`. A durable batch only
+provider call. Local user profiles receive automatic 18+ admission while channels/chats remain
+ineligible; start still requires external-provider confirmation and then delegates every eligible
+item to the existing `queue_telegram_psl()`. A durable batch only
 groups those attempts and skipped reasons; it is not a second runner or retry system.
 
 ## Current scope

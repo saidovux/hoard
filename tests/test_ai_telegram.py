@@ -119,16 +119,18 @@ async def start_analysis(service, **overrides):
     return (await service.handle("ai_telegram_psl_start", values))["analysis"]
 
 
-async def test_telegram_ai_requires_both_confirmations_and_ownership(tmp_path):
+async def test_telegram_ai_automatically_admits_adult_and_requires_external_confirmation(tmp_path):
     service, store, _photo = telegram_service(tmp_path, SequenceProvider(psl_response()))
-    with pytest.raises(ValueError, match="18"):
-        await start_analysis(service, adult_confirmed=False)
+    analysis = await start_analysis(service, adult_confirmed=False)
+    assert analysis["adult_confirmed"] == 1
     with pytest.raises(ValueError, match="внешнему"):
-        await start_analysis(service, external_confirmed=False)
+        await start_analysis(
+            service, operation_id="external-not-confirmed", external_confirmed=False
+        )
     with pytest.raises(ValueError, match="не принадлежит"):
-        await start_analysis(service, photo_ids=["second"])
-    assert store.db.execute("SELECT COUNT(*) FROM ai_telegram_analyses").fetchone()[0] == 0
-    assert store.db.execute("SELECT COUNT(*) FROM jobs WHERE kind='ai.chat'").fetchone()[0] == 0
+        await start_analysis(service, operation_id="wrong-photo", photo_ids=["second"])
+    assert store.db.execute("SELECT COUNT(*) FROM ai_telegram_analyses").fetchone()[0] == 1
+    assert store.db.execute("SELECT COUNT(*) FROM jobs WHERE kind='ai.chat'").fetchone()[0] == 1
     store.close()
 
 

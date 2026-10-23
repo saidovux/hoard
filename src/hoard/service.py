@@ -263,6 +263,7 @@ class Service:
         if not self.ai_runner.running:
             self.ai_service.register_interrupted_legacy_attempts()
             self.store.ai.recover_interrupted_attempts()
+            await self.ai_service.resume_pending_telegram_batches()
         await self.ai_runner.start()
 
     async def stop_background(self) -> None:

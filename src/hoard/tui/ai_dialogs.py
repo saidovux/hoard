@@ -11,6 +11,8 @@ from textual.containers import Horizontal, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Button, Input, Label, Select, SelectionList, Static, TextArea
 
+from ..ai.config import DEFAULT_DEEPSEEK_MODEL
+
 
 class AIRecordDialog(ModalScreen[dict[str, Any] | None]):
     """Edit a chat, prompt, memory entry, tariff, or private provider config."""
@@ -63,7 +65,9 @@ class AIRecordDialog(ModalScreen[dict[str, Any] | None]):
         yield from self._input(
             "Провайдер", "record-provider", self.current.get("provider", "deepseek")
         )
-        yield from self._input("Модель", "record-model", self.current.get("model", "deepseek-chat"))
+        yield from self._input(
+            "Модель", "record-model", self.current.get("model", DEFAULT_DEEPSEEK_MODEL)
+        )
         options = [("Без промпта", "")]
         options.extend(
             (
@@ -91,7 +95,9 @@ class AIRecordDialog(ModalScreen[dict[str, Any] | None]):
             id="record-scope",
         )
         yield from self._input("Провайдер", "record-provider", version.get("provider", "deepseek"))
-        yield from self._input("Модель", "record-model", version.get("model", "deepseek-chat"))
+        yield from self._input(
+            "Модель", "record-model", version.get("model", DEFAULT_DEEPSEEK_MODEL)
+        )
         yield Label("Формат ответа", classes="field-label")
         yield Select(
             [("Текст", "text"), ("JSON", "json")],
@@ -122,7 +128,7 @@ class AIRecordDialog(ModalScreen[dict[str, Any] | None]):
 
     def _price_fields(self):
         yield from self._input("Провайдер", "record-provider", "deepseek")
-        yield from self._input("Модель", "record-model", "deepseek-chat")
+        yield from self._input("Модель", "record-model", DEFAULT_DEEPSEEK_MODEL)
         yield from self._input("Валюта", "record-currency", "USD")
         yield from self._input("Cache hit / 1M", "record-hit")
         yield from self._input("Cache miss / 1M", "record-miss")
@@ -132,7 +138,7 @@ class AIRecordDialog(ModalScreen[dict[str, Any] | None]):
     def _config_fields(self):
         yield from self._input("Новый API-ключ", "record-key", "", password=True)
         yield from self._input(
-            "Модель", "record-model", self.current.get("model", "deepseek-flash")
+            "Модель", "record-model", self.current.get("model", DEFAULT_DEEPSEEK_MODEL)
         )
         yield from self._input("Таймаут, сек", "record-timeout", self.current.get("timeout", 120))
 
@@ -251,7 +257,7 @@ class TelegramAIDialog(ModalScreen[dict[str, Any] | None]):
                 "Оцени выбранные изображения по PSL-контракту.",
                 id="telegram-ai-content",
             )
-            yield Input(value="deepseek-chat", id="telegram-ai-model")
+            yield Input(value=DEFAULT_DEEPSEEK_MODEL, id="telegram-ai-model")
             previous = self.analyses[0] if self.analyses else None
             previous_text = "Предыдущих анализов нет"
             if previous:
@@ -362,7 +368,7 @@ class AIKeyDialog(ModalScreen[str | None]):
 
 
 class TelegramAnalysisDialog(ModalScreen[dict[str, Any] | None]):
-    """Confirm profile-specific adulthood and optional single-profile photos."""
+    """Review exact local photos before an explicit external request."""
 
     BINDINGS = [Binding("escape", "cancel", "Отмена")]
 
@@ -433,17 +439,10 @@ class TelegramAnalysisDialog(ModalScreen[dict[str, Any] | None]):
                         f"–{raw_max if raw_max is not None else '—'}",
                         classes="table-help",
                     )
-            yield Label(
-                "Подтверди 18+ отдельно для каждого профиля по сведениям вне фотографии",
-                classes="field-label",
+            yield Static(
+                "Возрастной допуск для локальных пользовательских профилей: 18+ автоматически.",
+                classes="table-help",
             )
-            adult_options = [
-                (self._profile_label(item), int(item["author_id"]), False)
-                for item in self.items
-                if item.get("selected_photo_ids")
-            ]
-            if adult_options:
-                yield SelectionList(*adult_options, id="analysis-adults")
             skipped = [item for item in self.items if not item.get("selected_photo_ids")]
             if skipped:
                 lines = [
@@ -466,24 +465,35 @@ class TelegramAnalysisDialog(ModalScreen[dict[str, Any] | None]):
         if event.button.id == "analysis-cancel":
             self.dismiss(None)
             return
-        adults = self.query_one("#analysis-adults", SelectionList).selected \
-            if self.query("#analysis-adults") else []
-        if not adults:
-            self.query_one("#analysis-error", Static).update(
-                "Подтверди 18+ хотя бы для одного подходящего профиля."
-            )
-            return
-        photo_ids: dict[str, list[str]] = {}
+        photo_ids = {
+            str(item["author_id"]): [str(photo) for photo in item.get("selected_photo_ids") or []]
+            for item in self.items
+            if item.get("selected_photo_ids") and int(item["author_id"]) > 0
+        }
+        photo_snapshots = {
+            str(item["author_id"]): str(item["photo_snapshot"])
+            for item in self.items
+            if item.get("photo_snapshot") and int(item["author_id"]) > 0
+        }
         if self.single and self.items and self.query("#analysis-photos"):
             photos = list(self.query_one("#analysis-photos", SelectionList).selected)
             if not 1 <= len(photos) <= 4:
                 self.query_one("#analysis-error", Static).update("Выбери от 1 до 4 фото.")
                 return
             photo_ids[str(self.items[0]["author_id"])] = [str(item) for item in photos]
+            if photo_ids[str(self.items[0]["author_id"])] != list(
+                self.items[0].get("selected_photo_ids") or []
+            ):
+                photo_snapshots.pop(str(self.items[0]["author_id"]), None)
+        if not photo_ids:
+            self.query_one("#analysis-error", Static).update(
+                "Нет подходящих локальных пользовательских профилей с фотографиями."
+            )
+            return
         self.dismiss(
             {
-                "confirmed_author_ids": [int(item) for item in adults],
                 "photo_ids": photo_ids,
+                "photo_snapshots": photo_snapshots,
             }
         )
 

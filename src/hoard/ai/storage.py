@@ -10,11 +10,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from .config import DEFAULT_DEEPSEEK_MODEL
 from .models import AIImage, AIUsage
 from .pricing import CostEstimate, decimal_text
 from .psl import DEFAULT_PSL_INSTRUCTIONS, PSL_JSON_SCHEMA
 
-AI_SCHEMA_VERSION = 3
+AI_SCHEMA_VERSION = 4
 MAX_TEXT_BYTES = 32 * 1024
 MAX_NAME_BYTES = 300
 MAX_PAGE = 100
@@ -282,6 +283,7 @@ class AIStorage:
                 operation_key TEXT NOT NULL UNIQUE,
                 source_id INTEGER,
                 selected_count INTEGER NOT NULL,
+                request_payload TEXT NOT NULL DEFAULT '{}',
                 created_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS ai_telegram_batch_items (
@@ -291,6 +293,9 @@ class AIStorage:
                 state TEXT NOT NULL CHECK(state IN ('pending','queued','skipped')),
                 reason TEXT NOT NULL DEFAULT '',
                 photo_count INTEGER NOT NULL DEFAULT 0,
+                photo_ids TEXT NOT NULL DEFAULT '[]',
+                photo_snapshot TEXT NOT NULL DEFAULT '',
+                technical_failed INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY(batch_id, author_id)
             );
             CREATE INDEX IF NOT EXISTS ai_prompts_scope_idx
@@ -324,6 +329,34 @@ class AIStorage:
         if "internal" not in chat_columns:
             self.db.execute(
                 "ALTER TABLE ai_chats ADD COLUMN internal INTEGER NOT NULL DEFAULT 0"
+            )
+        batch_columns = {
+            str(row["name"])
+            for row in self.db.execute("PRAGMA table_info(ai_telegram_batches)")
+        }
+        if "request_payload" not in batch_columns:
+            self.db.execute(
+                """ALTER TABLE ai_telegram_batches
+                ADD COLUMN request_payload TEXT NOT NULL DEFAULT '{}'"""
+            )
+        item_columns = {
+            str(row["name"])
+            for row in self.db.execute("PRAGMA table_info(ai_telegram_batch_items)")
+        }
+        if "photo_ids" not in item_columns:
+            self.db.execute(
+                """ALTER TABLE ai_telegram_batch_items
+                ADD COLUMN photo_ids TEXT NOT NULL DEFAULT '[]'"""
+            )
+        if "photo_snapshot" not in item_columns:
+            self.db.execute(
+                """ALTER TABLE ai_telegram_batch_items
+                ADD COLUMN photo_snapshot TEXT NOT NULL DEFAULT ''"""
+            )
+        if "technical_failed" not in item_columns:
+            self.db.execute(
+                """ALTER TABLE ai_telegram_batch_items
+                ADD COLUMN technical_failed INTEGER NOT NULL DEFAULT 0"""
             )
         self.db.execute(
             """INSERT INTO schema_versions(module,version) VALUES('ai',?)
@@ -378,6 +411,11 @@ class AIStorage:
 
     def ensure_psl_prompt(self) -> dict:
         """Install one editable Telegram prompt while retaining every historical version."""
+        setting_key = "ai_psl_builtin_instructions_sha256"
+        builtin_hash = hashlib.sha256(DEFAULT_PSL_INSTRUCTIONS.encode("utf-8")).hexdigest()
+        installed = self.db.execute(
+            "SELECT value FROM tg_settings WHERE key=?", (setting_key,)
+        ).fetchone()
         row = self.db.execute(
             """SELECT id FROM ai_prompts WHERE scope='telegram' AND name='Telegram PSL'
             AND deleted_at IS NULL ORDER BY created_at LIMIT 1"""
@@ -389,31 +427,53 @@ class AIStorage:
                     "scope": "telegram",
                     "instructions": DEFAULT_PSL_INSTRUCTIONS,
                     "provider": "deepseek",
-                    "model": "deepseek-chat",
+                    "model": DEFAULT_DEEPSEEK_MODEL,
                     "response_format": "json",
                     "json_schema": PSL_JSON_SCHEMA,
                     "temperature": 0,
                     "context_limit": DEFAULT_CONTEXT_CHARS,
                 }
             )
+            with self.db:
+                self.db.execute(
+                    """INSERT INTO tg_settings(key,value) VALUES(?,?)
+                    ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+                    (setting_key, builtin_hash),
+                )
         else:
             prompt = self.get_prompt(str(row["id"]))
-            if not str(prompt["current_version"].get("instructions") or "").startswith(
-                "IMPORTANT: First determine whether"
-            ):
-                # Keep the previous immutable version and install the revised built-in safety
-                # contract as a new version. User-created prompts are not touched.
+            current = str(prompt["current_version"].get("instructions") or "")
+            current_hash = hashlib.sha256(current.encode("utf-8")).hexdigest()
+            if installed is not None and current_hash == str(installed["value"]):
+                # Only an untouched version previously installed by Hoard may be upgraded.
+                # A user-edited version has a different digest and is never overwritten.
+                if current_hash == builtin_hash:
+                    return prompt
                 prompt = self.update_prompt(
                     str(prompt["id"]),
                     {
                         "name": prompt["name"],
                         "instructions": DEFAULT_PSL_INSTRUCTIONS,
                         "provider": prompt["current_version"].get("provider") or "deepseek",
-                        "model": prompt["current_version"].get("model") or "deepseek-chat",
+                        "model": prompt["current_version"].get("model")
+                        or DEFAULT_DEEPSEEK_MODEL,
                         "response_format": "json",
                         "json_schema": PSL_JSON_SCHEMA,
                     },
                 )
+                with self.db:
+                    self.db.execute(
+                        "UPDATE tg_settings SET value=? WHERE key=?",
+                        (builtin_hash, setting_key),
+                    )
+            elif installed is None and current_hash == builtin_hash:
+                # Existing 0.7 databases did not record provenance. Adopt only an exact
+                # match; older or user-edited instructions remain untouched.
+                with self.db:
+                    self.db.execute(
+                        "INSERT INTO tg_settings(key,value) VALUES(?,?)",
+                        (setting_key, builtin_hash),
+                    )
         return prompt
 
     def create_prompt(self, values: dict[str, Any]) -> dict:
@@ -1051,6 +1111,31 @@ class AIStorage:
         ).fetchone()
         return self.telegram_analysis(str(row["id"])) if row else None
 
+    def inflight_telegram_analysis(
+        self, author_id: int, photo_fingerprints: list[tuple[str, int]]
+    ) -> dict | None:
+        """Find the same ordered immutable photo set already queued for one profile."""
+        rows = self.db.execute(
+            """SELECT a.id FROM ai_telegram_analyses a
+            JOIN ai_attempts t ON t.id=a.attempt_id
+            WHERE a.author_id=? AND t.state IN ('queued','running')
+            ORDER BY a.created_at DESC,a.id""",
+            (int(author_id),),
+        )
+        expected = [(str(digest), int(size)) for digest, size in photo_fingerprints]
+        for row in rows:
+            actual = [
+                (str(photo["source_sha256"]), int(photo["size"]))
+                for photo in self.db.execute(
+                    """SELECT source_sha256,size FROM ai_telegram_analysis_photos
+                    WHERE analysis_id=? ORDER BY position""",
+                    (str(row["id"]),),
+                )
+            ]
+            if actual == expected:
+                return self.telegram_analysis(str(row["id"]))
+        return None
+
     def create_telegram_batch(
         self,
         *,
@@ -1058,6 +1143,7 @@ class AIStorage:
         source_id: int | None,
         selected_count: int,
         items: list[dict[str, Any]],
+        request_payload: dict[str, Any],
     ) -> dict[str, Any]:
         existing = self.telegram_batch_by_operation(operation_key)
         if existing is not None:
@@ -1067,19 +1153,30 @@ class AIStorage:
         with self.db:
             self.db.execute(
                 """INSERT INTO ai_telegram_batches(
-                id,operation_key,source_id,selected_count,created_at) VALUES(?,?,?,?,?)""",
-                (batch_id, operation_key, source_id, int(selected_count), timestamp),
+                id,operation_key,source_id,selected_count,request_payload,created_at)
+                VALUES(?,?,?,?,?,?)""",
+                (
+                    batch_id,
+                    operation_key,
+                    source_id,
+                    int(selected_count),
+                    self._json(request_payload),
+                    timestamp,
+                ),
             )
             for item in items:
                 self.db.execute(
                     """INSERT INTO ai_telegram_batch_items(
-                    batch_id,author_id,state,reason,photo_count) VALUES(?,?,?,?,?)""",
+                    batch_id,author_id,state,reason,photo_count,photo_ids,photo_snapshot)
+                    VALUES(?,?,?,?,?,?,?)""",
                     (
                         batch_id,
                         int(item["author_id"]),
                         str(item.get("state") or "pending"),
                         str(item.get("reason") or "")[:500],
                         int(item.get("photo_count") or 0),
+                        self._json(item.get("photo_ids") or []),
+                        str(item.get("photo_snapshot") or ""),
                     ),
                 )
         return self.telegram_batch(batch_id)
@@ -1090,8 +1187,9 @@ class AIStorage:
         with self.db:
             cursor = self.db.execute(
                 """UPDATE ai_telegram_batch_items
-                SET analysis_id=?,state='queued',reason=''
-                WHERE batch_id=? AND author_id=? AND state='pending'""",
+                SET analysis_id=?,state='queued',reason='',technical_failed=0
+                WHERE batch_id=? AND author_id=? AND state='pending'
+                AND technical_failed=0""",
                 (str(analysis_id), str(batch_id), int(author_id)),
             )
             if cursor.rowcount not in {0, 1}:
@@ -1100,10 +1198,50 @@ class AIStorage:
     def fail_telegram_batch_item(self, batch_id: str, author_id: int, reason: str) -> None:
         with self.db:
             self.db.execute(
-                """UPDATE ai_telegram_batch_items SET state='skipped',reason=?
+                """UPDATE ai_telegram_batch_items SET technical_failed=1,reason=?
                 WHERE batch_id=? AND author_id=? AND state='pending'""",
                 (str(reason)[:500], str(batch_id), int(author_id)),
             )
+
+    def skip_telegram_batch_item(self, batch_id: str, author_id: int, reason: str) -> None:
+        with self.db:
+            self.db.execute(
+                """UPDATE ai_telegram_batch_items SET state='skipped',reason=?
+                WHERE batch_id=? AND author_id=? AND state='pending'
+                AND technical_failed=0""",
+                (str(reason)[:500], str(batch_id), int(author_id)),
+            )
+
+    def pending_telegram_batches(self) -> list[str]:
+        return [
+            str(row["id"])
+            for row in self.db.execute(
+                """SELECT DISTINCT b.id FROM ai_telegram_batches b
+                JOIN ai_telegram_batch_items i ON i.batch_id=b.id
+                WHERE i.state='pending' AND i.technical_failed=0 ORDER BY b.created_at,b.id"""
+            )
+        ]
+
+    def pending_telegram_batch_items(self, batch_id: str) -> list[dict[str, Any]]:
+        rows = []
+        for row in self.db.execute(
+            """SELECT author_id,photo_ids,photo_snapshot FROM ai_telegram_batch_items
+            WHERE batch_id=? AND state='pending' AND technical_failed=0 ORDER BY author_id""",
+            (str(batch_id),),
+        ):
+            item = dict(row)
+            item["photo_ids"] = self._decode(item["photo_ids"]) or []
+            rows.append(item)
+        return rows
+
+    def telegram_batch_request(self, batch_id: str) -> dict[str, Any]:
+        row = self.db.execute(
+            "SELECT request_payload FROM ai_telegram_batches WHERE id=?", (str(batch_id),)
+        ).fetchone()
+        if row is None:
+            raise ValueError("Группа Telegram AI не найдена")
+        value = self._decode(str(row["request_payload"]) or "{}")
+        return value if isinstance(value, dict) else {}
 
     def telegram_batch_by_operation(self, operation_key: str) -> dict[str, Any] | None:
         row = self.db.execute(
@@ -1123,7 +1261,8 @@ class AIStorage:
         all_rows = [
             dict(item)
             for item in self.db.execute(
-                """SELECT i.batch_id,i.author_id,i.analysis_id,i.state AS item_state,
+                """SELECT i.batch_id,i.author_id,i.analysis_id,
+                CASE WHEN i.technical_failed=1 THEN 'failed' ELSE i.state END AS item_state,
                 i.reason,i.photo_count,p.display_name,p.current_username,
                 a.result_status,a.presentation,a.estimated_age,a.raw_psl_min,a.raw_psl_max,
                 a.boosted_psl,t.id AS attempt_id,t.state AS attempt_state,t.error_code,
@@ -1160,6 +1299,7 @@ class AIStorage:
                 unknown_cost += 1
         page = all_rows[page_offset : page_offset + page_limit]
         result = dict(row)
+        result.pop("request_payload", None)
         result.update(
             {
                 "items": page,

@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from .. import __version__
+from .config import DEFAULT_DEEPSEEK_MODEL
 from .errors import (
     AIAuthenticationError,
     AIConfigurationError,
@@ -103,7 +104,7 @@ class DeepSeekProvider(AIProvider):
         self,
         api_key: str,
         *,
-        model: str = "deepseek-flash",
+        model: str = DEFAULT_DEEPSEEK_MODEL,
         timeout: float = 120,
         transport: JSONTransport | None = None,
     ) -> None:
