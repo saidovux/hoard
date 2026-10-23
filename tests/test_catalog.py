@@ -690,3 +690,6 @@ def test_frontend_has_independent_list_state_local_history_and_bounded_media():
     assert "external_confirmed: true" in app
     assert "Возрастной допуск 18+ применяется автоматически" in app
     assert "external-confirmed" not in app
+    assert 'photos: "yes"' in app
+    assert 'const defaultView = interactiveEnabled ? "profiles" : "posts"' in app
+    assert "profilePhotos(profile)" in app

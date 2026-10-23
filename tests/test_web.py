@@ -1,13 +1,19 @@
 """Security boundary for the explicit loopback-only browser client."""
 from __future__ import annotations
 
+import base64
 import http.client
 import json
+import shutil
+import subprocess
 import threading
 from pathlib import Path
 
 import pytest
 
+from hoard.catalog import build_catalog
+from hoard.models import Post
+from hoard.storage import Store
 from hoard.web import WebState, create_web_server, run_web
 
 
@@ -220,6 +226,86 @@ def test_web_serves_catalog_media_from_each_explicit_allowed_root(tmp_path):
             server, "GET", "/media/r1/%2e%2e/secret", headers=common
         )
         assert status == 404
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+@pytest.mark.skipif(shutil.which("chromium") is None, reason="Chromium is not installed")
+def test_interactive_web_opens_photo_profiles_and_profile_gallery_in_chromium(tmp_path):
+    archive = tmp_path / "archive"
+    archive.mkdir()
+    store = Store(tmp_path / "hoard.sqlite3")
+    source_id = store.add_source(Post("synthetic_channel", 42), str(archive))
+    store.telegram.observe_profile(
+        author_id=12345,
+        username="photo_user",
+        display_name="Photo User",
+        source_id=source_id,
+    )
+    image = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAFElEQVR42mNk"
+        "+M9QzwAEYBxVSFUAANMCA/2BTpYAAAAASUVORK5CYII="
+    )
+    for index in (1, 2):
+        path = archive / "profile_photos" / f"photo-{index}.png"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(image)
+        store.telegram.record_profile_photo(
+            12345,
+            f"photo-{index}",
+            file_path=str(path),
+            size=len(image),
+            photo_date=f"2026-10-2{index}",
+        )
+    catalog = build_catalog(store, archive_root=archive)
+    roots = tuple(store.telegram.allowed_media_roots(archive))
+    store.close()
+
+    state = WebState(catalog, allowed_media_roots=roots, requester=FakeDaemon())
+    server = create_web_server(state)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    profile = tmp_path / "chromium-profile"
+    command = [
+        str(shutil.which("chromium")),
+        "--headless=new",
+        "--no-sandbox",
+        "--disable-gpu",
+        "--disable-background-networking",
+        f"--user-data-dir={profile}",
+        "--dump-dom",
+    ]
+    try:
+        listing = subprocess.run(
+            [*command, state.start_url],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        assert listing.returncode == 0, listing.stderr
+        assert '<h1 id="title">Все профили</h1>' in listing.stdout
+        assert 'class="avatar"' in listing.stdout
+        assert 'src="/media/' in listing.stdout
+        assert 'data-loaded="true"' in listing.stdout
+        assert "data-load-error" not in listing.stdout
+        assert "Photo User" in listing.stdout
+
+        detail = subprocess.run(
+            [*command, f"{state.origin}/#profile/12345/profiles"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        assert detail.returncode == 0, detail.stderr
+        assert ">Фотографии</h2>" in detail.stdout
+        assert detail.stdout.count('alt="Фото профиля"') == 2
+        assert detail.stdout.count('src="/media/') >= 3  # Avatar and two gallery photos.
+        assert detail.stdout.count('data-loaded="true"') >= 3
+        assert "data-load-error" not in detail.stdout
     finally:
         server.shutdown()
         server.server_close()

@@ -13,7 +13,7 @@ background service.
   `request()` boundary. Dialogs, screens, status formatting, reusable widgets and TCSS remain
   separate. The package imports neither storage nor Telethon.
 - `ipc.py` starts the daemon detached when required and sends one JSON request per private
-  Unix-socket connection. Client and daemon must both report Hoard 0.7.1 and IPC protocol `1`.
+  Unix-socket connection. Client and daemon must both report Hoard 0.7.1.1 and IPC protocol `1`.
   A held instance lock with no ready socket means initialization is in progress, so the client
   waits for that owner instead of spawning a second daemon.
 - `service.py` owns the database, two independently limited job runners and the sole
@@ -192,6 +192,12 @@ HTML from a random `127.0.0.1` port. Interactive controls are activated by a sma
 bootstrap object; without it the same JavaScript performs no HTTP request, preserving autonomous
 `file://` behavior. Filters, pages, selected `author_id` values and hash routes are mirrored to
 `sessionStorage` before an automatic post-analysis refresh.
+
+The interactive initial route is the profile list with the readable-photo filter enabled, so the
+first page is an avatar catalog rather than a page of recently observed profiles without photos.
+Only photo rows whose file still passes the strict media URL/size validation count as visible;
+the profile detail reuses that same set for its paginated gallery. The autonomous `file://`
+catalog retains its historical default route and unfiltered profile list.
 
 Browser writes map to a closed set of daemon IPC calls: key save, PSL preview, batch start and
 catalog refresh. The API key crosses the browser boundary only in the explicit save request and is

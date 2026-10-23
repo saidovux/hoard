@@ -37,7 +37,7 @@
     posts: {query: "", sort: "published", descending: true, page: 0},
     profiles: {
       query: "", sort: "last_active", descending: true, page: 0,
-      filters: emptyFilters(),
+      filters: interactiveEnabled ? {...emptyFilters(), photos: "yes"} : emptyFilters(),
     },
   };
 
@@ -625,15 +625,28 @@
     return source.slice(0, 2).toLocaleUpperCase("ru-RU");
   }
 
+  function trackImageLoad(image) {
+    image.addEventListener("load", () => { image.dataset.loaded = "true"; }, {once: true});
+    image.addEventListener("error", () => { image.dataset.loadError = "true"; }, {once: true});
+    return image;
+  }
+
   function avatar(profile, large = false) {
-    const photo = (profile.photos || []).find((item) => item.available && localMediaURL(item.url));
+    const photo = profilePhotos(profile)[0];
     if (!photo) return element("div", `avatar initials${large ? " large" : ""}`, initials(profile));
     const image = element("img", "avatar");
     image.loading = "lazy";
     image.decoding = "async";
     image.alt = "";
+    trackImageLoad(image);
     image.src = localMediaURL(photo.url);
     return image;
+  }
+
+  function profilePhotos(profile) {
+    return (profile.photos || []).filter((item) => (
+      item && item.available && localMediaURL(item.url)
+    ));
   }
 
   function profileSearch(profile) {
@@ -682,7 +695,8 @@
         : listRoute("profiles");
       return {type: "profile", id: Number(parts[1]), origin};
     }
-    return listRoute(parts[0] === "profiles" ? "profiles" : "posts");
+    const defaultView = interactiveEnabled ? "profiles" : "posts";
+    return listRoute(parts[0] === "profiles" ? "profiles" : (parts[0] ? "posts" : defaultView));
   }
 
   function rememberScroll() {
@@ -815,6 +829,7 @@
     image.loading = "lazy";
     image.decoding = "async";
     image.alt = label || "Локальное изображение";
+    trackImageLoad(image);
     image.src = url;
     button.append(image);
     button.addEventListener("click", () => openViewer(gallery, galleryIndex, label));
@@ -837,7 +852,7 @@
     return profiles.filter((profile) => {
       if (needle && !(profileSearchIndex.get(Number(profile.author_id)) || "").includes(needle)) return false;
       if (filters.source && !(profile.post_ids || []).some((id) => String(id) === filters.source)) return false;
-      if (!boolFilter(filters.photos, (profile.photos || []).length > 0)) return false;
+      if (!boolFilter(filters.photos, profilePhotos(profile).length > 0)) return false;
       if (!boolFilter(filters.videos, (profile.video_ids || []).length > 0)) return false;
       const psl = latestPSL(profile);
       if (!boolFilter(filters.psl, Boolean(psl))) return false;
@@ -867,7 +882,7 @@
     if (key === "username") return String(profile.username || "").toLocaleLowerCase("ru-RU");
     if (key === "discovered") return profile.first_seen || "";
     if (key === "last_active") return profile.last_activity || profile.last_seen || "";
-    if (key === "media_count") return (profile.video_ids || []).length + (profile.photos || []).length;
+    if (key === "media_count") return (profile.video_ids || []).length + profilePhotos(profile).length;
     if (key === "raw_psl") {
       const low = psl ? numberValue(psl.raw_psl_min) : null;
       const high = psl ? numberValue(psl.raw_psl_max) : null;
@@ -919,7 +934,7 @@
     copy.append(element("div", "eyebrow", profile.username ? `@${profile.username}` : "без username"));
     copy.append(meta([
       `ID ${profile.author_id}`,
-      `${(profile.photos || []).length} фото`,
+      `${profilePhotos(profile).length} фото`,
       `${(profile.video_ids || []).length} кружков`,
       `${(profile.post_ids || []).length} источников`,
       `активность: ${dateText(profile.last_activity || profile.last_seen)}`,
@@ -1245,7 +1260,7 @@
       `Telegram ID ${profile.author_id}`,
       `впервые: ${dateText(profile.first_seen)}`,
       `активность: ${dateText(profile.last_activity || profile.last_seen)}`,
-      `${(profile.photos || []).length} фото`,
+      `${profilePhotos(profile).length} фото`,
       `${(profile.video_ids || []).length} кружков`,
       `${(profile.post_ids || []).length} источников`,
     ]));
@@ -1276,8 +1291,10 @@
     root.append(element("h2", "section-title", "Связанные публикации"), linkedPosts(profile));
 
     root.append(element("h2", "section-title", "Фотографии"));
-    const photos = profile.photos || [];
-    if (!photos.length) root.append(element("p", "muted", profile.photo_error || "Сохранённых фотографий нет"));
+    const photos = profilePhotos(profile);
+    if (!photos.length) root.append(element(
+      "p", "muted", profile.photo_error || "Доступных локальных фотографий нет",
+    ));
     else root.append(localPager(photos, MEDIA_PAGE_SIZE, `profile-photos:${authorId}`, (photo, index) => (
       mediaNode(photo, "image", "Фото профиля", photos, index)
     )));
