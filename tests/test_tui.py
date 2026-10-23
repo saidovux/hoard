@@ -701,6 +701,35 @@ async def test_cancel_during_slow_authorization_cancels_ui_then_notifies_daemon(
 
 
 @pytest.mark.asyncio
+async def test_auth_dialog_timeout_returns_to_retry_state():
+    status = status_fixture()
+    status["telegram"] = "phone_required"
+    api = FakeAPI(status)
+    api.queue("auth_begin", TimeoutError(), {"state": "phone_required"})
+    app = HoardApp(api)
+    async with app.run_test() as pilot:
+        await wait_for_startup(app, pilot)
+        app.open_auth()
+        await wait_for_condition(
+            pilot,
+            lambda: (
+                isinstance(app.screen, AuthDialog)
+                and getattr(app.screen, "state", None) == "unknown"
+            ),
+        )
+        dialog = app.screen
+        error = str(dialog.query_one("#auth-error", Static).content)
+        assert "сеть или VPN" in error
+        assert "TimeoutError" not in error
+        assert str(dialog.query_one("#auth-primary").label) == "Проверить снова"
+
+        dialog.query_one("#auth-primary").press()
+        await wait_for_condition(
+            pilot, lambda: getattr(app.screen, "state", None) == "phone_required"
+        )
+
+
+@pytest.mark.asyncio
 async def test_source_flow_validates_upserts_and_does_not_create_duplicate_scan():
     api = FakeAPI()
     app = HoardApp(api)
