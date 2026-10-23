@@ -6,10 +6,26 @@ import json
 import subprocess
 import sys
 
+from . import __version__
 from .paths import endpoint_path, ensure_private, socket_path, state_dir
 from .platform_support import is_windows, read_endpoint
 
 IPC_MAX_BYTES = 64 * 1024
+IPC_PROTOCOL = 1
+
+
+class DaemonCompatibilityError(RuntimeError):
+    """A responding daemon is too old or otherwise incompatible with this client."""
+
+
+def validate_daemon_status(status: dict) -> None:
+    daemon_version = str(status.get("version") or "неизвестна")
+    protocol = status.get("protocol")
+    if daemon_version != __version__ or protocol != IPC_PROTOCOL:
+        raise DaemonCompatibilityError(
+            f"Работает daemon версии {daemon_version}, клиент {__version__}. "
+            "Выполни `hoard shutdown` и повтори"
+        )
 
 
 def encode_ipc_message(value: dict) -> bytes:
@@ -57,8 +73,11 @@ async def request(method: str, args: dict | None = None, timeout: float = 12) ->
 
 async def ensure_daemon() -> None:
     try:
-        await request("status", timeout=1)
+        status = await request("status", timeout=1)
+        validate_daemon_status(status)
         return
+    except DaemonCompatibilityError:
+        raise
     except (OSError, RuntimeError, TimeoutError, ValueError, json.JSONDecodeError):
         pass
     ensure_private(state_dir())
@@ -82,8 +101,11 @@ async def ensure_daemon() -> None:
     for _ in range(45):
         await asyncio.sleep(0.12)
         try:
-            await request("status", timeout=1)
+            status = await request("status", timeout=1)
+            validate_daemon_status(status)
             return
+        except DaemonCompatibilityError:
+            raise
         except (OSError, RuntimeError, TimeoutError, ValueError, json.JSONDecodeError):
             continue
     raise RuntimeError(f"Не удалось запустить службу; проверь {log}")

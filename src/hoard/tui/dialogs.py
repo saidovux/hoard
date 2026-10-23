@@ -178,8 +178,15 @@ class AuthDialog(ModalScreen[bool]):
         except Exception as exc:
             self._busy = False
             if self.is_mounted:
+                self.state = "unknown"
+                message = str(exc) or type(exc).__name__
+                if isinstance(exc, (OSError, TimeoutError)):
+                    message = (
+                        "Не удалось завершить проверку Telegram. Проверь сеть или VPN "
+                        "и нажми «Проверить снова»."
+                    )
                 self.query_one("#auth-error", Static).update(
-                    Text(str(exc) or type(exc).__name__, style="#F79646")
+                    Text(message, style="#F79646")
                 )
                 self._show_state()
             return

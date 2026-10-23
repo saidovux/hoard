@@ -5,6 +5,7 @@ import asyncio
 import contextlib
 import json
 import mimetypes
+import os
 import re
 import secrets
 import subprocess
@@ -28,6 +29,7 @@ from .platform_support import is_windows
 
 RequestFunction = Callable[[str, dict[str, Any], float], Awaitable[dict[str, Any]]]
 _ID = re.compile(r"^[a-f0-9]{32}$")
+_READY_FILE = "web.ready.json"
 
 
 async def _daemon_request(
@@ -400,28 +402,70 @@ def create_web_server(state: WebState) -> HoardWebServer:
     return HoardWebServer((state.host, 0), state)
 
 
+def _ready_path() -> Path:
+    return state_dir() / _READY_FILE
+
+
+def _write_ready(port: int) -> None:
+    ensure_private(state_dir())
+    payload = json.dumps({"pid": os.getpid(), "port": int(port)}, separators=(",", ":"))
+    path = _ready_path()
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        path.chmod(0o600)
+    except Exception:
+        path.unlink(missing_ok=True)
+        raise
+
+
+def _remove_ready(pid: int) -> None:
+    path = _ready_path()
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, ValueError, TypeError):
+        return
+    try:
+        owner_pid = int(value.get("pid") or 0) if isinstance(value, dict) else 0
+    except (TypeError, ValueError):
+        owner_pid = 0
+    if owner_pid == int(pid):
+        path.unlink(missing_ok=True)
+
+
 def run_web(*, open_browser: bool = True, lifetime: int = 1800) -> str:
     """Run the explicit loopback-only browser session until idle expiry or Ctrl+C."""
     asyncio.run(ensure_daemon())
     report = asyncio.run(request("telegram_report", timeout=180))
-    catalog = Path(str(report.get("catalog") or "")).expanduser().resolve(strict=True)
+    catalog_value = str(report.get("catalog") or "").strip()
+    if not catalog_value:
+        raise RuntimeError(
+            "Ответ daemon устарел и не содержит путь каталога. "
+            "Выполни `hoard shutdown` и повтори"
+        )
+    catalog = Path(catalog_value).expanduser().resolve(strict=True)
     if catalog.name != "telegram_archive.html" or not catalog.is_file():
         raise RuntimeError("Не удалось подготовить локальный HTML-каталог")
     state = WebState(catalog, lifetime=max(60, min(int(lifetime), 86_400)))
     server = create_web_server(state)
     server.timeout = 1
     url = state.start_url
-    print(f"Hoard Web: {url}", flush=True)
-    print("Только 127.0.0.1 · Ctrl+C для закрытия", flush=True)
-    if open_browser:
-        webbrowser.open(url, new=2)
+    _write_ready(state.port)
     try:
+        print(f"Hoard Web: {url}", flush=True)
+        print("Только 127.0.0.1 · Ctrl+C для закрытия", flush=True)
+        if open_browser:
+            webbrowser.open(url, new=2)
         while time.monotonic() - state.last_seen <= state.lifetime:
             server.handle_request()
     except KeyboardInterrupt:
         pass
     finally:
         server.server_close()
+        _remove_ready(os.getpid())
     return url
 
 
@@ -430,6 +474,8 @@ def launch_web_process() -> None:
     ensure_private(state_dir())
     log = state_dir() / "web.log"
     log.touch(mode=0o600, exist_ok=True)
+    ready = _ready_path()
+    ready.unlink(missing_ok=True)
     command = [sys.executable, "-m", "hoard", "web"]
     options: dict[str, Any] = {
         "stdin": subprocess.DEVNULL,
@@ -444,4 +490,21 @@ def launch_web_process() -> None:
     with log.open("ab") as stream:
         options["stdout"] = stream
         options["stderr"] = stream
-        subprocess.Popen(command, **options)
+        process = subprocess.Popen(command, **options)
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            break
+        try:
+            value = json.loads(ready.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, ValueError, TypeError):
+            value = None
+        try:
+            ready_pid = int(value.get("pid") or 0) if isinstance(value, dict) else 0
+            ready_port = int(value.get("port") or 0) if isinstance(value, dict) else 0
+        except (TypeError, ValueError):
+            ready_pid = ready_port = 0
+        if ready_pid == process.pid and 0 < ready_port <= 65535:
+            return
+        time.sleep(0.1)
+    raise RuntimeError(f"Веб-интерфейс не запустился; проверь {log}")

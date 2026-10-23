@@ -489,6 +489,39 @@ async def test_missing_usage_and_partial_tariff_never_become_fake_zero(tmp_path)
     store.close()
 
 
+async def test_pricing_falls_back_from_actual_to_requested_model(tmp_path):
+    usage = AIUsage(
+        prompt_tokens=1,
+        completion_tokens=1,
+        total_tokens=2,
+        prompt_cache_hit_tokens=0,
+        prompt_cache_miss_tokens=1,
+    )
+    provider = SequenceProvider(response("ok", usage=usage, model="provider-model-alias"))
+    service, store = service_with(tmp_path, provider)
+    store.ai.create_price(
+        {
+            "provider": "deepseek",
+            "model": "deepseek-chat",
+            "currency": "USD",
+            "input_cache_hit_per_million": "1",
+            "input_cache_miss_per_million": "1",
+            "output_per_million": "1",
+            "source": "test fixture",
+        }
+    )
+    conversation = await chat(service)
+    attempt = await send(service, conversation["id"])
+
+    await service.ai_service.execute_attempt(attempt["id"])
+
+    recorded = store.ai.attempt(attempt["id"])
+    assert recorded["actual_model"] == "provider-model-alias"
+    assert recorded["price_snapshot"]["model"] == "deepseek-chat"
+    assert recorded["cost_status"] == "complete"
+    store.close()
+
+
 async def test_historical_cost_snapshot_does_not_change_with_tariffs(tmp_path):
     usage = AIUsage(
         prompt_tokens=2,
@@ -584,6 +617,45 @@ async def test_new_image_path_uses_private_attachment_reference_not_job_base64(t
     await wait_for(lambda: store.ai.attempt(attempt["id"])["state"] == "completed")
     assert provider.requests[0].messages[-1].images[0].media_type == "image/png"
     await service.stop_background()
+    store.close()
+
+
+async def test_whole_chat_request_keeps_only_four_newest_images(tmp_path):
+    provider = SequenceProvider(response("first answer"))
+    service, store = service_with(tmp_path, provider)
+    attachments = []
+    for index in range(8):
+        image_file = tmp_path / f"selected-{index}.png"
+        image_file.write_bytes(b"\x89PNG\r\n\x1a\n" + f"image-{index}".encode())
+        attachments.append(store.ai.import_attachment(str(image_file)))
+    conversation = await chat(service)
+    first = await send(
+        service,
+        conversation["id"],
+        content="old images",
+        operation="old-images",
+        attachment_ids=[item["id"] for item in attachments[:4]],
+    )
+    await service.ai_service.execute_attempt(first["id"])
+    second = await send(
+        service,
+        conversation["id"],
+        content="new images",
+        operation="new-images",
+        attachment_ids=[item["id"] for item in attachments[4:]],
+    )
+
+    request = service.ai_service.load_request(second["id"])
+
+    assert sum(len(message.images) for message in request.messages) == 4
+    assert [image.data[-7:] for image in request.messages[-1].images] == [
+        b"image-4",
+        b"image-5",
+        b"image-6",
+        b"image-7",
+    ]
+    old = next(message for message in request.messages if message.content.startswith("old images"))
+    assert "4 ранее прикреплённых" in old.content
     store.close()
 
 

@@ -16,12 +16,14 @@ def test_ai_config_is_private_and_environment_key_wins(monkeypatch, tmp_path):
     if os.name != "nt":
         assert stat.S_IMODE(path.stat().st_mode) == 0o600
     assert "file-secret" not in repr(read_ai_config())
+    assert read_ai_config().key_source == "file"
 
     monkeypatch.setenv("DEEPSEEK_API_KEY", "environment-secret")
     loaded = read_ai_config()
     assert loaded.api_key == "environment-secret"
     assert loaded.model == "deepseek-flash"
     assert loaded.max_parallel == 4
+    assert loaded.key_source == "env"
 
 
 def test_invalid_ai_config_does_not_expose_secret(monkeypatch, tmp_path):

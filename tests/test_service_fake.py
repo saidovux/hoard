@@ -4,6 +4,9 @@ from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+from telethon.errors import FloodWaitError
+
 from hoard.archive_paths import video_note_path
 from hoard.models import Post
 from hoard.storage import Store
@@ -43,6 +46,18 @@ class FakeMessage:
         self.sender_id = 101
         self.sender = SimpleNamespace(username="example", first_name="Test", last_name="User")
         self.date = datetime(2026, 1, 1, tzinfo=UTC)
+
+
+class SelectiveFailureClient(FakeClient):
+    def __init__(self, messages, failures):
+        super().__init__(messages)
+        self.failures = dict(failures)
+
+    async def download_media(self, msg, file, progress_callback=None):
+        failure = self.failures.get(msg.id)
+        if failure is not None:
+            raise failure
+        return await super().download_media(msg, file, progress_callback)
 
 
 async def test_scan_filters_and_resumes(tmp_path):
@@ -86,6 +101,69 @@ async def test_missing_download_is_recovered(tmp_path):
     assert store.stats()["downloads"] == 2
     store.close()
 
+
+async def test_one_failed_media_does_not_poison_source_and_is_retried(tmp_path):
+    store = Store(tmp_path / "db.sqlite")
+    store.add_source(Post("channelx", 7), str(tmp_path / "archive"), 120)
+    messages = [FakeMessage(21, False), FakeMessage(22, True), FakeMessage(23, True)]
+    fake = SelectiveFailureClient(messages, {22: OSError("synthetic failure")})
+    engine = TelegramEngine(store)
+    engine.connect = lambda: asyncio.sleep(0, result=fake)
+
+    assert await engine.scan(store.sources()[0]) == (3, 1)
+    assert store.sources()[0]["last_id"] == 21
+    assert store.seen(store.sources()[0]["id"], 23) is True
+    failure = store.db.execute("SELECT * FROM tg_media_failures").fetchone()
+    assert failure["message_id"] == 22
+    assert failure["attempts"] == 1
+    assert any("повтор через" in event["text"] for event in store.recent_events())
+
+    assert await engine.scan(store.sources()[0]) == (2, 0)
+    store.db.execute("UPDATE tg_media_failures SET retry_at=0")
+    store.db.commit()
+    fake.failures.clear()
+    assert await engine.scan(store.sources()[0]) == (2, 1)
+    assert store.sources()[0]["last_id"] == 23
+    assert store.db.execute("SELECT COUNT(*) FROM tg_media_failures").fetchone()[0] == 0
+    store.close()
+
+
+async def test_flood_wait_still_stops_source_scan(tmp_path):
+    store = Store(tmp_path / "db.sqlite")
+    store.add_source(Post("channelx", 7), str(tmp_path / "archive"), 120)
+    fake = SelectiveFailureClient(
+        [FakeMessage(22, True)],
+        {22: FloodWaitError(request=None, capture=9)},
+    )
+    engine = TelegramEngine(store)
+    engine.connect = lambda: asyncio.sleep(0, result=fake)
+
+    with pytest.raises(FloodWaitError):
+        await engine.scan(store.sources()[0])
+    assert store.db.execute("SELECT COUNT(*) FROM tg_media_failures").fetchone()[0] == 0
+    assert store.sources()[0]["last_id"] == 0
+    store.close()
+
+
+async def test_each_source_uses_its_own_archive_root(tmp_path):
+    store = Store(tmp_path / "db.sqlite")
+    first_root = tmp_path / "first"
+    second_root = tmp_path / "second"
+    store.add_source(Post("channelx", 7), str(first_root), 120)
+    store.add_source(Post("channely", 8), str(second_root), 120)
+    engine = TelegramEngine(store)
+    fake = FakeClient([FakeMessage(22, True)])
+    engine.connect = lambda: asyncio.sleep(0, result=fake)
+
+    first, second = store.sources()
+    await engine.scan(first)
+    await engine.scan(second)
+
+    rows = list(store.db.execute("SELECT source_id,file_path FROM downloads ORDER BY source_id"))
+    assert Path(rows[0]["file_path"]).is_relative_to(first_root)
+    assert Path(rows[1]["file_path"]).is_relative_to(second_root)
+    store.close()
+
 async def test_truncated_download_is_replaced(tmp_path):
     store = Store(tmp_path / "db.sqlite")
     store.add_source(Post("channelx", 7), str(tmp_path), 120)
@@ -118,10 +196,11 @@ async def test_source_is_resolved_before_being_saved(tmp_path):
 
 
 class ProfileClient(FakeClient):
-    def __init__(self, photos, *, unavailable=False):
+    def __init__(self, photos, *, unavailable=False, error=None):
         super().__init__([])
         self.photos = photos
         self.unavailable = unavailable
+        self.error = error
         self.photo_downloads = 0
 
     async def get_entity(self, username):
@@ -134,6 +213,8 @@ class ProfileClient(FakeClient):
         )
 
     async def iter_profile_photos(self, entity, limit):
+        if self.error is not None:
+            raise self.error
         if self.unavailable:
             raise RuntimeError("private")
         for photo in self.photos[:limit]:
@@ -178,8 +259,31 @@ async def test_unavailable_profile_photo_does_not_raise(tmp_path):
     result = await engine.refresh_profile_photos(101)
 
     assert "недоступны" in result
-    row = store.db.execute("SELECT photo_error FROM tg_profiles").fetchone()
+    row = store.db.execute(
+        "SELECT photo_error,photo_error_code FROM tg_profiles"
+    ).fetchone()
     assert row["photo_error"]
+    assert row["photo_error_code"] == "unavailable"
+    store.close()
+
+
+async def test_profile_photo_privacy_error_is_classified(tmp_path):
+    from telethon.errors import UserpicPrivacyRequiredError
+
+    store = Store(tmp_path / "db.sqlite")
+    store.telegram.observe_profile(author_id=101, username=None, display_name="Private")
+    fake = ProfileClient([], error=UserpicPrivacyRequiredError(request=None))
+    engine = TelegramEngine(store)
+    engine.connect = lambda: asyncio.sleep(0, result=fake)
+
+    result = await engine.refresh_profile_photos(101)
+
+    assert "приватности" in result
+    row = store.db.execute(
+        "SELECT photo_error,photo_error_code FROM tg_profiles"
+    ).fetchone()
+    assert row["photo_error_code"] == "privacy"
+    assert "приватности" in row["photo_error"]
     store.close()
 
 

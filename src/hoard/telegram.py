@@ -496,7 +496,10 @@ class TelegramEngine:
         missing = self.store.earliest_missing_download(source["id"])
         if missing is not None:
             cursor = min(cursor, missing - 1)
+        from telethon.errors import FloodWaitError
+
         checked = downloaded = 0
+        checkpoint_blocked = False
         # Telethon docs: channel/reply_to returns the linked discussion thread.
         async for msg in client.iter_messages(entity, reply_to=post.message_id,
                                                min_id=cursor, reverse=True):
@@ -523,14 +526,39 @@ class TelegramEngine:
                             unique_key=f"telegram-profile-photos:{author_id}",
                         )
                 if not self.store.seen(source["id"], msg.id):
-                    video = await self.download_one(client, post, source, msg, identity)
-                    self.store.checkpoint(source["id"], msg.id, video)
+                    if not self.store.telegram.media_download_due(source["id"], msg.id):
+                        checkpoint_blocked = True
+                        continue
+                    try:
+                        video = await self.download_one(client, post, source, msg, identity)
+                    except FloodWaitError:
+                        raise
+                    except Exception as exc:
+                        failure = self.store.telegram.record_media_failure(
+                            source["id"], msg.id, error=f"{type(exc).__name__}: {exc}"
+                        )
+                        checkpoint_blocked = True
+                        self.store.event(
+                            "error",
+                            f"Кружок {post.name} / {msg.id} не сохранён; "
+                            f"повтор через {failure['delay']} с.",
+                        )
+                        continue
+                    self.store.telegram.clear_media_failure(source["id"], msg.id)
+                    self.store.checkpoint(
+                        source["id"], msg.id, video, advance=not checkpoint_blocked
+                    )
                     downloaded += 1
                     self.store.event("ok", f"Сохранён кружок {post.name} / {msg.id}")
                 else:
-                    self.store.checkpoint(source["id"], msg.id)
+                    self.store.telegram.clear_media_failure(source["id"], msg.id)
+                    self.store.checkpoint(
+                        source["id"], msg.id, advance=not checkpoint_blocked
+                    )
             else:
-                self.store.checkpoint(source["id"], msg.id)
+                self.store.checkpoint(
+                    source["id"], msg.id, advance=not checkpoint_blocked
+                )
         self.progress = {}
         self.report_progress({})
         return checked, downloaded
@@ -548,7 +576,7 @@ class TelegramEngine:
         name = identity["author_name"]
         username = identity["author_username"]
         output = video_note_path(
-            self.store.telegram.archive_root(),
+            self.store.telegram.archive_root(str(source["output"])),
             int(source["id"]),
             ident,
             int(msg.id),
@@ -661,7 +689,10 @@ class TelegramEngine:
             except (OSError, TypeError, ValueError):
                 pass
         output = post_media_path(
-            self.store.telegram.archive_root(), int(source["id"]), media_id, suffix
+            self.store.telegram.archive_root(str(source["output"])),
+            int(source["id"]),
+            media_id,
+            suffix,
         )
         ensure_private(output.parent)
         partial = output.with_name(f"{output.name}.part")
@@ -755,18 +786,45 @@ class TelegramEngine:
                 saved += 1
         except Exception as exc:
             retry = 6 * 60 * 60
+            error_code = "unavailable"
             try:
-                from telethon.errors import FloodWaitError
+                from telethon.errors import (
+                    ChannelPrivateError,
+                    FloodWaitError,
+                    RPCError,
+                    UserNotParticipantError,
+                    UserpicPrivacyRequiredError,
+                    UserPrivacyRestrictedError,
+                )
 
                 if isinstance(exc, FloodWaitError):
                     retry = max(60, int(exc.seconds) + 3)
+                    error_code = "flood_wait"
                     message = f"Telegram ограничил фотографии; повтор через {exc.seconds} с."
+                elif isinstance(
+                    exc, (UserpicPrivacyRequiredError, UserPrivacyRestrictedError)
+                ):
+                    error_code = "privacy"
+                    message = "Фотографии профиля скрыты настройками приватности"
+                elif isinstance(exc, (ChannelPrivateError, UserNotParticipantError)):
+                    error_code = "access_denied"
+                    message = "Нет доступа к фотографиям этого Telegram-профиля"
+                elif isinstance(exc, (OSError, TimeoutError)):
+                    retry = 5 * 60
+                    error_code = "network"
+                    message = "Не удалось загрузить фотографии: проверь сеть или VPN"
+                elif isinstance(exc, RPCError):
+                    error_code = "telegram_error"
+                    message = "Telegram не смог предоставить фотографии профиля"
                 else:
                     message = "Фотографии профиля недоступны или скрыты настройками приватности"
             except ImportError:
                 message = "Фотографии профиля сейчас недоступны"
             self.store.telegram.finish_profile_photo_check(
-                int(author_id), error=message, retry_after=retry
+                int(author_id),
+                error=message,
+                error_code=error_code,
+                retry_after=retry,
             )
             return message
         self.store.telegram.finish_profile_photo_check(int(author_id))

@@ -107,6 +107,10 @@ class AIWorkspaceScreen(WorkspaceScreen):
         text.append("DeepSeek  ", style="#888888")
         state_style = "#F79646" if key_status == "authorization_error" else "#FFFFFF"
         text.append(state_label, style=state_style)
+        source_label = {"env": "окружение", "file": "файл", "none": "нет"}.get(
+            str(self.config.get("key_source") or "none"), "нет"
+        )
+        text.append(f"  ·  ключ: {source_label}", style="#888888")
         text.append("  ·  ", style="#888888")
         text.append("платные запросы только после подтверждения", style="#F79646")
         self.query_one("#ai-summary", Static).update(text)
@@ -431,8 +435,9 @@ class AIWorkspaceScreen(WorkspaceScreen):
         self.app.push_screen(
             ConfirmDialog(
                 "Отправить внешний AI-запрос?",
-                "Текст, выбранная память и до четырёх локальных изображений будут отправлены "
-                "DeepSeek. Запрос может быть платным; стоимость заранее может быть неизвестна. "
+                "Текст, выбранная память и не более четырёх самых новых изображений из всего "
+                "контекста будут отправлены DeepSeek; более старые вложения могут быть опущены. "
+                "Запрос может быть платным; стоимость заранее может быть неизвестна. "
                 "Автоматического платного повтора не будет.",
                 confirm_label="Подтверждаю отправку",
             ),

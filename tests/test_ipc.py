@@ -4,7 +4,14 @@ import os
 
 import pytest
 
-from hoard.ipc import IPC_MAX_BYTES, encode_ipc_message
+from hoard import __version__
+from hoard.ipc import (
+    IPC_MAX_BYTES,
+    IPC_PROTOCOL,
+    DaemonCompatibilityError,
+    encode_ipc_message,
+    ensure_daemon,
+)
 from hoard.service import serve_connection
 
 
@@ -33,6 +40,33 @@ async def test_socket_dispatch(tmp_path):
 def test_ipc_encoder_rejects_oversized_message():
     with pytest.raises(ValueError, match="64 KiB"):
         encode_ipc_message({"value": "x" * IPC_MAX_BYTES})
+
+
+async def test_existing_incompatible_daemon_is_not_replaced(monkeypatch):
+    started = False
+
+    async def old_status(method, args=None, timeout=12):
+        assert method == "status"
+        return {"version": "0.7.0", "protocol": IPC_PROTOCOL}
+
+    def unexpected_start(*args, **kwargs):
+        nonlocal started
+        started = True
+
+    monkeypatch.setattr("hoard.ipc.request", old_status)
+    monkeypatch.setattr("hoard.ipc.subprocess.Popen", unexpected_start)
+
+    with pytest.raises(DaemonCompatibilityError, match=r"hoard shutdown"):
+        await ensure_daemon()
+    assert started is False
+
+
+async def test_current_daemon_version_and_protocol_are_accepted(monkeypatch):
+    async def current_status(method, args=None, timeout=12):
+        return {"version": __version__, "protocol": IPC_PROTOCOL}
+
+    monkeypatch.setattr("hoard.ipc.request", current_status)
+    await ensure_daemon()
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Unix sockets require Linux/macOS")

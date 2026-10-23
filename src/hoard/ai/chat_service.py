@@ -11,7 +11,13 @@ from .errors import AIConnectionError, AIError, AIResponseError
 from .executor import AICore
 from .models import AIImage, AIMessage, AIRequest, AIResponse, AIUsage
 from .pricing import CostEstimate, estimate_cost
-from .psl import DEFAULT_PSL_INSTRUCTIONS, PSL_JSON_SCHEMA, PSL_SCHEMA_VERSION, validate_psl_result
+from .psl import (
+    DEFAULT_PSL_INSTRUCTIONS,
+    PSL_JSON_SCHEMA,
+    PSL_OUTPUT_FORMAT,
+    PSL_SCHEMA_VERSION,
+    validate_psl_result,
+)
 from .storage import (
     DEFAULT_CONTEXT_CHARS,
     MAX_MESSAGE_ATTACHMENT_BYTES,
@@ -750,6 +756,8 @@ class AIChatService:
             and prompt_instructions != DEFAULT_PSL_INSTRUCTIONS
         ):
             messages.append(AIMessage("system", DEFAULT_PSL_INSTRUCTIONS))
+        if attempt.get("entity_kind") == "telegram.psl":
+            messages.append(AIMessage("system", PSL_OUTPUT_FORMAT))
 
         memory_rows = list(
             self.storage.db.execute(
@@ -768,17 +776,45 @@ class AIChatService:
             blocks.extend(f"[{row['title']}]\n{row['content']}" for row in memory_rows)
             messages.append(AIMessage("user", "\n\n".join(blocks)))
 
-        for row in self.storage.db.execute(
+        message_rows = list(
+            self.storage.db.execute(
             """SELECT m.* FROM ai_attempt_messages am JOIN ai_messages m ON m.id=am.message_id
             WHERE am.attempt_id=? ORDER BY am.position""",
             (attempt_id,),
-        ):
+            )
+        )
+        attachment_rows: dict[str, list[dict[str, Any]]] = {}
+        for row in message_rows:
+            attachment_rows[str(row["id"])] = [
+                dict(item)
+                for item in self.storage.db.execute(
+                    """SELECT a.* FROM ai_message_attachments ma JOIN ai_attachments a
+                    ON a.id=ma.attachment_id WHERE ma.message_id=? ORDER BY ma.position""",
+                    (row["id"],),
+                )
+            ]
+
+        selected_attachments: set[tuple[str, str]] = set()
+        selected_bytes = 0
+        for row in reversed(message_rows):
+            message_id = str(row["id"])
+            for attachment in reversed(attachment_rows[message_id]):
+                size = int(attachment["size"])
+                if (
+                    len(selected_attachments) >= MAX_MESSAGE_ATTACHMENTS
+                    or selected_bytes + size > MAX_MESSAGE_ATTACHMENT_BYTES
+                ):
+                    continue
+                selected_attachments.add((message_id, str(attachment["id"])))
+                selected_bytes += size
+
+        for row in message_rows:
             images: list[AIImage] = []
-            for attachment in self.storage.db.execute(
-                """SELECT a.* FROM ai_message_attachments ma JOIN ai_attachments a
-                ON a.id=ma.attachment_id WHERE ma.message_id=? ORDER BY ma.position""",
-                (row["id"],),
-            ):
+            message_id = str(row["id"])
+            attachments = attachment_rows[message_id]
+            for attachment in attachments:
+                if (message_id, str(attachment["id"])) not in selected_attachments:
+                    continue
                 image = AIImage.from_file(str(attachment["file_path"]))
                 if len(image.data) != int(attachment["size"]):
                     raise ValueError("Сохранённое AI-вложение повреждено")
@@ -786,7 +822,14 @@ class AIChatService:
                 if digest != attachment["sha256"]:
                     raise ValueError("Сохранённое AI-вложение изменилось")
                 images.append(image)
-            messages.append(AIMessage(str(row["role"]), str(row["content"]), tuple(images)))
+            omitted = len(attachments) - len(images)
+            content = str(row["content"])
+            if omitted:
+                content += (
+                    f"\n\n[{omitted} ранее прикреплённых изображений не включены "
+                    "из-за общего лимита 4 файла / 24 MiB.]"
+                )
+            messages.append(AIMessage(str(row["role"]), content, tuple(images)))
 
         request = AIRequest(
             tuple(messages),
@@ -949,11 +992,16 @@ class AIChatService:
         attempt = self.storage.attempt(attempt_id)
         usage: AIUsage | None = response.usage if response else None
         actual_model = response.model if response else None
-        price = (
-            self.storage.price_for(str(attempt["provider"]), actual_model, attempt["created_at"])
-            if actual_model
-            else None
-        )
+        price = None
+        if actual_model:
+            price = self.storage.price_for(
+                str(attempt["provider"]), actual_model, attempt["created_at"]
+            )
+        requested_model = str(attempt.get("requested_model") or "")
+        if price is None and requested_model:
+            price = self.storage.price_for(
+                str(attempt["provider"]), requested_model, attempt["created_at"]
+            )
         cost: CostEstimate = estimate_cost(usage, price)
         self.storage.finish_attempt(
             attempt_id,

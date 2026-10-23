@@ -348,6 +348,22 @@ def test_template_refresh_preserves_objects_and_rolls_back_on_error(tmp_path):
     store.close()
 
 
+def test_catalog_template_markers_inside_data_are_not_replaced(tmp_path):
+    store = Store(tmp_path / "db.sqlite")
+    root = tmp_path / "archive"
+    title = f"Literal {STYLE_TOKEN} {DATA_TOKEN} {APP_TOKEN} </script>"
+    store.add_source(Post("channelx", 7), str(root), title=title)
+
+    report = build_catalog(store)
+
+    assert payload_from(report)["posts"][0]["channel_title"] == title
+    html = report.read_text(encoding="utf-8")
+    assert html.count('<script data-hoard-bundle="app">') == 1
+    assert html.count("const catalog = window.HOARD_CATALOG || {};") == 1
+    assert "</script><script>" not in html
+    store.close()
+
+
 def test_split_catalog_objects_move_out_of_telegram_and_keep_database_links(tmp_path):
     store = Store(tmp_path / "db.sqlite")
     root = tmp_path / "archive"

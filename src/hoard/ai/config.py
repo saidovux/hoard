@@ -23,6 +23,7 @@ class AIConfig:
     model: str = DEFAULT_DEEPSEEK_MODEL
     timeout: float = 120.0
     max_parallel: int = 2
+    key_source: str = "none"
 
     def __post_init__(self) -> None:
         if self.provider != "deepseek":
@@ -33,6 +34,8 @@ class AIConfig:
             raise AIConfigurationError("Таймаут AI должен быть от 1 до 600 секунд")
         if not 1 <= self.max_parallel <= 100:
             raise AIConfigurationError("Параллельность AI должна быть от 1 до 100")
+        if self.key_source not in {"env", "file", "none"}:
+            raise AIConfigurationError("Неизвестный источник API-ключа")
 
     @property
     def configured(self) -> bool:
@@ -53,7 +56,10 @@ def read_ai_config() -> AIConfig:
     deepseek = data.get("deepseek", {})
     if not isinstance(deepseek, dict):
         raise AIConfigurationError("Раздел deepseek в ai.json должен быть объектом")
-    api_key = os.environ.get("DEEPSEEK_API_KEY") or deepseek.get("api_key", "")
+    environment_key = os.environ.get("DEEPSEEK_API_KEY", "").strip()
+    file_key = str(deepseek.get("api_key", "")).strip()
+    api_key = environment_key or file_key
+    key_source = "env" if environment_key else "file" if file_key else "none"
     model = os.environ.get("DEEPSEEK_MODEL") or deepseek.get(
         "model", DEFAULT_DEEPSEEK_MODEL
     )
@@ -66,6 +72,7 @@ def read_ai_config() -> AIConfig:
             model=str(model),
             timeout=float(raw_timeout),
             max_parallel=int(raw_parallel),
+            key_source=key_source,
         )
     except (TypeError, ValueError) as exc:
         raise AIConfigurationError("Неверные значения в конфигурации AI") from exc

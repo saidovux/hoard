@@ -10,7 +10,9 @@ from typing import Any
 from .archive_paths import default_archive_root, path_is_within
 from .models import parse_post_url
 
-TELEGRAM_SCHEMA_VERSION = 2
+TELEGRAM_SCHEMA_VERSION = 3
+
+MEDIA_RETRY_DELAYS = (60, 300, 1800, 7200, 21600, 86400)
 
 
 def utc_now() -> str:
@@ -107,6 +109,15 @@ class TelegramStorage:
                 error TEXT NOT NULL DEFAULT '',
                 PRIMARY KEY(source_id, media_id)
             );
+            CREATE TABLE IF NOT EXISTS tg_media_failures (
+                source_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                error TEXT NOT NULL DEFAULT '',
+                retry_at REAL NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY(source_id, message_id)
+            );
             CREATE INDEX IF NOT EXISTS tg_profiles_username_idx
                 ON tg_profiles(current_username COLLATE NOCASE);
             CREATE INDEX IF NOT EXISTS tg_profiles_name_idx
@@ -119,6 +130,8 @@ class TelegramStorage:
                 ON tg_profile_sources(source_id, author_id);
             CREATE INDEX IF NOT EXISTS tg_profile_photos_author_idx
                 ON tg_profile_photos(author_id, photo_date DESC);
+            CREATE INDEX IF NOT EXISTS tg_media_failures_retry_idx
+                ON tg_media_failures(retry_at, source_id, message_id);
             """
         )
         download_columns = {
@@ -131,6 +144,13 @@ class TelegramStorage:
         for name, declaration in additions.items():
             if name not in download_columns:
                 self.db.execute(f"ALTER TABLE downloads ADD COLUMN {name} {declaration}")
+        profile_columns = {
+            str(row["name"]) for row in self.db.execute("PRAGMA table_info(tg_profiles)")
+        }
+        if "photo_error_code" not in profile_columns:
+            self.db.execute(
+                "ALTER TABLE tg_profiles ADD COLUMN photo_error_code TEXT NOT NULL DEFAULT ''"
+            )
         self.db.execute(
             "INSERT OR IGNORE INTO tg_settings(key,value) VALUES('catalog_dirty','0')"
         )
@@ -244,6 +264,48 @@ class TelegramStorage:
     def ensure_archive_root(self, preferred: str | Path) -> Path:
         configured = self.get_setting("archive_root")
         return self.archive_root(configured or preferred, persist=not bool(configured))
+
+    def media_download_due(self, source_id: int, message_id: int) -> bool:
+        row = self.db.execute(
+            "SELECT retry_at FROM tg_media_failures WHERE source_id=? AND message_id=?",
+            (int(source_id), int(message_id)),
+        ).fetchone()
+        return row is None or float(row["retry_at"] or 0) <= time.time()
+
+    def record_media_failure(
+        self, source_id: int, message_id: int, *, error: str
+    ) -> dict[str, Any]:
+        current = self.db.execute(
+            "SELECT attempts FROM tg_media_failures WHERE source_id=? AND message_id=?",
+            (int(source_id), int(message_id)),
+        ).fetchone()
+        attempts = int(current["attempts"] if current is not None else 0) + 1
+        delay = MEDIA_RETRY_DELAYS[min(attempts - 1, len(MEDIA_RETRY_DELAYS) - 1)]
+        retry_at = time.time() + delay
+        with self.db:
+            self.db.execute(
+                """INSERT INTO tg_media_failures(
+                source_id,message_id,attempts,error,retry_at,updated_at)
+                VALUES(?,?,?,?,?,?) ON CONFLICT(source_id,message_id) DO UPDATE SET
+                attempts=excluded.attempts,error=excluded.error,
+                retry_at=excluded.retry_at,updated_at=excluded.updated_at""",
+                (
+                    int(source_id),
+                    int(message_id),
+                    attempts,
+                    error[:500],
+                    retry_at,
+                    utc_now(),
+                ),
+            )
+        return {"attempts": attempts, "retry_at": retry_at, "delay": delay}
+
+    def clear_media_failure(self, source_id: int, message_id: int) -> None:
+        with self.db:
+            self.db.execute(
+                "DELETE FROM tg_media_failures WHERE source_id=? AND message_id=?",
+                (int(source_id), int(message_id)),
+            )
 
     def allowed_media_roots(self, archive_root: Path) -> list[Path]:
         roots = [archive_root.expanduser().resolve()]
@@ -723,7 +785,7 @@ class TelegramStorage:
             for row in self.db.execute(
                 f"""SELECT profiles.author_id,profiles.current_username,
                 profiles.display_name,profiles.first_seen,profiles.last_seen,
-                profiles.photo_error,
+                profiles.photo_error,profiles.photo_error_code,
                 COUNT(DISTINCT CASE WHEN photos.status='saved' THEN photos.photo_id END)
                     AS photo_count,
                 COUNT(DISTINCT links.source_id) AS source_count
@@ -802,14 +864,16 @@ class TelegramStorage:
         author_id: int,
         *,
         error: str = "",
+        error_code: str = "",
         retry_after: int = 6 * 60 * 60,
     ) -> None:
         retry_at = time.time() + retry_after if error else time.time() + 24 * 60 * 60
         with self.db:
             self.db.execute(
-                """UPDATE tg_profiles SET photos_checked_at=?,photo_error=?,photos_retry_at=?
+                """UPDATE tg_profiles SET photos_checked_at=?,photo_error=?,photo_error_code=?,
+                photos_retry_at=?
                 WHERE author_id=?""",
-                (utc_now(), error[:500], retry_at, int(author_id)),
+                (utc_now(), error[:500], error_code[:80], retry_at, int(author_id)),
             )
             self._set_dirty_sql()
 

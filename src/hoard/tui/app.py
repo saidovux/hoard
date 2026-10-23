@@ -419,10 +419,15 @@ class HoardApp(App[None]):
         self.set_notice("Группа продолжает выполняться в daemon; её можно открыть позже.")
 
     def open_web_interface(self) -> None:
+        self.run_worker(
+            self._launch_web_interface(), name="launch-web-interface", exit_on_error=False
+        )
+
+    async def _launch_web_interface(self) -> None:
         try:
             from hoard.web import launch_web_process
 
-            launch_web_process()
+            await asyncio.to_thread(launch_web_process)
         except (OSError, RuntimeError) as exc:
             self.set_notice(str(exc), error=True)
             return

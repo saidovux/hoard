@@ -6,6 +6,18 @@ from typing import Any
 
 PSL_SCHEMA_VERSION = 2
 PSL_STATUSES = {"completed", "insufficient_data", "ineligible", "invalid_result"}
+PSL_FAILURE_CATEGORIES = {"invalid_result", "provider_error", "outcome_unknown"}
+
+PSL_OUTPUT_FORMAT = """Return exactly one JSON object with these six keys and no others:
+{
+  "status": "completed | insufficient_data | ineligible",
+  "presentation": "female | male | unknown",
+  "estimated_age": "integer 0..120 | null",
+  "raw_psl_min": "number 0..8 | null",
+  "raw_psl_max": "number 0..8 | null",
+  "boosted_psl": "number 0..8 | null"
+}
+Use JSON numbers and null values, not the explanatory type strings shown above."""
 
 PSL_JSON_SCHEMA: dict[str, Any] = {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -50,6 +62,26 @@ unknown, use status=ineligible and all three PSL values must be null. If adultho
 quality is uncertain, use status=insufficient_data and all three PSL values must be null. Never
 score a possible minor. estimated_age is approximate and may be null. For a completed result,
 raw_psl_min <= raw_psl_max and every PSL value is between 0 and 8."""
+
+
+def psl_failure_category(
+    attempt_state: Any, error_code: Any = None, result_status: Any = None
+) -> str | None:
+    """Return the stable public failure category without exposing provider details."""
+    state = str(attempt_state or "")
+    result = str(result_status or "")
+    error = str(error_code or "")
+    if state == "outcome_unknown":
+        return "outcome_unknown"
+    if result == "invalid_result" or error in {
+        "invalid_json",
+        "json_schema_mismatch",
+        "invalid_psl_result",
+    }:
+        return "invalid_result"
+    if state == "failed":
+        return "provider_error"
+    return None
 
 
 def validate_psl_result(value: Any) -> dict[str, Any]:

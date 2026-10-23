@@ -10,7 +10,7 @@ import pytest
 from hoard.ai import AICore, AIResponse
 from hoard.ai.config import DEFAULT_DEEPSEEK_MODEL
 from hoard.ai.provider import AIProvider
-from hoard.ai.psl import DEFAULT_PSL_INSTRUCTIONS
+from hoard.ai.psl import DEFAULT_PSL_INSTRUCTIONS, PSL_OUTPUT_FORMAT
 from hoard.models import Post
 from hoard.service import Service
 from hoard.storage import Store
@@ -431,5 +431,14 @@ async def test_builtin_psl_contract_is_not_duplicated_and_uses_provider_default(
     )["analysis"]
     request = service.ai_service.load_request(analysis["attempt_id"])
     assert [message.content for message in request.messages].count(DEFAULT_PSL_INSTRUCTIONS) == 1
+    assert [message.content for message in request.messages].count(PSL_OUTPUT_FORMAT) == 1
+    assert set(request.json_schema["required"]) == {
+        "status",
+        "presentation",
+        "estimated_age",
+        "raw_psl_min",
+        "raw_psl_max",
+        "boosted_psl",
+    }
     assert request.model == DEFAULT_DEEPSEEK_MODEL
     store.close()

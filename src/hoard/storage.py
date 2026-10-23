@@ -207,7 +207,14 @@ class Store:
         except OSError:
             return False
 
-    def checkpoint(self, source_id: int, message_id: int, video: dict | None = None) -> None:
+    def checkpoint(
+        self,
+        source_id: int,
+        message_id: int,
+        video: dict | None = None,
+        *,
+        advance: bool = True,
+    ) -> None:
         # Store media record and checkpoint atomically, only AFTER successful write.
         payload = dict(video or {})
         if payload:
@@ -224,8 +231,11 @@ class Store:
                       author_name=excluded.author_name, file_path=excluded.file_path,
                       size=excluded.size,observed_at=excluded.observed_at,
                       state=excluded.state""", payload)
-            self.db.execute("""UPDATE sources SET last_id=MAX(last_id,?) WHERE id=?""",
-                            (message_id, source_id))
+            if advance:
+                self.db.execute(
+                    "UPDATE sources SET last_id=MAX(last_id,?) WHERE id=?",
+                    (message_id, source_id),
+                )
         if payload:
             self.telegram.set_catalog_dirty()
             if payload.get("author_id") is not None:

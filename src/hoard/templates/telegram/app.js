@@ -191,6 +191,10 @@
       return;
     }
     const {dialog, body} = modal(config.configured ? "AI → Настройки" : "DeepSeek не подключён");
+    const keySource = ({env: "переменная окружения", file: "локальный файл", none: "не задан"})[
+      config.key_source || "none"
+    ];
+    body.append(element("p", "muted", `Текущий источник ключа: ${keySource}.`));
     body.append(element(
       "p", "muted",
       config.configured
@@ -273,6 +277,14 @@
       + `ошибки ${batch.errors || 0} · ${cost}`;
   }
 
+  function failureLabel(value) {
+    return ({
+      invalid_result: "Ответ AI не прошёл проверку формата",
+      provider_error: "Провайдер AI не выполнил запрос",
+      outcome_unknown: "Результат запроса неизвестен — проверь перед ручным повтором",
+    })[String(value || "")] || "";
+  }
+
   function renderBatch(body, batch) {
     body.replaceChildren(element("p", "workflow-summary", batchSummary(batch)));
     const list = element("div", "workflow-list");
@@ -282,7 +294,9 @@
       row.append(element("strong", "", name));
       row.append(element("span", "muted", item.state || "—"));
       if (item.reason) row.append(element("span", "workflow-reason", item.reason));
-      if (item.error_code) row.append(element("span", "workflow-reason", item.error_code));
+      if (item.failure_category) {
+        row.append(element("span", "workflow-reason", failureLabel(item.failure_category)));
+      }
       list.append(row);
     });
     body.append(list);
@@ -1128,7 +1142,9 @@
 
   function pslHistoryEntry(item) {
     const row = element("article", "psl-entry");
-    row.append(element("div", "card-title", clean(item.status, "unknown")));
+    row.append(element(
+      "div", "card-title", failureLabel(item.failure_category) || clean(item.status, "unknown"),
+    ));
     row.append(meta([
       dateText(item.analyzed_at),
       item.actual_model ? `модель: ${item.actual_model}` : "модель не сохранена",

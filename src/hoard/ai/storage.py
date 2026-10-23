@@ -13,7 +13,7 @@ from typing import Any
 from .config import DEFAULT_DEEPSEEK_MODEL
 from .models import AIImage, AIUsage
 from .pricing import CostEstimate, decimal_text
-from .psl import DEFAULT_PSL_INSTRUCTIONS, PSL_JSON_SCHEMA
+from .psl import DEFAULT_PSL_INSTRUCTIONS, PSL_JSON_SCHEMA, psl_failure_category
 
 AI_SCHEMA_VERSION = 4
 MAX_TEXT_BYTES = 32 * 1024
@@ -1095,6 +1095,11 @@ class AIStorage:
             raise ValueError("Telegram AI-анализ не найден")
         result = dict(row)
         result["attempt"] = self.attempt(str(result["attempt_id"]))
+        result["failure_category"] = psl_failure_category(
+            result["attempt"].get("state"),
+            result["attempt"].get("error_code"),
+            result.get("result_status"),
+        )
         result["photos"] = [
             dict(photo)
             for photo in self.db.execute(
@@ -1287,6 +1292,9 @@ class AIStorage:
                 continue
             state = str(item.get("attempt_state") or item["item_state"])
             item["state"] = state
+            item["failure_category"] = psl_failure_category(
+                state, item.get("error_code"), item.get("result_status")
+            )
             if state in {"queued", "running", "pending"}:
                 queued += 1
             elif state == "completed":
@@ -1344,6 +1352,12 @@ class AIStorage:
                 (*parameters, page_limit + 1, page_offset),
             )
         ]
+        for item in rows:
+            item["failure_category"] = psl_failure_category(
+                item.get("attempt_state"),
+                item.get("error_code"),
+                item.get("result_status"),
+            )
         return {
             "items": rows[:page_limit],
             "limit": page_limit,
@@ -1353,14 +1367,15 @@ class AIStorage:
 
     def catalog_telegram_analyses(self) -> list[dict[str, Any]]:
         """Read the complete compact PSL journal in one ordered query for HTML export."""
-        return [
+        rows = [
             dict(row)
             for row in self.db.execute(
                 """SELECT a.id,a.author_id,a.attempt_id,a.prompt_version_id,
                 a.schema_version,a.result_status,a.presentation,a.estimated_age,
                 a.raw_psl_min,a.raw_psl_max,a.boosted_psl,
                 COALESCE(a.actual_model,t.actual_model) AS actual_model,
-                a.analyzed_at,a.created_at,t.state AS attempt_state,t.completed_at
+                a.analyzed_at,a.created_at,t.state AS attempt_state,t.error_code,
+                t.completed_at
                 FROM ai_telegram_analyses a
                 JOIN ai_attempts t ON t.id=a.attempt_id
                 ORDER BY a.author_id,
@@ -1368,6 +1383,14 @@ class AIStorage:
                 COALESCE(a.analyzed_at,a.created_at) DESC,a.id DESC"""
             )
         ]
+        for item in rows:
+            item["failure_category"] = psl_failure_category(
+                item.get("attempt_state"),
+                item.get("error_code"),
+                item.get("result_status"),
+            )
+            item.pop("error_code", None)
+        return rows
 
     def _mark_catalog_changed_sql(self) -> None:
         """Mark a catalog-visible AI mutation inside the caller's transaction."""

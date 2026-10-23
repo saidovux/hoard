@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 from contextlib import suppress
 from datetime import UTC, datetime
@@ -263,6 +264,7 @@ def _analysis_item(row: dict[str, Any]) -> tuple[dict[str, Any], bool]:
         "prompt_version_id": _text(row.get("prompt_version_id")),
         "schema_version": int(row.get("schema_version") or 0),
         "attempt_id": _text(row.get("attempt_id")),
+        "failure_category": _text(row.get("failure_category")) or None,
         "presentation": normalized["presentation"] if valid and normalized else None,
         "estimated_age": normalized["estimated_age"] if valid and normalized else None,
         "raw_psl_min": normalized["raw_psl_min"] if valid and normalized else None,
@@ -304,6 +306,7 @@ def _build_payload(
             "last_seen": _text(row["last_seen"]),
             "last_activity": "",
             "photo_error": _text(row["photo_error"]),
+            "photo_error_code": _text(row.get("photo_error_code")),
             "photos_checked_at": _text(row["photos_checked_at"]),
             "username_history": [],
             "post_ids": [],
@@ -477,11 +480,9 @@ def _bundle_html(
         raise ValueError("CSS-шаблон содержит закрывающий HTML-тег")
     if "</script" in app.casefold():
         raise ValueError("JavaScript-шаблон содержит закрывающий HTML-тег")
-    return (
-        index.replace(STYLE_TOKEN, style, 1)
-        .replace(DATA_TOKEN, data, 1)
-        .replace(APP_TOKEN, app, 1)
-    )
+    replacements = {STYLE_TOKEN: style, DATA_TOKEN: data, APP_TOKEN: app}
+    pattern = re.compile("|".join(re.escape(token) for token in replacements))
+    return pattern.sub(lambda match: replacements[match.group(0)], index)
 
 
 def _rewrite_obsolete_object_paths(

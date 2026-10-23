@@ -136,6 +136,10 @@ class AIRecordDialog(ModalScreen[dict[str, Any] | None]):
         yield from self._input("Источник тарифа", "record-source")
 
     def _config_fields(self):
+        source = {"env": "окружение", "file": "файл", "none": "не настроен"}.get(
+            str(self.current.get("key_source") or "none"), "не настроен"
+        )
+        yield Static(f"Текущий источник ключа: {source}", classes="muted")
         yield from self._input("Новый API-ключ", "record-key", "", password=True)
         yield from self._input(
             "Модель", "record-model", self.current.get("model", DEFAULT_DEEPSEEK_MODEL)

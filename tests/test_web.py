@@ -6,7 +6,9 @@ import json
 import threading
 from pathlib import Path
 
-from hoard.web import WebState, create_web_server
+import pytest
+
+from hoard.web import WebState, create_web_server, run_web
 
 
 class FakeDaemon:
@@ -36,6 +38,21 @@ def request(server, method, path, *, headers=None, body=None):
     result = response.status, dict(response.getheaders()), payload
     connection.close()
     return result
+
+
+def test_web_rejects_old_daemon_reply_clearly(monkeypatch):
+    async def daemon_ready():
+        return None
+
+    async def old_report(method, args=None, timeout=12):
+        assert method == "telegram_report"
+        return {}
+
+    monkeypatch.setattr("hoard.web.ensure_daemon", daemon_ready)
+    monkeypatch.setattr("hoard.web.request", old_report)
+
+    with pytest.raises(RuntimeError, match=r"hoard shutdown"):
+        run_web(open_browser=False)
 
 
 def test_web_requires_bootstrap_cookie_exact_host_origin_and_csrf(tmp_path):

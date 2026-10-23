@@ -10,6 +10,7 @@ import shutil
 import signal
 from functools import partial
 
+from . import __version__
 from .ai import AICore, AIRequest, create_default_core, read_ai_config, write_ai_config
 from .ai.chat_service import AIChatService
 from .ai.config import AIConfig
@@ -20,13 +21,15 @@ from .catalog import build_catalog_from_db
 from .config import read_credentials, write_credentials
 from .integrations.media import download, validate_media
 from .integrations.rclone import upload, validate_upload
-from .ipc import IPC_MAX_BYTES, encode_ipc_message
+from .ipc import IPC_MAX_BYTES, IPC_PROTOCOL, encode_ipc_message
 from .jobs import JobRunner
 from .models import parse_post_url
 from .paths import db_path, endpoint_path, ensure_private, socket_path, state_dir
 from .platform_support import is_windows, remove_endpoint_if_owned, single_instance, write_endpoint
 from .storage import Store
 from .telegram import AuthFlowError, AuthState, TelegramEngine
+
+AUTH_OPERATION_TIMEOUT = 80
 
 
 class Service:
@@ -281,7 +284,15 @@ class Service:
 
     async def _auth_call(self, operation) -> dict:
         try:
-            return await operation
+            return await asyncio.wait_for(operation, timeout=AUTH_OPERATION_TIMEOUT)
+        except TimeoutError:
+            return {
+                "state": "unknown",
+                "authorized": False,
+                "error": "Telegram не ответил вовремя. Проверь сеть или VPN и повтори попытку.",
+                "error_code": "timeout",
+                "retryable": True,
+            }
         except AuthFlowError as exc:
             return {
                 "state": str(exc.state),
@@ -301,6 +312,7 @@ class Service:
                 "max_parallel": config.max_parallel,
                 "configured": self.ai_core.is_configured(config.provider),
                 "key_status": self._ai_key_state,
+                "key_source": config.key_source,
             }
         if method == "ai_config_set":
             current = read_ai_config()
@@ -315,16 +327,24 @@ class Service:
                 max_parallel=int(args.get("max_parallel", current.max_parallel)),
             )
             write_ai_config(config)
+            effective = read_ai_config()
             if not self._injected_ai_core:
-                self.ai_core = create_default_core(config)
+                self.ai_core = create_default_core(effective)
                 self.ai_service.core = self.ai_core
             self._ai_key_state = "key_saved"
+            message = "Ключ сохранён; он будет проверен при первом AI-запросе"
+            if effective.key_source == "env":
+                message = (
+                    "Ключ сохранён в файл, но сейчас используется DEEPSEEK_API_KEY "
+                    "из окружения"
+                )
             return {
-                "message": "Ключ сохранён; он будет проверен при первом AI-запросе",
-                "provider": config.provider,
-                "model": config.model,
+                "message": message,
+                "provider": effective.provider,
+                "model": effective.model,
                 "configured": True,
                 "key_status": self._ai_key_state,
+                "key_source": effective.key_source,
             }
         if method.startswith("ai_"):
             return await self.ai_ipc.handle(method, args)
@@ -335,6 +355,8 @@ class Service:
                 auth_state = AuthState.API_REQUIRED
             archive_root = self.store.telegram.archive_root()
             return {
+                "version": __version__,
+                "protocol": IPC_PROTOCOL,
                 "running": self.running,
                 "collector_state": self.collector_state,
                 "telegram": str(auth_state),

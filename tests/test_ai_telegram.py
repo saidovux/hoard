@@ -172,6 +172,7 @@ async def test_invalid_minor_result_is_terminal_and_never_scores(tmp_path):
     assert saved["raw_psl_min"] is None
     assert saved["attempt"]["state"] == "failed"
     assert saved["attempt"]["error_code"] == "invalid_psl_result"
+    assert saved["failure_category"] == "invalid_result"
     store.close()
 
 
@@ -183,6 +184,7 @@ async def test_unknown_outcome_needs_linked_manual_retry(tmp_path):
         await service.ai_service.execute_attempt(original["attempt_id"])
     failed = store.ai.telegram_analysis(original["id"])
     assert failed["attempt"]["state"] == "outcome_unknown"
+    assert failed["failure_category"] == "outcome_unknown"
     assert len(provider.requests) == 1
 
     retry = (
@@ -223,6 +225,7 @@ async def test_ai_config_ipc_never_returns_key(monkeypatch, tmp_path):
     visible = await service.handle("ai_config_get", {})
     assert saved["configured"] is True
     assert visible["configured"] is True
+    assert visible["key_source"] == "file"
     assert "api_key" not in visible
     assert "round-five-secret" not in repr(visible)
     config_path = tmp_path / "config" / "hoard" / "ai.json"

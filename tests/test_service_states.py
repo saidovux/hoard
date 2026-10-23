@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 
 from hoard.models import Post
@@ -57,6 +59,24 @@ async def test_expected_auth_errors_are_structured_for_ui(tmp_path):
         "error_code": "code_invalid",
         "retryable": True,
     }
+    store.close()
+
+
+async def test_auth_timeout_is_bounded_and_retryable(monkeypatch, tmp_path):
+    class SlowEngine(FakeEngine):
+        async def begin_authorization(self):
+            await asyncio.sleep(1)
+
+    monkeypatch.setattr("hoard.service.AUTH_OPERATION_TIMEOUT", 0.01)
+    store = Store(tmp_path / "db.sqlite")
+    service = Service(store=store, engine=SlowEngine())
+
+    result = await service.handle("auth_begin", {})
+
+    assert result["state"] == "unknown"
+    assert result["error_code"] == "timeout"
+    assert result["retryable"] is True
+    assert "VPN" in result["error"]
     store.close()
 
 
