@@ -13,7 +13,9 @@ background service.
   `request()` boundary. Dialogs, screens, status formatting, reusable widgets and TCSS remain
   separate. The package imports neither storage nor Telethon.
 - `ipc.py` starts the daemon detached when required and sends one JSON request per private
-  Unix-socket connection.
+  Unix-socket connection. Client and daemon must both report Hoard 0.7.1 and IPC protocol `1`.
+  A held instance lock with no ready socket means initialization is in progress, so the client
+  waits for that owner instead of spawning a second daemon.
 - `service.py` owns the database, two independently limited job runners and the sole
   `TelegramEngine`. An asyncio lock
   serializes login, validation, scans and enrichment so one Telethon session is never opened by
@@ -32,7 +34,7 @@ background service.
   catalog template. It never opens SQLite or calls a provider. Exact Host/Origin checks, a random
   bootstrap/session token, HttpOnly SameSite cookie, independent CSRF token and CSP protect every
   write. Only media paths already validated into the current catalog snapshot and still contained
-  by that archive root are served.
+  by one of the daemon-reported archive roots are served through an opaque root-prefixed URL.
 - The socket and all XDG state directories are user-only. No persistent or remotely reachable
   TCP/HTTP listener exists; the loopback browser session starts only by explicit user action and
   expires after inactivity.
@@ -114,6 +116,8 @@ AI storage uses the same daemon-owned connection but a separate additive schema:
 The AI schema records its own version in `schema_versions`. Deletion is soft where history refers
 to an object, critical queue/context writes are transactional, and no transaction stays open over
 a provider request. New attachment files are mode `0600` under a mode-`0700` data directory.
+Identical SHA-256/size content reuses one active attachment row and file; cleanup refuses to delete
+content referenced by either chat history or a Telegram analysis.
 
 The migration only adds tables/columns. Its one-time legacy pass reads existing `downloads` and
 safe JSON sidecars inside configured archive roots, backfills profile links and file state, and
@@ -138,7 +142,9 @@ the TUI never needs direct database access.
 Profile photo enumeration is capped at 30 per check. Saved Telegram photo IDs prevent duplicate
 downloads. The scheduler backfills due profile IDs already in SQLite and retries temporary
 failures without rewinding any source checkpoint. Privacy/RPC failures and FloodWait retry times
-are recorded on the profile and do not fail the source scan.
+are recorded on the profile and do not fail the source scan. Authorization loss, inaccessible
+peers, privacy/access restrictions, FloodWait and network failures have distinct retry classes;
+local filesystem write failures fail the photo job and are never mislabeled as network trouble.
 
 ## Offline catalog
 
@@ -190,7 +196,8 @@ bootstrap object; without it the same JavaScript performs no HTTP request, prese
 Browser writes map to a closed set of daemon IPC calls: key save, PSL preview, batch start and
 catalog refresh. The API key crosses the browser boundary only in the explicit save request and is
 never returned. The browser process does not read SQLite. Media serving accepts only resolved
-files in the snapshot's explicit current-archive allowlist and supports bounded byte ranges;
+files in the snapshot's explicit daemon-provided archive-root allowlist and supports bounded byte
+ranges;
 SQLite, Telegram sessions, AI attachments and arbitrary filesystem paths have no route.
 
 ## Progress and errors
@@ -226,8 +233,9 @@ output is treated only as data: round 1 sends no tools and executes no generated
 DeepSeek errors are mapped to stable configuration, authentication, balance, rate-limit,
 connection, request and provider-availability errors with a `retryable` signal, but round 1 never
 acts on that signal automatically. The key comes from `DEEPSEEK_API_KEY` or the user-only
-`ai.json`; it is excluded from object representations and never enters SQLite job payloads or
-events. Telegram PSL and browser interaction belong to later rounds.
+`ai.json`; configuration metadata exposes only `key_source=env|file|none`, with the environment
+taking precedence. The secret is excluded from object representations and never enters SQLite job
+payloads or events. Telegram PSL and browser interaction belong to later rounds.
 
 ## AI infrastructure — round 4
 
@@ -300,9 +308,16 @@ The 0.7 selection contract accepts either stable local `author_id` values or one
 `tg_profile_sources` relation; unknown links fail without scheduling Telegram work. Preview
 revalidates local files, defaults to four newest photos, reports prior analysis and makes no
 provider call. Local user profiles receive automatic 18+ admission while channels/chats remain
-ineligible; start still requires external-provider confirmation and then delegates every eligible
-item to the existing `queue_telegram_psl()`. A durable batch only
-groups those attempts and skipped reasons; it is not a second runner or retry system.
+ineligible. The TUI and Web preview paginate compact profile/photo-ID records, retaining full photo
+metadata only for a single profile. One explicit send button follows the external-transfer and
+possible-cost disclosure; clients set `external_confirmed`, while the Web server never invents it.
+Start delegates every eligible item to the existing `queue_telegram_psl()`. A durable batch only
+groups those attempts and skipped reasons; it is not a second runner or retry system. Its public
+states are `pending`, `queued`, `running`, `completed`, `skipped`, `failed` and
+`outcome_unknown`; totals/costs are SQL aggregates and items are paginated. Public PSL failure
+categories are limited to `invalid_json`, `json_schema_mismatch`, `invalid_psl_result`,
+`provider_error` and `outcome_unknown`. Active batches can be rediscovered over IPC, and Web keeps
+only the current batch ID in `sessionStorage` to resume polling without reloading the page.
 
 ## Current scope
 

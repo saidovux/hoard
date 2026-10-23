@@ -308,6 +308,8 @@ class AIStorage:
                 ON ai_messages(chat_id, sequence);
             CREATE INDEX IF NOT EXISTS ai_memory_scope_idx
                 ON ai_memory(scope, chat_id, updated_at DESC);
+            CREATE INDEX IF NOT EXISTS ai_attachments_content_idx
+                ON ai_attachments(sha256, size) WHERE deleted_at IS NULL;
             CREATE INDEX IF NOT EXISTS ai_prices_lookup_idx
                 ON ai_prices(provider, model, effective_from DESC);
             CREATE INDEX IF NOT EXISTS ai_attempts_created_idx
@@ -870,6 +872,20 @@ class AIStorage:
             raise ValueError("Вложение превышает локальный лимит 12 MiB")
         image = AIImage.from_file(source)
         digest = hashlib.sha256(image.data).hexdigest()
+        for existing in self.db.execute(
+            """SELECT * FROM ai_attachments
+            WHERE sha256=? AND size=? AND deleted_at IS NULL ORDER BY created_at,id""",
+            (digest, len(image.data)),
+        ):
+            path = Path(str(existing["file_path"]))
+            try:
+                if path.is_file() and path.stat().st_size == len(image.data):
+                    result = dict(existing)
+                    result.pop("file_path", None)
+                    result["_created"] = False
+                    return result
+            except OSError:
+                continue
         attachment_id = new_id()
         self.attachments_root.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.attachments_root.chmod(0o700)
@@ -908,7 +924,9 @@ class AIStorage:
             temporary.unlink(missing_ok=True)
             if not installed:
                 destination.unlink(missing_ok=True)
-        return self.get_attachment(attachment_id)
+        result = self.get_attachment(attachment_id)
+        result["_created"] = True
+        return result
 
     def get_attachment(self, attachment_id: str, *, include_path: bool = False) -> dict:
         row = self.db.execute(
@@ -930,8 +948,14 @@ class AIStorage:
         used = self.db.execute(
             "SELECT 1 FROM ai_message_attachments WHERE attachment_id=? LIMIT 1", (attachment_id,)
         ).fetchone()
+        if used is None:
+            used = self.db.execute(
+                """SELECT 1 FROM ai_telegram_analysis_photos
+                WHERE attachment_id=? LIMIT 1""",
+                (attachment_id,),
+            ).fetchone()
         if used is not None:
-            raise ValueError("Вложение уже связано с историей диалога")
+            raise ValueError("Вложение уже связано с сохранённой AI-операцией")
         Path(str(row["file_path"])).unlink(missing_ok=True)
         with self.db:
             self.db.execute(
@@ -1263,7 +1287,31 @@ class AIStorage:
         ).fetchone()
         if row is None:
             raise ValueError("Группа Telegram AI не найдена")
-        all_rows = [
+        state_sql = (
+            "CASE WHEN i.state='skipped' THEN 'skipped' "
+            "WHEN i.technical_failed=1 THEN 'failed' "
+            "ELSE COALESCE(t.state,i.state) END"
+        )
+        statistics = self.db.execute(
+            f"""SELECT COUNT(*) AS total,
+            SUM(CASE WHEN {state_sql} IN ('queued','running','pending') THEN 1 ELSE 0 END)
+                AS queued,
+            SUM(CASE WHEN {state_sql}='completed' THEN 1 ELSE 0 END) AS completed,
+            SUM(CASE WHEN {state_sql}='skipped' THEN 1 ELSE 0 END) AS skipped,
+            SUM(CASE WHEN {state_sql} IN ('failed','outcome_unknown') THEN 1 ELSE 0 END)
+                AS errors,
+            SUM(CASE WHEN t.estimated_cost IS NOT NULL AND t.cost_currency='USD'
+                THEN CAST(t.estimated_cost AS REAL) ELSE NULL END) AS usd_total,
+            SUM(CASE WHEN i.analysis_id IS NOT NULL
+                AND NOT (t.estimated_cost IS NOT NULL AND t.cost_currency='USD')
+                AND COALESCE(t.cost_status,'unknown')!='complete'
+                THEN 1 ELSE 0 END) AS unknown_cost
+            FROM ai_telegram_batch_items i
+            LEFT JOIN ai_telegram_analyses a ON a.id=i.analysis_id
+            LEFT JOIN ai_attempts t ON t.id=a.attempt_id WHERE i.batch_id=?""",
+            (str(batch_id),),
+        ).fetchone()
+        page = [
             dict(item)
             for item in self.db.execute(
                 """SELECT i.batch_id,i.author_id,i.analysis_id,
@@ -1276,18 +1324,14 @@ class AIStorage:
                 LEFT JOIN tg_profiles p ON p.author_id=i.author_id
                 LEFT JOIN ai_telegram_analyses a ON a.id=i.analysis_id
                 LEFT JOIN ai_attempts t ON t.id=a.attempt_id
-                WHERE i.batch_id=? ORDER BY i.author_id""",
-                (str(batch_id),),
+                WHERE i.batch_id=? ORDER BY i.author_id LIMIT ? OFFSET ?""",
+                (str(batch_id), page_limit, page_offset),
             )
         ]
-        queued = completed = skipped = errors = 0
-        usd_total = None
-        unknown_cost = 0
         from decimal import Decimal
 
-        for item in all_rows:
+        for item in page:
             if item["item_state"] == "skipped":
-                skipped += 1
                 item["state"] = "skipped"
                 continue
             state = str(item.get("attempt_state") or item["item_state"])
@@ -1295,17 +1339,14 @@ class AIStorage:
             item["failure_category"] = psl_failure_category(
                 state, item.get("error_code"), item.get("result_status")
             )
-            if state in {"queued", "running", "pending"}:
-                queued += 1
-            elif state == "completed":
-                completed += 1
-            elif state in {"failed", "outcome_unknown"}:
-                errors += 1
-            if item.get("estimated_cost") is not None and item.get("cost_currency") == "USD":
-                usd_total = (usd_total or Decimal("0")) + Decimal(str(item["estimated_cost"]))
-            elif item.get("analysis_id") and item.get("cost_status") != "complete":
-                unknown_cost += 1
-        page = all_rows[page_offset : page_offset + page_limit]
+            item.pop("error_code", None)
+        total = int(statistics["total"] or 0)
+        queued = int(statistics["queued"] or 0)
+        usd_total = (
+            Decimal(str(statistics["usd_total"]))
+            if statistics["usd_total"] is not None
+            else None
+        )
         result = dict(row)
         result.pop("request_payload", None)
         result.update(
@@ -1313,17 +1354,40 @@ class AIStorage:
                 "items": page,
                 "limit": page_limit,
                 "offset": page_offset,
-                "has_more": page_offset + len(page) < len(all_rows),
+                "has_more": page_offset + len(page) < total,
                 "queued": queued,
-                "completed": completed,
-                "skipped": skipped,
-                "errors": errors,
+                "completed": int(statistics["completed"] or 0),
+                "skipped": int(statistics["skipped"] or 0),
+                "errors": int(statistics["errors"] or 0),
                 "estimated_cost_usd": format(usd_total, "f") if usd_total is not None else None,
-                "unknown_cost": unknown_cost,
+                "unknown_cost": int(statistics["unknown_cost"] or 0),
                 "terminal": queued == 0,
             }
         )
         return result
+
+    def list_telegram_batches(self, *, active_only: bool, limit: Any = 20) -> list[dict]:
+        page_limit = max(1, min(100, int(limit)))
+        active = ""
+        if active_only:
+            active = """AND EXISTS (
+                SELECT 1 FROM ai_telegram_batch_items i
+                LEFT JOIN ai_telegram_analyses a ON a.id=i.analysis_id
+                LEFT JOIN ai_attempts t ON t.id=a.attempt_id
+                WHERE i.batch_id=b.id AND (
+                    (i.state='pending' AND i.technical_failed=0)
+                    OR t.state IN ('queued','running')
+                )
+            )"""
+        identifiers = [
+            str(item["id"])
+            for item in self.db.execute(
+                f"""SELECT b.id FROM ai_telegram_batches b
+                WHERE 1=1 {active} ORDER BY b.created_at DESC,b.id DESC LIMIT ?""",
+                (page_limit,),
+            )
+        ]
+        return [self.telegram_batch(identifier, limit=20) for identifier in identifiers]
 
     def list_telegram_analyses(
         self,
@@ -1364,6 +1428,41 @@ class AIStorage:
             "offset": page_offset,
             "has_more": len(rows) > page_limit,
         }
+
+    def latest_telegram_analyses(
+        self, author_ids: list[int]
+    ) -> dict[int, dict[str, Any]]:
+        """Return one compact latest analysis per author without N+1 queries."""
+        identifiers = list(dict.fromkeys(int(item) for item in author_ids if int(item) > 0))
+        result: dict[int, dict[str, Any]] = {}
+        for start in range(0, len(identifiers), 500):
+            chunk = identifiers[start : start + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = self.db.execute(
+                f"""WITH ranked AS (
+                    SELECT a.author_id,a.result_status,a.raw_psl_min,a.raw_psl_max,
+                    a.analyzed_at,a.created_at,t.state AS attempt_state,t.error_code,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY a.author_id
+                        ORDER BY COALESCE(t.completed_at,a.analyzed_at,a.created_at) DESC,
+                        a.id DESC
+                    ) AS position
+                    FROM ai_telegram_analyses a
+                    JOIN ai_attempts t ON t.id=a.attempt_id
+                    WHERE a.author_id IN ({placeholders})
+                ) SELECT * FROM ranked WHERE position=1""",
+                tuple(chunk),
+            )
+            for row in rows:
+                item = dict(row)
+                item.pop("position", None)
+                item["failure_category"] = psl_failure_category(
+                    item.get("attempt_state"),
+                    item.pop("error_code", None),
+                    item.get("result_status"),
+                )
+                result[int(item["author_id"])] = item
+        return result
 
     def catalog_telegram_analyses(self) -> list[dict[str, Any]]:
         """Read the complete compact PSL journal in one ordered query for HTML export."""

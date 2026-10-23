@@ -69,6 +69,39 @@ async def test_current_daemon_version_and_protocol_are_accepted(monkeypatch):
     await ensure_daemon()
 
 
+async def test_initializing_daemon_is_waited_for_without_starting_a_second_process(
+    tmp_path, monkeypatch
+):
+    calls = 0
+    started = False
+
+    async def becoming_ready(method, args=None, timeout=12):
+        nonlocal calls
+        assert method == "status"
+        calls += 1
+        if calls == 1:
+            raise OSError("socket not ready")
+        return {"version": __version__, "protocol": IPC_PROTOCOL}
+
+    async def immediate_sleep(_seconds):
+        return None
+
+    def unexpected_start(*args, **kwargs):
+        nonlocal started
+        started = True
+
+    monkeypatch.setattr("hoard.ipc.request", becoming_ready)
+    monkeypatch.setattr("hoard.ipc.state_dir", lambda: tmp_path)
+    monkeypatch.setattr("hoard.ipc.instance_running", lambda _path: True)
+    monkeypatch.setattr("hoard.ipc.asyncio.sleep", immediate_sleep)
+    monkeypatch.setattr("hoard.ipc.subprocess.Popen", unexpected_start)
+
+    await ensure_daemon()
+
+    assert calls == 2
+    assert started is False
+
+
 @pytest.mark.skipif(os.name == "nt", reason="Unix sockets require Linux/macOS")
 async def test_socket_returns_small_error_instead_of_oversized_response(tmp_path):
     class Stub:

@@ -107,7 +107,9 @@ class AIIPC:
             return {"message": "Запись памяти удалена"}
 
         if method == "ai_attachment_import":
-            return {"attachment": self.storage.import_attachment(str(args.get("path") or ""))}
+            attachment = self.storage.import_attachment(str(args.get("path") or ""))
+            attachment.pop("_created", None)
+            return {"attachment": attachment}
         if method == "ai_attachment_get":
             return {"attachment": self.storage.get_attachment(self._id(args))}
         if method == "ai_attachment_delete":
@@ -243,6 +245,13 @@ class AIIPC:
                     self._id(args),
                     limit=args.get("limit", 100),
                     offset=args.get("offset", 0),
+                )
+            }
+        if method == "ai_telegram_batch_list":
+            return {
+                "items": self.storage.list_telegram_batches(
+                    active_only=bool(args.get("active_only", False)),
+                    limit=args.get("limit", 20),
                 )
             }
         if method == "ai_telegram_analysis_get":

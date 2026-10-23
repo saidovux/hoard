@@ -172,7 +172,7 @@ async def test_invalid_minor_result_is_terminal_and_never_scores(tmp_path):
     assert saved["raw_psl_min"] is None
     assert saved["attempt"]["state"] == "failed"
     assert saved["attempt"]["error_code"] == "invalid_psl_result"
-    assert saved["failure_category"] == "invalid_result"
+    assert saved["failure_category"] == "invalid_psl_result"
     store.close()
 
 

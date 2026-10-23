@@ -687,3 +687,6 @@ def test_frontend_has_independent_list_state_local_history_and_bounded_media():
     assert 'video.preload = "none"' in app
     assert "fetch(" not in app
     assert ".innerHTML" not in app
+    assert "external_confirmed: true" in app
+    assert "Возрастной допуск 18+ применяется автоматически" in app
+    assert "external-confirmed" not in app

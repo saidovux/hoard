@@ -43,6 +43,26 @@ class AuthFlowError(RuntimeError):
         self.code = code
 
 
+class ProfilePhotoWriteError(OSError):
+    """A local archive write failed, rather than the Telegram transfer."""
+
+
+class _ProfilePhotoStream:
+    """Translate file write errors raised inside Telethon into a local failure."""
+
+    def __init__(self, stream):
+        self.stream = stream
+
+    def write(self, value):
+        try:
+            return self.stream.write(value)
+        except OSError as exc:
+            raise ProfilePhotoWriteError(str(exc)) from exc
+
+    def __getattr__(self, name):
+        return getattr(self.stream, name)
+
+
 class TelegramEngine:
     def __init__(self, store, report_progress=None):
         self.store = store
@@ -733,7 +753,11 @@ class TelegramEngine:
         try:
             client = await self.connect()
             if not await client.is_user_authorized():
-                raise RuntimeError("Telegram не подключён")
+                raise AuthFlowError(
+                    "Сессия Telegram недействительна; подключи аккаунт заново",
+                    AuthState.PHONE_REQUIRED,
+                    code="authorization",
+                )
             entity = await client.get_entity(int(author_id))
             identity = self._sender_identity(entity, int(author_id))
             self.store.telegram.observe_profile(
@@ -762,17 +786,34 @@ class TelegramEngine:
                 output = profile_photo_path(
                     self.store.telegram.archive_root(), int(author_id), photo_id
                 )
-                ensure_private(output.parent)
                 partial = output.with_name(f"{output.name}.part")
-                partial.unlink(missing_ok=True)
                 try:
+                    try:
+                        ensure_private(output.parent)
+                        partial.unlink(missing_ok=True)
+                    except OSError as exc:
+                        raise ProfilePhotoWriteError(str(exc)) from exc
                     with partial.open("wb") as stream:
-                        result = await client.download_media(photo, file=stream)
-                        stream.flush()
-                        os.fsync(stream.fileno())
-                    if result is None or not partial.is_file() or partial.stat().st_size == 0:
-                        raise OSError("Telegram не вернул фотографию профиля")
-                    os.replace(partial, output)
+                        result = await client.download_media(
+                            photo, file=_ProfilePhotoStream(stream)
+                        )
+                        try:
+                            stream.flush()
+                            os.fsync(stream.fileno())
+                        except OSError as exc:
+                            raise ProfilePhotoWriteError(str(exc)) from exc
+                    if result is None:
+                        raise RuntimeError("Telegram не вернул фотографию профиля")
+                    try:
+                        if not partial.is_file() or partial.stat().st_size == 0:
+                            raise ProfilePhotoWriteError(
+                                "Загруженная фотография профиля пуста"
+                            )
+                        os.replace(partial, output)
+                    except OSError as exc:
+                        if isinstance(exc, ProfilePhotoWriteError):
+                            raise
+                        raise ProfilePhotoWriteError(str(exc)) from exc
                 except BaseException:
                     partial.unlink(missing_ok=True)
                     raise
@@ -787,17 +828,45 @@ class TelegramEngine:
         except Exception as exc:
             retry = 6 * 60 * 60
             error_code = "unavailable"
+            fatal = False
             try:
                 from telethon.errors import (
+                    AuthKeyUnregisteredError,
                     ChannelPrivateError,
                     FloodWaitError,
+                    PeerIdInvalidError,
                     RPCError,
+                    SessionExpiredError,
+                    SessionRevokedError,
+                    UserIdInvalidError,
+                    UsernameInvalidError,
+                    UsernameNotOccupiedError,
                     UserNotParticipantError,
                     UserpicPrivacyRequiredError,
                     UserPrivacyRestrictedError,
                 )
 
-                if isinstance(exc, FloodWaitError):
+                if isinstance(exc, AuthFlowError):
+                    retry = 5 * 60
+                    error_code = "authorization"
+                    message = str(exc)
+                elif isinstance(exc, ProfilePhotoWriteError):
+                    retry = 60 * 60
+                    error_code = "local_write"
+                    message = "Не удалось записать фотографию в локальный архив"
+                    fatal = True
+                elif isinstance(
+                    exc,
+                    (
+                        AuthKeyUnregisteredError,
+                        SessionExpiredError,
+                        SessionRevokedError,
+                    ),
+                ):
+                    retry = 5 * 60
+                    error_code = "authorization"
+                    message = "Сессия Telegram недействительна; подключи аккаунт заново"
+                elif isinstance(exc, FloodWaitError):
                     retry = max(60, int(exc.seconds) + 3)
                     error_code = "flood_wait"
                     message = f"Telegram ограничил фотографии; повтор через {exc.seconds} с."
@@ -809,6 +878,18 @@ class TelegramEngine:
                 elif isinstance(exc, (ChannelPrivateError, UserNotParticipantError)):
                     error_code = "access_denied"
                     message = "Нет доступа к фотографиям этого Telegram-профиля"
+                elif isinstance(
+                    exc,
+                    (
+                        PeerIdInvalidError,
+                        UserIdInvalidError,
+                        UsernameInvalidError,
+                        UsernameNotOccupiedError,
+                    ),
+                ):
+                    retry = 24 * 60 * 60
+                    error_code = "peer_unavailable"
+                    message = "Telegram-профиль удалён, переименован или больше недоступен"
                 elif isinstance(exc, (OSError, TimeoutError)):
                     retry = 5 * 60
                     error_code = "network"
@@ -826,6 +907,8 @@ class TelegramEngine:
                 error_code=error_code,
                 retry_after=retry,
             )
+            if fatal:
+                raise RuntimeError(message) from exc
             return message
         self.store.telegram.finish_profile_photo_check(int(author_id))
         return f"Фотографии профиля обновлены; новых: {saved}"

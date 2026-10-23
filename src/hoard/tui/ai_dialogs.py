@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+from collections import Counter
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 from textual.app import ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, VerticalScroll
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Button, Input, Label, Select, SelectionList, Static, TextArea
 
@@ -235,8 +237,9 @@ class TelegramAIDialog(ModalScreen[dict[str, Any] | None]):
         with VerticalScroll(classes="dialog telegram-ai-dialog"):
             yield Static(f"Telegram AI · {name}", classes="dialog-title")
             yield Static(
-                "PSL — субъективная, ненаучная визуальная оценка. Не выбирай фото, если "
-                "совершеннолетие человека не подтверждено вне изображения.",
+                "PSL — субъективная, ненаучная визуальная оценка. Возрастной допуск 18+ "
+                "применяется автоматически. Выбранные фото будут отправлены в DeepSeek; "
+                "запрос может быть платным.",
                 classes="dialog-message",
             )
             yield Label("Фото: введи 1–4 ID через запятую", classes="field-label")
@@ -289,7 +292,11 @@ class TelegramAIDialog(ModalScreen[dict[str, Any] | None]):
             )
             yield Static(id="telegram-ai-error", classes="dialog-error")
             with Horizontal(classes="dialog-actions"):
-                yield Button("Продолжить", id="telegram-ai-submit", variant="primary")
+                yield Button(
+                    "Отправить фото в DeepSeek и запустить анализ",
+                    id="telegram-ai-submit",
+                    variant="primary",
+                )
                 yield Button("Открыть первое фото", id="telegram-ai-open")
                 yield Button("Отмена", id="telegram-ai-cancel")
 
@@ -372,134 +379,205 @@ class AIKeyDialog(ModalScreen[str | None]):
 
 
 class TelegramAnalysisDialog(ModalScreen[dict[str, Any] | None]):
-    """Review exact local photos before an explicit external request."""
+    """Paginated review of an immutable local-photo selection."""
 
     BINDINGS = [Binding("escape", "cancel", "Отмена")]
 
-    def __init__(self, preview: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        preview: dict[str, Any],
+        *,
+        page_loader: Callable[[int], Awaitable[dict[str, Any]]] | None = None,
+    ) -> None:
         super().__init__()
         self.preview = preview
-        self.items = list(preview.get("items") or [])
+        self.page_loader = page_loader
         self.single = int(preview.get("selected_count") or 0) == 1
+        self.page_limit = max(1, int(preview.get("limit") or 20))
+        self.page_offset = max(0, int(preview.get("offset") or 0))
+        self.pages: dict[int, dict[str, Any]] = {self.page_offset: preview}
+        self.photo_ids: dict[str, list[str]] = {}
+        self.photo_snapshots: dict[str, str] = {}
+        self._ingest(preview)
 
-    @staticmethod
-    def _profile_label(item: dict[str, Any]) -> str:
-        name = item.get("display_name") or item.get("username") or f"ID {item['author_id']}"
-        username = f" · @{item['username']}" if item.get("username") else ""
-        return f"{name}{username} · {item.get('photo_count', 0)} фото"
+    def _ingest(self, page: dict[str, Any]) -> None:
+        for item in page.get("items") or []:
+            author_id = int(item.get("author_id") or 0)
+            selected = [str(value) for value in item.get("selected_photo_ids") or []]
+            if author_id > 0 and selected:
+                key = str(author_id)
+                self.photo_ids.setdefault(key, selected)
+                snapshot = str(item.get("photo_snapshot") or "")
+                if snapshot:
+                    self.photo_snapshots.setdefault(key, snapshot)
 
     def compose(self) -> ComposeResult:
         source = self.preview.get("source") or {}
         title = "Анализ профиля" if self.single else "Анализ выбранных профилей"
         if source:
             title = "Профили публикации"
-        with VerticalScroll(classes="dialog telegram-analysis-dialog"):
-            yield Static(title, classes="dialog-title")
-            yield Static(
-                f"Выбрано: {self.preview.get('selected_count', 0)} · "
-                f"локальных фото: {self.preview.get('photo_count', 0)}. "
-                "Preview не обращается к Telegram и не отправляет данные в DeepSeek.",
-                classes="dialog-message",
-            )
-            if source:
-                channel = (
-                    source.get("channel_title")
-                    or source.get("title")
-                    or source.get("username")
-                )
+        with Vertical(classes="dialog telegram-analysis-dialog"):
+            with VerticalScroll(id="analysis-scroll"):
+                yield Static(title, classes="dialog-title")
                 yield Static(
-                    f"Публикация: {channel} #{source.get('post_id')}", classes="table-help"
+                    f"Выбрано: {self.preview.get('selected_count', 0)} · "
+                    f"локальных фото: {self.preview.get('photo_count', 0)}. "
+                    "Предпросмотр не обращается к Telegram и DeepSeek.",
+                    classes="dialog-message",
                 )
-            if self.single and self.items:
-                item = self.items[0]
-                yield Label("Фотографии (до четырёх)", classes="field-label")
-                selected = set(item.get("selected_photo_ids") or [])
-                photo_options = [
-                    (
-                        f"{photo['photo_id']} · {photo.get('date') or 'без даты'} · "
-                        f"{photo.get('size') or 0} байт",
-                        str(photo["photo_id"]),
-                        str(photo["photo_id"]) in selected,
+                if source:
+                    channel = (
+                        source.get("channel_title")
+                        or source.get("title")
+                        or source.get("username")
                     )
-                    for photo in item.get("photos") or []
-                    if photo.get("available")
-                ]
-                if photo_options:
-                    yield SelectionList(*photo_options, id="analysis-photos")
-                else:
-                    yield Static("Доступных локальных фотографий нет.", classes="dialog-error")
-                previous = item.get("previous") or {}
-                if previous:
-                    previous_status = (
-                        previous.get("result_status")
-                        or previous.get("attempt_state")
-                        or "—"
-                    )
-                    raw_min = previous.get("raw_psl_min")
-                    raw_max = previous.get("raw_psl_max")
                     yield Static(
-                        f"Предыдущий анализ: {previous_status} · "
-                        f"Raw {raw_min if raw_min is not None else '—'}"
-                        f"–{raw_max if raw_max is not None else '—'}",
+                        f"Публикация: {channel} #{source.get('post_id')}",
                         classes="table-help",
                     )
-            yield Static(
-                "Возрастной допуск для локальных пользовательских профилей: 18+ автоматически.",
-                classes="table-help",
-            )
-            skipped = [item for item in self.items if not item.get("selected_photo_ids")]
-            if skipped:
-                lines = [
-                    f"ID {item['author_id']}: {item.get('reason') or 'будет пропущен'}"
-                    for item in skipped[:20]
-                ]
-                yield Static("\n".join(lines), classes="dialog-error")
-            if self.preview.get("has_more"):
+                yield Static(id="analysis-page-label", classes="table-help")
+                yield Static(id="analysis-page-items")
+                if self.single and (self.preview.get("items") or []):
+                    item = self.preview["items"][0]
+                    yield Label("Фотографии (до четырёх)", classes="field-label")
+                    selected = set(item.get("selected_photo_ids") or [])
+                    options = [
+                        (
+                            f"{photo['photo_id']} · {photo.get('date') or 'без даты'} · "
+                            f"{photo.get('size') or 0} байт",
+                            str(photo["photo_id"]),
+                            str(photo["photo_id"]) in selected,
+                        )
+                        for photo in item.get("photos") or []
+                        if photo.get("available")
+                    ]
+                    if options:
+                        yield SelectionList(*options, id="analysis-photos")
+                    else:
+                        yield Static(
+                            "Доступных локальных фотографий нет.", classes="dialog-error"
+                        )
+                yield Static(id="analysis-skipped", classes="dialog-error")
                 yield Static(
-                    "Список длиннее одной страницы. Непоказанные профили останутся без "
-                    "подтверждения и будут пропущены.",
+                    "Возрастной допуск 18+ применяется автоматически. Будут отправлены только "
+                    "указанные локальные фото; запрос DeepSeek может быть платным, "
+                    "автоматического платного повтора нет.",
                     classes="table-help",
                 )
-            yield Static(id="analysis-error", classes="dialog-error")
+                yield Static(id="analysis-error", classes="dialog-error")
+            with Horizontal(classes="analysis-pages"):
+                yield Button("← Страница", id="analysis-previous")
+                yield Button("Страница →", id="analysis-next")
             with Horizontal(classes="dialog-actions"):
-                yield Button("Продолжить", id="analysis-submit", variant="primary")
+                count = int(
+                    self.preview.get("selected_photo_count")
+                    or sum(len(value) for value in self.photo_ids.values())
+                )
+                yield Button(
+                    f"Отправить {count} фото в DeepSeek и запустить анализ",
+                    id="analysis-submit",
+                    variant="primary",
+                )
                 yield Button("Отмена", id="analysis-cancel")
 
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id == "analysis-cancel":
-            self.dismiss(None)
-            return
-        photo_ids = {
-            str(item["author_id"]): [str(photo) for photo in item.get("selected_photo_ids") or []]
-            for item in self.items
-            if item.get("selected_photo_ids") and int(item["author_id"]) > 0
-        }
-        photo_snapshots = {
-            str(item["author_id"]): str(item["photo_snapshot"])
-            for item in self.items
-            if item.get("photo_snapshot") and int(item["author_id"]) > 0
-        }
-        if self.single and self.items and self.query("#analysis-photos"):
-            photos = list(self.query_one("#analysis-photos", SelectionList).selected)
-            if not 1 <= len(photos) <= 4:
-                self.query_one("#analysis-error", Static).update("Выбери от 1 до 4 фото.")
+    def on_mount(self) -> None:
+        self._render_page()
+
+    @staticmethod
+    def _profile_line(item: dict[str, Any]) -> str:
+        name = item.get("display_name") or item.get("username") or f"ID {item['author_id']}"
+        previous = item.get("previous") or {}
+        previous_status = previous.get("result_status") or previous.get("attempt_state")
+        suffix = f" · предыдущий: {previous_status}" if previous_status else ""
+        return f"{name} · ID {item['author_id']} · {item.get('photo_count', 0)} фото{suffix}"
+
+    def _render_page(self) -> None:
+        page = self.pages[self.page_offset]
+        items = list(page.get("items") or [])
+        start = self.page_offset + 1 if items else 0
+        end = self.page_offset + len(items)
+        self.query_one("#analysis-page-label", Static).update(
+            f"Профили {start}–{end} из {page.get('selected_count', 0)}"
+        )
+        lines = [self._profile_line(item) for item in items if item.get("selected_photo_ids")]
+        self.query_one("#analysis-page-items", Static).update("\n".join(lines))
+        reasons = Counter(
+            str(item.get("reason") or "будет пропущен")
+            for item in items
+            if not item.get("selected_photo_ids")
+        )
+        reason_text = " · ".join(f"{reason}: {count}" for reason, count in reasons.items())
+        skipped = int(page.get("skipped_count") or 0)
+        self.query_one("#analysis-skipped", Static).update(
+            f"Пропущено всего: {skipped}. {reason_text}" if skipped else ""
+        )
+        self.query_one("#analysis-previous", Button).disabled = self.page_offset <= 0
+        self.query_one("#analysis-next", Button).disabled = not bool(page.get("has_more"))
+
+    def _save_single_selection(self) -> bool:
+        if not self.single or not self.query("#analysis-photos"):
+            return True
+        item = (self.preview.get("items") or [None])[0]
+        if not item:
+            return True
+        selected = [str(value) for value in self.query_one(
+            "#analysis-photos", SelectionList
+        ).selected]
+        if not 1 <= len(selected) <= 4:
+            self.query_one("#analysis-error", Static).update("Выбери от 1 до 4 фото.")
+            return False
+        key = str(item["author_id"])
+        self.photo_ids[key] = selected
+        if selected != [str(value) for value in item.get("selected_photo_ids") or []]:
+            self.photo_snapshots.pop(key, None)
+        return True
+
+    async def _load_page(self, offset: int) -> None:
+        if offset not in self.pages:
+            if self.page_loader is None:
                 return
-            photo_ids[str(self.items[0]["author_id"])] = [str(item) for item in photos]
-            if photo_ids[str(self.items[0]["author_id"])] != list(
-                self.items[0].get("selected_photo_ids") or []
-            ):
-                photo_snapshots.pop(str(self.items[0]["author_id"]), None)
-        if not photo_ids:
+            try:
+                page = await self.page_loader(offset)
+            except Exception as exc:
+                self.query_one("#analysis-error", Static).update(
+                    str(exc) or type(exc).__name__
+                )
+                return
+            self.pages[offset] = page
+            self._ingest(page)
+        self.page_offset = offset
+        self._render_page()
+
+    async def _finish(self) -> None:
+        total = int(self.preview.get("selected_count") or 0)
+        for offset in range(0, total, self.page_limit):
+            if offset not in self.pages:
+                await self._load_page(offset)
+                if offset not in self.pages:
+                    return
+        if not self.photo_ids:
             self.query_one("#analysis-error", Static).update(
                 "Нет подходящих локальных пользовательских профилей с фотографиями."
             )
             return
         self.dismiss(
             {
-                "photo_ids": photo_ids,
-                "photo_snapshots": photo_snapshots,
+                "photo_ids": self.photo_ids,
+                "photo_snapshots": self.photo_snapshots,
             }
         )
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        identifier = str(event.button.id)
+        if identifier == "analysis-cancel":
+            self.dismiss(None)
+        elif identifier == "analysis-previous":
+            self.run_worker(self._load_page(max(0, self.page_offset - self.page_limit)))
+        elif identifier == "analysis-next":
+            self.run_worker(self._load_page(self.page_offset + self.page_limit))
+        elif identifier == "analysis-submit" and self._save_single_selection():
+            event.button.disabled = True
+            self.run_worker(self._finish())
 
     def action_cancel(self) -> None:
         self.dismiss(None)

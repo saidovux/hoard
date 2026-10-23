@@ -11,6 +11,7 @@ from hoard.ai import AICore, AIResponse
 from hoard.ai.config import DEFAULT_DEEPSEEK_MODEL
 from hoard.ai.provider import AIProvider
 from hoard.ai.psl import DEFAULT_PSL_INSTRUCTIONS, PSL_OUTPUT_FORMAT
+from hoard.ipc import encode_ipc_message
 from hoard.models import Post
 from hoard.service import Service
 from hoard.storage import Store
@@ -124,6 +125,50 @@ async def test_source_preview_is_local_complete_and_has_no_80_profile_cap(tmp_pa
     store.close()
 
 
+async def test_batch_preview_fits_ipc_for_100x20(tmp_path):
+    service, store, _provider, _source_id = workflow_service(tmp_path, profile_count=100)
+    archive = tmp_path / "archive"
+    paths = []
+    for photo_index in range(20):
+        path = archive / f"shared-{photo_index}.png"
+        path.write_bytes(b"\x89PNG\r\n\x1a\n" + f"photo-{photo_index}".encode())
+        paths.append(path)
+    with store.db:
+        store.db.execute("DELETE FROM tg_profile_photos")
+        store.db.executemany(
+            """INSERT INTO tg_profile_photos(
+            author_id,photo_id,file_path,size,photo_date,status,error)
+            VALUES(?,?,?,?,?,'saved','')""",
+            [
+                (
+                    author_id,
+                    f"photo-{photo_index}",
+                    str(path),
+                    path.stat().st_size,
+                    "2026-10-22",
+                )
+                for author_id in range(1, 101)
+                for photo_index, path in enumerate(paths)
+            ],
+        )
+
+    preview = (
+        await service.handle(
+            "ai_telegram_batch_preview",
+            {"author_ids": list(range(1, 101)), "limit": 100, "offset": 0},
+        )
+    )["preview"]
+    encoded = encode_ipc_message({"ok": True, "data": {"preview": preview}})
+
+    assert len(encoded) < 48 * 1024
+    assert preview["selected_count"] == 100
+    assert preview["photo_count"] == 2000
+    assert preview["selected_photo_count"] == 400
+    assert all(item["photos"] == [] for item in preview["items"])
+    assert all(len(item["selected_photo_ids"]) == 4 for item in preview["items"])
+    store.close()
+
+
 async def test_batch_uses_automatic_adult_admission_and_is_idempotent(tmp_path):
     service, store, provider, source_id = workflow_service(tmp_path, profile_count=3)
     third = tmp_path / "archive" / "third.png"
@@ -163,6 +208,11 @@ async def test_batch_uses_automatic_adult_admission_and_is_idempotent(tmp_path):
     assert finished["terminal"] is True
     assert len(provider.requests) == 2
     assert len(provider.requests[0].messages[-1].images) == 2
+    middle_page = store.ai.telegram_batch(first["id"], limit=1, offset=1)
+    assert len(middle_page["items"]) == 1
+    assert middle_page["completed"] == 2
+    assert middle_page["skipped"] == 1
+    assert middle_page["has_more"] is True
 
     database = store.filename
     store.close()

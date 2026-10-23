@@ -92,22 +92,30 @@ class AIChatService:
                 "системные инструкции и сообщение не обрезаны"
             )
 
-        history = [
+        remaining = config["context_limit"] - required_chars
+        history_total = int(
+            self.storage.db.execute(
+                """SELECT COUNT(*) FROM ai_messages
+                WHERE chat_id=? AND state IN ('completed','failed')""",
+                (chat_id,),
+            ).fetchone()[0]
+        )
+        chosen_reversed = [
             dict(row)
             for row in self.storage.db.execute(
-                """SELECT * FROM ai_messages WHERE chat_id=? AND state IN ('completed','failed')
-                ORDER BY sequence DESC""",
-                (chat_id,),
+                """WITH newest AS (
+                    SELECT m.*,
+                    SUM(LENGTH(content)) OVER (
+                        ORDER BY sequence DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                    ) AS cumulative_chars
+                    FROM ai_messages m
+                    WHERE chat_id=? AND state IN ('completed','failed')
+                )
+                SELECT * FROM newest WHERE cumulative_chars<=? ORDER BY sequence DESC""",
+                (chat_id, remaining),
             )
         ]
-        remaining = config["context_limit"] - required_chars
-        chosen_reversed: list[dict] = []
-        for message in history:
-            size = len(str(message["content"]))
-            if size > remaining:
-                break
-            chosen_reversed.append(message)
-            remaining -= size
+        remaining -= sum(len(str(message["content"])) for message in chosen_reversed)
         chosen = list(reversed(chosen_reversed))
         timestamp = now_utc()
         attempt_id = new_id()
@@ -122,7 +130,7 @@ class AIChatService:
             "context_limit": config["context_limit"],
             "used_characters": config["context_limit"] - remaining,
             "history_messages_used": len(chosen),
-            "history_messages_omitted": len(history) - len(chosen),
+            "history_messages_omitted": history_total - len(chosen),
             "memory_entries": len(selected_memory),
             "attachments": len(selected_attachments),
         }
@@ -376,6 +384,8 @@ class AIChatService:
             return self.storage.telegram_analysis(analysis_id)
         except Exception:
             for _photo, attachment in imported:
+                if not attachment.get("_created"):
+                    continue
                 try:
                     self.storage.delete_attachment(str(attachment["id"]))
                 except ValueError:
@@ -450,6 +460,8 @@ class AIChatService:
             identifiers = self.telegram_storage.source_profiles(selected_source)
         else:
             identifiers = self._author_ids(author_ids)
+        previous_by_author = self.storage.latest_telegram_analyses(identifiers)
+        include_photo_details = len(identifiers) == 1
         raw_photo_map = photo_ids if isinstance(photo_ids, dict) else {}
         raw_snapshot_map = photo_snapshots if isinstance(photo_snapshots, dict) else {}
         candidates: list[dict[str, Any]] = []
@@ -472,7 +484,7 @@ class AIChatService:
                 )
                 continue
             try:
-                profile = self.telegram_storage.get_profile(author_id)
+                profile = self.telegram_storage.get_profile_identity(author_id)
             except ValueError:
                 # Explicit IDs are never expanded or replaced by usernames.
                 candidates.append(
@@ -540,18 +552,19 @@ class AIChatService:
                     snapshot = ""
                     reason = "Фото изменились после предпросмотра"
             adult_confirmed = True
-            previous_page = self.storage.list_telegram_analyses(
-                author_id=author_id, successful_only=False, limit=1, offset=0
+            photos = (
+                [
+                    {
+                        "photo_id": str(item["photo_id"]),
+                        "date": str(item.get("photo_date") or ""),
+                        "size": int(item.get("size") or 0),
+                        "available": bool(item.get("available")),
+                    }
+                    for item in stored_photos
+                ]
+                if include_photo_details
+                else []
             )
-            photos = [
-                {
-                    "photo_id": str(item["photo_id"]),
-                    "date": str(item.get("photo_date") or ""),
-                    "size": int(item.get("size") or 0),
-                    "available": bool(item.get("available")),
-                }
-                for item in profile.get("photos", [])
-            ]
             candidates.append(
                 {
                     "author_id": author_id,
@@ -564,7 +577,7 @@ class AIChatService:
                     "adult_confirmed": adult_confirmed,
                     "ready": bool(selected and adult_confirmed and not reason),
                     "reason": reason,
-                    "previous": (previous_page.get("items") or [None])[0],
+                    "previous": previous_by_author.get(author_id),
                 }
             )
         return candidates, selected_source
@@ -595,6 +608,9 @@ class AIChatService:
             "source": source,
             "selected_count": len(candidates),
             "photo_count": sum(int(item["photo_count"]) for item in candidates),
+            "selected_photo_count": sum(
+                len(item["selected_photo_ids"]) for item in candidates
+            ),
             "ready_count": sum(1 for item in candidates if item["ready"]),
             "skipped_count": sum(1 for item in candidates if not item["ready"]),
             "items": page,

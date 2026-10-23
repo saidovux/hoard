@@ -26,7 +26,7 @@ from textual.widgets import (
 
 from .ai_dialogs import AIKeyDialog, TelegramAIDialog, TelegramAnalysisDialog
 from .api import HoardAPI, IPCStatusAPI
-from .dialogs import AuthDialog, ConfirmDialog
+from .dialogs import AuthDialog
 from .navigation import SECTIONS, section_index
 from .screens import (
     ActivityScreen,
@@ -263,9 +263,22 @@ class HoardApp(App[None]):
         )
 
     async def _preview_telegram_analysis(self, selector: dict[str, Any]) -> None:
+        page_limit = 20
+
+        async def load_page(offset: int) -> dict[str, Any]:
+            result = await self.api.ai_call(
+                "ai_telegram_batch_preview",
+                {**selector, "limit": page_limit, "offset": offset},
+            )
+            preview_page = result.get("preview")
+            if not isinstance(preview_page, dict):
+                raise RuntimeError("Daemon не вернул страницу preview анализа")
+            return preview_page
+
         try:
             result = await self.api.ai_call(
-                "ai_telegram_batch_preview", {**selector, "limit": 100, "offset": 0}
+                "ai_telegram_batch_preview",
+                {**selector, "limit": page_limit, "offset": 0},
             )
         except Exception as exc:
             self.set_notice(str(exc) or type(exc).__name__, error=True)
@@ -278,7 +291,7 @@ class HoardApp(App[None]):
             self.set_notice("Daemon не вернул preview анализа.", error=True)
             return
         self.push_screen(
-            TelegramAnalysisDialog(preview),
+            TelegramAnalysisDialog(preview, page_loader=load_page),
             lambda choices: self._confirm_telegram_analysis(selector, choices),
         )
 
@@ -309,18 +322,10 @@ class HoardApp(App[None]):
     ) -> None:
         if not values or values.get("open_photo_id"):
             return
-        self.push_screen(
-            ConfirmDialog(
-                "Отправить фотографии в DeepSeek?",
-                "Возрастной допуск 18+ применяется автоматически. Фото будут отправлены "
-                "DeepSeek; запрос может быть платным, автоматического повтора не будет.",
-                confirm_label="Отправить",
-            ),
-            lambda confirmed: self.run_worker(
-                self._start_legacy_telegram_analysis(author_id, values), exit_on_error=False
-            )
-            if confirmed
-            else None,
+        self.run_worker(
+            self._start_legacy_telegram_analysis(author_id, values),
+            name="telegram-analysis-start",
+            exit_on_error=False,
         )
 
     async def _start_legacy_telegram_analysis(
@@ -352,22 +357,10 @@ class HoardApp(App[None]):
         if not choices:
             return
         operation_id = uuid.uuid4().hex
-        self.push_screen(
-            ConfirmDialog(
-                "Отправить фотографии в DeepSeek?",
-                "В DeepSeek будут отправлены только показанные локальные фотографии "
-                "подтверждённых профилей. Запрос может быть платным; автоматического "
-                "повтора не будет. "
-                "PSL субъективен и не является научной оценкой.",
-                confirm_label="Отправить",
-            ),
-            lambda confirmed: self.run_worker(
-                self._start_telegram_analysis(selector, choices, operation_id),
-                name="telegram-analysis-start",
-                exit_on_error=False,
-            )
-            if confirmed
-            else None,
+        self.run_worker(
+            self._start_telegram_analysis(selector, choices, operation_id),
+            name="telegram-analysis-start",
+            exit_on_error=False,
         )
 
     async def _start_telegram_analysis(
@@ -417,6 +410,29 @@ class HoardApp(App[None]):
             if batch.get("terminal"):
                 return
         self.set_notice("Группа продолжает выполняться в daemon; её можно открыть позже.")
+
+    def reopen_active_telegram_batch(self) -> None:
+        self.run_worker(
+            self._reopen_active_telegram_batch(),
+            name="telegram-analysis-reopen",
+            exit_on_error=False,
+        )
+
+    async def _reopen_active_telegram_batch(self) -> None:
+        try:
+            result = await self.api.ai_call(
+                "ai_telegram_batch_list", {"active_only": True, "limit": 1}
+            )
+        except Exception as exc:
+            self.set_notice(str(exc) or type(exc).__name__, error=True)
+            return
+        items = list(result.get("items") or [])
+        if not items:
+            self.set_notice("Активных Telegram AI-групп нет.")
+            return
+        batch = items[0]
+        self.set_notice(f"Возобновляем наблюдение за группой {batch['id']}…")
+        await self._poll_telegram_batch(str(batch["id"]))
 
     def open_web_interface(self) -> None:
         self.run_worker(

@@ -287,6 +287,57 @@ async def test_profile_photo_privacy_error_is_classified(tmp_path):
     store.close()
 
 
+async def test_profile_photo_authorization_and_missing_peer_are_classified(tmp_path):
+    from telethon.errors import PeerIdInvalidError
+
+    store = Store(tmp_path / "db.sqlite")
+    store.telegram.observe_profile(author_id=101, username=None, display_name="Gone")
+    fake = ProfileClient([], error=PeerIdInvalidError(request=None))
+    engine = TelegramEngine(store)
+    engine.connect = lambda: asyncio.sleep(0, result=fake)
+
+    result = await engine.refresh_profile_photos(101)
+
+    assert "недоступен" in result
+    row = store.db.execute(
+        "SELECT photo_error_code,photos_retry_at FROM tg_profiles WHERE author_id=101"
+    ).fetchone()
+    assert row["photo_error_code"] == "peer_unavailable"
+    assert float(row["photos_retry_at"]) > datetime.now(tz=UTC).timestamp() + 23 * 60 * 60
+
+    store.db.execute("UPDATE tg_profiles SET photos_retry_at=0 WHERE author_id=101")
+    store.db.commit()
+    fake.error = None
+    fake.is_user_authorized = lambda: asyncio.sleep(0, result=False)
+    result = await engine.refresh_profile_photos(101)
+    assert "подключи аккаунт заново" in result
+    assert store.db.execute(
+        "SELECT photo_error_code FROM tg_profiles WHERE author_id=101"
+    ).fetchone()[0] == "authorization"
+    store.close()
+
+
+async def test_profile_photo_local_write_failure_fails_job(tmp_path, monkeypatch):
+    store = Store(tmp_path / "db.sqlite")
+    store.telegram.observe_profile(author_id=101, username=None, display_name="Profile")
+    fake = ProfileClient([SimpleNamespace(id=1, date=datetime(2026, 1, 1, tzinfo=UTC))])
+    engine = TelegramEngine(store)
+    engine.connect = lambda: asyncio.sleep(0, result=fake)
+
+    def fail_write(_path):
+        raise OSError("disk full")
+
+    monkeypatch.setattr("hoard.telegram.ensure_private", fail_write)
+    with pytest.raises(RuntimeError, match="локальный архив"):
+        await engine.refresh_profile_photos(101)
+    row = store.db.execute(
+        "SELECT photo_error,photo_error_code FROM tg_profiles WHERE author_id=101"
+    ).fetchone()
+    assert row["photo_error_code"] == "local_write"
+    assert "локальный архив" in row["photo_error"]
+    store.close()
+
+
 class PostMediaClient(FakeClient):
     def __init__(self):
         super().__init__([])

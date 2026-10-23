@@ -2,6 +2,7 @@ import asyncio
 import json
 import sqlite3
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 
@@ -617,6 +618,31 @@ async def test_new_image_path_uses_private_attachment_reference_not_job_base64(t
     await wait_for(lambda: store.ai.attempt(attempt["id"])["state"] == "completed")
     assert provider.requests[0].messages[-1].images[0].media_type == "image/png"
     await service.stop_background()
+    store.close()
+
+
+def test_attachment_import_reuses_content_and_deletes_only_when_unreferenced(tmp_path):
+    _service, store = service_with(tmp_path, SequenceProvider(response("unused")))
+    image_file = tmp_path / "duplicate.png"
+    image_file.write_bytes(b"\x89PNG\r\n\x1a\nidentical-image")
+
+    attachments = [store.ai.import_attachment(str(image_file)) for _ in range(24)]
+
+    assert len({item["id"] for item in attachments}) == 1
+    assert attachments[0]["_created"] is True
+    assert all(item["_created"] is False for item in attachments[1:])
+    row = store.db.execute(
+        "SELECT id,file_path FROM ai_attachments WHERE deleted_at IS NULL"
+    ).fetchone()
+    assert row["id"] == attachments[0]["id"]
+    saved_path = Path(str(row["file_path"]))
+    assert saved_path.is_file()
+
+    store.ai.delete_attachment(attachments[0]["id"])
+    assert not saved_path.exists()
+    assert store.db.execute(
+        "SELECT COUNT(*) FROM ai_attachments WHERE deleted_at IS NULL"
+    ).fetchone()[0] == 0
     store.close()
 
 

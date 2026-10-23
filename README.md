@@ -59,7 +59,10 @@ For development, install the test tools with `python -m pip install -e '.[dev]'`
 
 An upgrade keeps the existing XDG configuration, database, Telegram session and archive.
 If an older daemon is still running, execute `hoard shutdown` before starting the upgraded
-installation.
+installation. The 0.7.1 client accepts only a daemon reporting the same application version and
+IPC protocol `1`; it reports the mismatch instead of starting a competing service. If a matching
+daemon already owns the service lock but is still initializing, clients wait for it and show a
+specific startup diagnostic.
 
 ## Windows installation (PowerShell)
 
@@ -213,11 +216,15 @@ driving Hoard. The server never listens on a LAN address and expires after inact
 Interactive mode adds contextual actions to saved publications and profiles. It can analyze one
 profile, selected profiles, or every locally linked profile of a saved publication. Before any
 provider request it shows a local preview, lets the user choose one profile's photos, applies the
-configured automatic 18+ admission to local user profiles, and separately confirms external
-DeepSeek transmission. Unknown post links do not start Telegram collection.
+configured automatic 18+ admission to local user profiles, and places the external-transfer and
+possible-cost disclosure directly above one explicit **Отправить N фото в DeepSeek и запустить
+анализ** button. There is no second confirmation dialog. Unknown post links do not start Telegram
+collection.
 Progress shows queued, completed, skipped and failed profiles, each skip reason and an estimated
 USD cost when a matching user tariff exists. Otherwise cost is explicitly unknown. Finished
-results refresh automatically without a manual HTML rebuild.
+results refresh automatically without a manual HTML rebuild. The browser remembers one active
+batch in `sessionStorage`, resumes polling after reopening the page and keeps the final result
+visible once; the TUI can reopen the newest active group from **Архив → Профили**.
 
 The autonomous `<archive>/telegram_archive.html` does not contain a session, API key or active
 backend configuration and keeps working through `file://` exactly as before. Closing the Web or
@@ -234,6 +241,9 @@ Enrichment is queued separately from video-note scans, respects Telegram privacy
 deduplicates media IDs and does not stop the primary scan when a profile photo is unavailable.
 The collector automatically queues an initial photo check for profiles already stored in SQLite
 and durable retries when a temporary failure becomes due; it does not rewind source checkpoints.
+Authorization, unavailable-peer, access/privacy, FloodWait and network failures retain separate
+retry categories. A local archive write error fails the photo job visibly instead of being
+reported as a network/VPN problem.
 Start the collector first if it is stopped. Stories, hidden data and unrelated message history
 are not requested. The offline report remains usable without enrichment.
 
@@ -251,7 +261,8 @@ new key as saved but unverified until a provider request succeeds and distinguis
 authentication error. The key field is masked and the daemon never returns the saved secret. The
 key is never placed in job payloads, responses, HTML or public logs. AI requests have no automatic
 provider retry: an error, truncated response, empty response or interrupted paid job requires an
-explicit user decision.
+explicit user decision. Configuration metadata reports only the key source: `env`, `file` or
+`none`; an environment key takes precedence and cannot be overwritten from the UI.
 
 The single Hoard daemon owns two independent job pools. `hoard start`, `stop` and `pause` control
 the Telegram pool; the AI pool follows the daemon lifecycle and keeps working when the Telegram
@@ -293,13 +304,16 @@ ai_price_create/list/delete
 ai_attempt_get/list/retry  ai_job_state  ai_statistics
 ai_telegram_profile_get/list  ai_telegram_source_get  ai_telegram_photos/photo_get
 ai_telegram_psl_start  ai_telegram_analysis_get/list
-ai_telegram_batch_preview/start/get
+ai_telegram_batch_preview/start/get/list
 ```
 
 Lists and history are paginated, and both IPC directions retain the 64 KiB message limit. New chat
 image jobs store only attachment IDs; the explicitly selected image is copied once into a private
-local directory instead of being duplicated as Base64 in SQLite jobs. Old serialized `ai.request`
-payloads remain supported and now receive accounting records without a payload migration.
+local directory instead of being duplicated as Base64 in SQLite jobs. Identical content reuses
+one attachment row/file and is deleted only while unreferenced. Batch preview returns compact
+photo IDs and counts, keeps full photo details only for one profile and stays below 48 KiB for the
+100-profile/20-photo regression case. Old serialized `ai.request` payloads remain supported and
+now receive accounting records without a payload migration.
 
 Prompts, chosen memory and message history are sent to the configured external provider only after
 the explicit send action. Memory is never inferred from Telegram profiles, never shared between
@@ -320,6 +334,11 @@ Before queueing, local user profiles receive automatic 18+ admission and the UI 
 transmission to DeepSeek. Channels/chats, missing or changed photos and over-limit selections are
 retained in a small durable batch as skipped with an explicit reason. Repeating one logical action
 returns the original paid attempts.
+
+Batch items expose `pending`, `queued`, `running`, `completed`, `skipped`, `failed` or
+`outcome_unknown`; totals and costs are SQL aggregates independent of the requested item page.
+Public PSL failures use only `invalid_json`, `json_schema_mismatch`, `invalid_psl_result`,
+`provider_error` or `outcome_unknown`, without provider error text.
 
 The PSL result is a subjective, non-scientific visual estimate, not a fact or measurement. The
 versioned JSON contract stores `presentation`, approximate `estimated_age`, `raw_psl_min`,

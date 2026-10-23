@@ -279,7 +279,9 @@
 
   function failureLabel(value) {
     return ({
-      invalid_result: "Ответ AI не прошёл проверку формата",
+      invalid_json: "AI вернул не JSON",
+      json_schema_mismatch: "Ответ AI не соответствует JSON-схеме",
+      invalid_psl_result: "Ответ AI нарушает PSL-контракт",
       provider_error: "Провайдер AI не выполнил запрос",
       outcome_unknown: "Результат запроса неизвестен — проверь перед ручным повтором",
     })[String(value || "")] || "";
@@ -302,8 +304,10 @@
     body.append(list);
   }
 
+  const ACTIVE_BATCH_KEY = "hoard.ai.active-batch";
+
   async function pollBatch(dialog, body, batchId, operationKey) {
-    for (let index = 0; index < 120 && dialog.open; index += 1) {
+    while (dialog.open) {
       await new Promise((resolve) => window.setTimeout(resolve, 1500));
       let result;
       try { result = await api(`/api/batches/${encodeURIComponent(batchId)}`); }
@@ -315,11 +319,13 @@
       renderBatch(body, batch);
       if (batch.terminal) {
         try { sessionStorage.removeItem(operationKey); } catch (_) { /* unavailable */ }
+        try { sessionStorage.removeItem(ACTIVE_BATCH_KEY); } catch (_) { /* unavailable */ }
         try {
           body.append(element("p", "muted", "Обновляем локальный каталог…"));
           await api("/api/catalog/refresh", {method: "POST", body: {}});
           saveInteractiveState();
-          location.reload();
+          renderBatch(body, batch);
+          body.append(element("p", "muted", "Локальный каталог обновлён. Итог группы сохранён."));
         } catch (error) {
           body.append(element("p", "notice-inline", error.message));
         }
@@ -345,77 +351,105 @@
         `${clean(source.channel_title || source.title, `@${source.username}`)} #${source.post_id}`,
       ));
     }
-    const photoInputs = [];
+    const pageLimit = Number(preview.limit || 25);
+    const pages = new Map([[Number(preview.offset || 0), preview]]);
+    const photoIds = {};
+    const photoSnapshots = {};
+    let current = preview;
+    let photoInputs = [];
+    function ingest(page) {
+      (page.items || []).forEach((item) => {
+        if (!validProfileId(item.author_id) || !(item.selected_photo_ids || []).length) return;
+        const key = String(item.author_id);
+        if (!photoIds[key]) photoIds[key] = [...item.selected_photo_ids].map(String);
+        if (item.photo_snapshot && !photoSnapshots[key]) {
+          photoSnapshots[key] = String(item.photo_snapshot);
+        }
+      });
+    }
+    ingest(preview);
+    const pageLabel = element("p", "muted");
     const list = element("div", "workflow-list");
-    (preview.items || []).forEach((item) => {
-      const row = element("div", "workflow-row");
-      row.append(element(
-        "strong", "", clean(item.display_name || item.username, `ID ${item.author_id}`),
-      ));
-      row.append(element("span", "muted", `ID ${item.author_id} · ${item.photo_count} фото`));
-      if (preview.selected_count === 1) {
-        const photos = element("div", "photo-choices");
-        const defaults = new Set(item.selected_photo_ids || []);
-        (item.photos || []).filter((photo) => photo.available).forEach((photo) => {
-          const label = element("label", "check-row");
-          const input = element("input", "");
-          input.type = "checkbox";
-          input.value = String(photo.photo_id);
-          input.checked = defaults.has(String(photo.photo_id));
-          photoInputs.push(input);
-          label.append(input, element("span", "", `${photo.photo_id} · ${dateText(photo.date)}`));
-          photos.append(label);
+    const skippedSummary = element("p", "workflow-reason");
+    const previousPage = element("button", "secondary", "← Страница");
+    const nextPage = element("button", "secondary", "Страница →");
+    async function loadPage(offset) {
+      if (!pages.has(offset)) {
+        const result = await api("/api/ai/preview", {
+          method: "POST", body: {...selector, limit: pageLimit, offset},
         });
-        row.append(photos);
+        pages.set(offset, result.preview);
+        ingest(result.preview);
+      }
+      return pages.get(offset);
+    }
+    function renderPreviewPage(page) {
+      current = page;
+      photoInputs = [];
+      const rows = [];
+      const reasons = new Map();
+      (page.items || []).forEach((item) => {
+        const row = element("div", "workflow-row");
+        row.append(element(
+          "strong", "", clean(item.display_name || item.username, `ID ${item.author_id}`),
+        ));
+        row.append(element("span", "muted", `ID ${item.author_id} · ${item.photo_count} фото`));
+        if (preview.selected_count === 1) {
+          const photos = element("div", "photo-choices");
+          const defaults = new Set(photoIds[String(item.author_id)] || []);
+          (item.photos || []).filter((photo) => photo.available).forEach((photo) => {
+            const label = element("label", "check-row");
+            const input = element("input", "");
+            input.type = "checkbox";
+            input.value = String(photo.photo_id);
+            input.checked = defaults.has(String(photo.photo_id));
+            photoInputs.push(input);
+            label.append(input, element("span", "", `${photo.photo_id} · ${dateText(photo.date)}`));
+            photos.append(label);
+          });
+          row.append(photos);
+        }
         const previous = item.previous;
         if (previous) row.append(element(
           "span", "muted",
           `Предыдущий: ${previous.result_status || previous.attempt_state || "—"}`,
         ));
-      }
-      if ((item.selected_photo_ids || []).length && validProfileId(item.author_id)) {
-        row.append(element("span", "muted", "Возрастной допуск: 18+ автоматически"));
-      } else {
-        row.append(element("span", "workflow-reason", item.reason || "Будет пропущен"));
-      }
-      list.append(row);
-    });
-    body.append(list);
-    const defaultPhotoIds = {};
-    (preview.items || []).forEach((item) => {
-      if (validProfileId(item.author_id) && (item.selected_photo_ids || []).length) {
-        defaultPhotoIds[String(item.author_id)] = [...item.selected_photo_ids].map(String);
-      }
-    });
-    if (Object.keys(defaultPhotoIds).length) {
-      savedOperation(operationStorageKey(selector, defaultPhotoIds));
+        if (!(item.selected_photo_ids || []).length) {
+          const reason = item.reason || "Будет пропущен";
+          reasons.set(reason, (reasons.get(reason) || 0) + 1);
+        }
+        rows.push(row);
+      });
+      list.replaceChildren(...rows);
+      const start = page.items.length ? Number(page.offset || 0) + 1 : 0;
+      pageLabel.textContent = `Профили ${start}–${Number(page.offset || 0) + page.items.length} из ${page.selected_count}`;
+      skippedSummary.textContent = [...reasons].map(([reason, count]) => `${reason}: ${count}`).join(" · ");
+      previousPage.disabled = Number(page.offset || 0) <= 0;
+      nextPage.disabled = !page.has_more;
     }
-    if (preview.has_more) body.append(element(
+    previousPage.type = nextPage.type = "button";
+    previousPage.addEventListener("click", async () => {
+      renderPreviewPage(await loadPage(Math.max(0, Number(current.offset || 0) - pageLimit)));
+    });
+    nextPage.addEventListener("click", async () => {
+      renderPreviewPage(await loadPage(Number(current.offset || 0) + pageLimit));
+    });
+    const pageActions = element("div", "interactive-actions");
+    pageActions.append(previousPage, nextPage);
+    body.append(pageLabel, list, skippedSummary, pageActions);
+    renderPreviewPage(preview);
+    body.append(element(
       "p", "muted",
-      "Непоказанные профили будут обработаны с тем же автоматическим допуском 18+.",
+      "Возрастной допуск 18+ применяется автоматически. Будут отправлены только выбранные "
+        + "локальные фото; запрос DeepSeek может быть платным, автоматического повтора нет.",
     ));
-    const externalLabel = element("label", "check-row external-check");
-    const external = element("input", "");
-    external.type = "checkbox";
-    externalLabel.append(
-      external,
-      element("span", "", "Я подтверждаю отправку выбранных фото во внешний DeepSeek"),
-    );
     const feedback = element("p", "notice-inline");
-    const start = element("button", "primary-action", "Запустить анализ");
+    const count = Number(preview.selected_photo_count || 0);
+    const start = element(
+      "button", "primary-action", `Отправить ${count} фото в DeepSeek и запустить анализ`,
+    );
     start.type = "button";
     start.addEventListener("click", async () => {
-      if (!external.checked) {
-        feedback.textContent = "Подтверди внешнюю отправку фотографий.";
-        return;
-      }
-      const photoIds = {};
-      const photoSnapshots = {};
-      (preview.items || []).forEach((item) => {
-        if (!validProfileId(item.author_id) || !(item.selected_photo_ids || []).length) return;
-        photoIds[String(item.author_id)] = [...item.selected_photo_ids].map(String);
-        if (item.photo_snapshot) photoSnapshots[String(item.author_id)] = String(item.photo_snapshot);
-      });
       if (preview.selected_count === 1) {
         const selected = photoInputs.filter((input) => input.checked).map((input) => input.value);
         if (selected.length < 1 || selected.length > 4) {
@@ -431,9 +465,12 @@
         feedback.textContent = "Нет подходящих пользовательских профилей с локальными фото.";
         return;
       }
-      const storageKey = operationStorageKey(selector, photoIds);
       start.disabled = true;
       try {
+        for (let offset = 0; offset < preview.selected_count; offset += pageLimit) {
+          await loadPage(offset);
+        }
+        const storageKey = operationStorageKey(selector, photoIds);
         const result = await api("/api/ai/start", {
           method: "POST",
           body: {
@@ -441,8 +478,14 @@
             photo_ids: photoIds,
             photo_snapshots: photoSnapshots,
             operation_id: savedOperation(storageKey),
+            external_confirmed: true,
           },
         });
+        try {
+          sessionStorage.setItem(ACTIVE_BATCH_KEY, JSON.stringify({
+            id: result.batch.id, operationKey: storageKey,
+          }));
+        } catch (_) { /* unavailable */ }
         renderBatch(body, result.batch);
         pollBatch(dialog, body, result.batch.id, storageKey);
       } catch (error) {
@@ -450,12 +493,14 @@
         start.disabled = false;
       }
     });
-    body.append(externalLabel, feedback, start);
+    body.append(feedback, start);
   }
 
   async function loadAnalysis(selector) {
     try {
-      const result = await api("/api/ai/preview", {method: "POST", body: selector});
+      const result = await api("/api/ai/preview", {
+        method: "POST", body: {...selector, limit: 25, offset: 0},
+      });
       analysisPreview(result.preview, selector);
     } catch (error) {
       showNotice(error.message, true);
@@ -464,6 +509,25 @@
 
   function beginAnalysis(selector) {
     ensureAI(() => loadAnalysis(selector));
+  }
+
+  async function restoreActiveBatch() {
+    let saved;
+    try { saved = JSON.parse(sessionStorage.getItem(ACTIVE_BATCH_KEY) || "null"); }
+    catch (_) { return; }
+    if (!saved || !/^[a-f0-9]{32}$/.test(String(saved.id || ""))) return;
+    try {
+      const result = await api(`/api/batches/${encodeURIComponent(saved.id)}`);
+      const {dialog, body} = modal("Telegram AI · активная группа");
+      renderBatch(body, result.batch);
+      if (result.batch.terminal) {
+        try { sessionStorage.removeItem(ACTIVE_BATCH_KEY); } catch (_) { /* unavailable */ }
+      } else {
+        pollBatch(dialog, body, saved.id, String(saved.operationKey || ""));
+      }
+    } catch (error) {
+      showNotice(error.message, true);
+    }
   }
 
   function initInteractive() {
@@ -501,6 +565,7 @@
         showNotice("DeepSeek отклонил сохранённый ключ. Замени его в AI настройках.", true);
       }
     }).catch((error) => showNotice(error.message, true));
+    restoreActiveBatch();
   }
 
   function selectionControls(profile) {
@@ -539,7 +604,9 @@
         return "";
       }
     }
-    if (value.startsWith("/")) return "";
+    if (value.startsWith("/")) {
+      return interactiveEnabled && value.startsWith("/media/") ? value : "";
+    }
     try {
       if (decodeURIComponent(value).split("/").some((part) => part === "..")) return "";
     } catch (_) {

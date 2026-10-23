@@ -23,7 +23,7 @@ def test_sources_and_checkpoints(tmp_path):
                   file_path=str(video), size=123)
     store.checkpoint(sid, 11, record)
     assert store.seen(sid, 11)
-    assert store.stats() == dict(sources=1, downloads=1, authors=1)
+    assert store.stats() == dict(sources=1, downloads=1, authors=1, profile_photos=0)
     store.close()
     again = Store(tmp_path / "db" / "items.sqlite")
     assert again.sources()[0]["last_id"] == 11

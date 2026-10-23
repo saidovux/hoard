@@ -304,6 +304,18 @@ SelectOverlay > .option-list--option-hover {
     width: 80;
 }
 
+.telegram-analysis-dialog {
+    height: 90%;
+}
+
+#analysis-scroll {
+    height: 1fr;
+}
+
+.analysis-pages {
+    height: 3;
+}
+
 .telegram-analysis-dialog SelectionList {
     height: auto;
     min-height: 3;

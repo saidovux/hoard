@@ -883,6 +883,7 @@ async def test_archive_views_real_results_and_reports_failures_without_false_suc
             "photo_error": "",
         }
     ]
+    status["stats"]["profile_photos"] = 3
     status["jobs"] = [
         {
             "id": 7,
@@ -1093,18 +1094,24 @@ async def test_telegram_ai_requires_visible_adult_and_external_confirmation():
         app.open_section("archive")
         await pilot.pause()
         await pilot.click("#mode-profiles")
+        await wait_for_condition(
+            pilot,
+            lambda: bool(getattr(app.screen, "_profile_ids", [])),
+        )
         await pilot.click("#telegram-ai")
         await wait_for_condition(pilot, lambda: isinstance(app.screen, TelegramAIDialog))
         app.screen.query_one("#telegram-ai-photo-ids", Input).value = "photo-1"
+        disclosure = str(app.screen.query_one(".dialog-message", Static).content)
+        assert "18+" in disclosure
+        assert "DeepSeek" in disclosure
+        assert "платным" in disclosure
         app.screen.query_one("#telegram-ai-submit").press()
-        await wait_for_condition(pilot, lambda: isinstance(app.screen, ConfirmDialog))
-        await pilot.pause()
-        message = str(app.screen.query_one(".dialog-message", Static).content)
-        assert "18" in message
-        assert "DeepSeek" in message
-        assert "платным" in message
-        app.screen.query_one("#cancel").press()
-        assert not any(name == "ai_telegram_psl_start" for name, _ in api.calls)
+        await wait_for_condition(
+            pilot, lambda: any(name == "ai_telegram_psl_start" for name, _ in api.calls)
+        )
+        start_args = next(args for name, args in api.calls if name == "ai_telegram_psl_start")
+        assert start_args["adult_confirmed"] is True
+        assert start_args["external_confirmed"] is True
 
 
 @pytest.mark.asyncio
@@ -1132,8 +1139,12 @@ async def test_minimal_telegram_analysis_picker_uses_default_photos_and_one_oper
             "preview": {
                 "selected_count": 1,
                 "photo_count": 1,
+                "selected_photo_count": 1,
                 "ready_count": 1,
                 "skipped_count": 0,
+                "limit": 20,
+                "offset": 0,
+                "has_more": False,
                 "items": [
                     {
                         "author_id": 99,
@@ -1178,16 +1189,22 @@ async def test_minimal_telegram_analysis_picker_uses_default_photos_and_one_oper
         app.open_section("archive")
         await pilot.pause()
         await pilot.click("#mode-profiles")
+        await wait_for_condition(
+            pilot,
+            lambda: bool(getattr(app.screen, "_profile_ids", [])),
+        )
         await pilot.click("#telegram-ai")
-        await wait_for_condition(pilot, lambda: isinstance(app.screen, TelegramAnalysisDialog))
+        await wait_for_condition(
+            pilot,
+            lambda: isinstance(app.screen, TelegramAnalysisDialog),
+            f"notice={app.notice!r}; calls={api.calls!r}",
+        )
         photos = app.screen.query_one("#analysis-photos", SelectionList)
         assert photos.selected == ["photo-1"]
+        dialog_text = " ".join(str(node.content) for node in app.screen.query(Static))
+        assert "18+" in dialog_text
+        assert "DeepSeek" in str(app.screen.query_one("#analysis-submit").label)
         app.screen.query_one("#analysis-submit").press()
-        await wait_for_condition(pilot, lambda: isinstance(app.screen, ConfirmDialog))
-        message = str(app.screen.query_one(".dialog-message", Static).content)
-        assert "локальные фотографии" in message
-        assert "DeepSeek" in message
-        app.screen.query_one("#confirm").press()
         await wait_for_condition(
             pilot, lambda: any(name == "ai_telegram_batch_start" for name, _ in api.calls)
         )
@@ -1198,6 +1215,50 @@ async def test_minimal_telegram_analysis_picker_uses_default_photos_and_one_oper
         assert start_args["photo_ids"] == {"99": ["photo-1"]}
         assert start_args["photo_snapshots"] == {"99": "snapshot-1"}
         assert "confirmed_author_ids" not in start_args
+
+
+@pytest.mark.asyncio
+async def test_analysis_dialog_actions_visible_at_120x30():
+    preview = {
+        "selected_count": 100,
+        "photo_count": 2000,
+        "selected_photo_count": 400,
+        "ready_count": 100,
+        "skipped_count": 0,
+        "limit": 20,
+        "offset": 0,
+        "has_more": True,
+        "items": [
+            {
+                "author_id": author_id,
+                "display_name": f"Synthetic Profile {author_id}",
+                "username": f"person{author_id}",
+                "photo_count": 20,
+                "photos": [],
+                "selected_photo_ids": [f"photo-{index}" for index in range(4)],
+                "photo_snapshot": f"snapshot-{author_id}",
+                "reason": "",
+                "previous": None,
+            }
+            for author_id in range(1, 21)
+        ],
+    }
+    app = HoardApp(FakeAPI())
+    async with app.run_test(size=(120, 30)) as pilot:
+        await wait_for_startup(app, pilot)
+        app.push_screen(TelegramAnalysisDialog(preview))
+        await wait_for_condition(
+            pilot, lambda: isinstance(app.screen, TelegramAnalysisDialog)
+        )
+        submit = app.screen.query_one("#analysis-submit")
+        cancel = app.screen.query_one("#analysis-cancel")
+        scroll = app.screen.query_one("#analysis-scroll")
+
+        assert submit.region.height > 0
+        assert cancel.region.height > 0
+        assert submit.region.bottom <= app.size.height
+        assert cancel.region.bottom <= app.size.height
+        assert scroll.max_scroll_y > 0
 
 
 def test_cli_module_keeps_textual_lazy_for_noninteractive_commands():

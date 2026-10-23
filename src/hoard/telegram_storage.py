@@ -598,6 +598,14 @@ class TelegramStorage:
         result["photos"] = self.profile_photos(author_id)
         return result
 
+    def get_profile_identity(self, author_id: int) -> dict[str, Any]:
+        row = self.db.execute(
+            "SELECT * FROM tg_profiles WHERE author_id=?", (int(author_id),)
+        ).fetchone()
+        if row is None:
+            raise ValueError("Telegram-профиль не найден в локальном архиве")
+        return dict(row)
+
     def profile_photos(
         self, author_id: int, *, include_path: bool = False
     ) -> list[dict[str, Any]]:

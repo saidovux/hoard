@@ -446,7 +446,13 @@ class Service:
             requested_root = str(args.get("archive_root") or "") or None
             result = await self._telegram_report({"archive_root": requested_root})
             root = self.store.telegram.archive_root(requested_root)
-            return {"message": result, "catalog": str(telegram_catalog_file(root))}
+            return {
+                "message": result,
+                "catalog": str(telegram_catalog_file(root)),
+                "media_roots": [
+                    str(path) for path in self.store.telegram.allowed_media_roots(root)
+                ],
+            }
         if method == "telegram_enrich":
             jobs = 0
             for source in self.store.sources():

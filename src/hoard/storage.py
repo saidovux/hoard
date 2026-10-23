@@ -261,7 +261,15 @@ class Store:
         source_count = self.db.execute("SELECT COUNT(*) FROM sources WHERE enabled=1").fetchone()[0]
         downloaded = self.db.execute("SELECT COUNT(*) FROM downloads").fetchone()[0]
         authors = self.db.execute("SELECT COUNT(*) FROM tg_profiles").fetchone()[0]
-        return {"sources": source_count, "downloads": downloaded, "authors": authors}
+        profile_photos = self.db.execute(
+            "SELECT COUNT(*) FROM tg_profile_photos WHERE status='saved'"
+        ).fetchone()[0]
+        return {
+            "sources": source_count,
+            "downloads": downloaded,
+            "authors": authors,
+            "profile_photos": profile_photos,
+        }
 
     def queue_stats(self) -> dict[str, int]:
         result = {"queued": 0, "running": 0, "failed": 0}

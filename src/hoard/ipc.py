@@ -8,7 +8,7 @@ import sys
 
 from . import __version__
 from .paths import endpoint_path, ensure_private, socket_path, state_dir
-from .platform_support import is_windows, read_endpoint
+from .platform_support import instance_running, is_windows, read_endpoint
 
 IPC_MAX_BYTES = 64 * 1024
 IPC_PROTOCOL = 1
@@ -83,6 +83,20 @@ async def ensure_daemon() -> None:
     ensure_private(state_dir())
     log = state_dir() / "daemon.log"
     log.touch(mode=0o600, exist_ok=True)
+    if instance_running(state_dir() / "service.lock"):
+        for _ in range(100):
+            await asyncio.sleep(0.12)
+            try:
+                status = await request("status", timeout=1)
+                validate_daemon_status(status)
+                return
+            except DaemonCompatibilityError:
+                raise
+            except (OSError, RuntimeError, TimeoutError, ValueError, json.JSONDecodeError):
+                continue
+        raise RuntimeError(
+            f"Процесс daemon работает, но ещё инициализируется; проверь {log}"
+        )
     command = [sys.executable, "-m", "hoard", "daemon"]
     options = {
         "stdin": subprocess.DEVNULL,
@@ -97,9 +111,11 @@ async def ensure_daemon() -> None:
     with log.open("ab") as stream:
         options["stdout"] = stream
         options["stderr"] = stream
-        subprocess.Popen(command, **options)
-    for _ in range(45):
+        process = subprocess.Popen(command, **options)
+    for _ in range(100):
         await asyncio.sleep(0.12)
+        if process.poll() is not None:
+            raise RuntimeError(f"Процесс daemon завершился при запуске; проверь {log}")
         try:
             status = await request("status", timeout=1)
             validate_daemon_status(status)
@@ -108,4 +124,4 @@ async def ensure_daemon() -> None:
             raise
         except (OSError, RuntimeError, TimeoutError, ValueError, json.JSONDecodeError):
             continue
-    raise RuntimeError(f"Не удалось запустить службу; проверь {log}")
+    raise RuntimeError(f"Daemon запущен, но не завершил инициализацию; проверь {log}")

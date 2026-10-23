@@ -6,18 +6,27 @@ from typing import Any
 
 PSL_SCHEMA_VERSION = 2
 PSL_STATUSES = {"completed", "insufficient_data", "ineligible", "invalid_result"}
-PSL_FAILURE_CATEGORIES = {"invalid_result", "provider_error", "outcome_unknown"}
-
-PSL_OUTPUT_FORMAT = """Return exactly one JSON object with these six keys and no others:
-{
-  "status": "completed | insufficient_data | ineligible",
-  "presentation": "female | male | unknown",
-  "estimated_age": "integer 0..120 | null",
-  "raw_psl_min": "number 0..8 | null",
-  "raw_psl_max": "number 0..8 | null",
-  "boosted_psl": "number 0..8 | null"
+PSL_FAILURE_CATEGORIES = {
+    "invalid_json",
+    "json_schema_mismatch",
+    "invalid_psl_result",
+    "provider_error",
+    "outcome_unknown",
 }
-Use JSON numbers and null values, not the explanatory type strings shown above."""
+
+PSL_OUTPUT_FORMAT = """Return exactly one JSON object with these six keys and no others.
+Allowed values: status is completed, insufficient_data, or ineligible; presentation is female,
+male, or unknown. estimated_age is an integer from 0 through 120 or null. raw_psl_min,
+raw_psl_max, and boosted_psl are JSON numbers from 0 through 8 or null.
+Use this empty JSON skeleton and replace the empty enum strings with allowed values:
+{
+  "status": "",
+  "presentation": "",
+  "estimated_age": null,
+  "raw_psl_min": null,
+  "raw_psl_max": null,
+  "boosted_psl": null
+}"""
 
 PSL_JSON_SCHEMA: dict[str, Any] = {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -73,12 +82,14 @@ def psl_failure_category(
     error = str(error_code or "")
     if state == "outcome_unknown":
         return "outcome_unknown"
-    if result == "invalid_result" or error in {
+    if error in {
         "invalid_json",
         "json_schema_mismatch",
         "invalid_psl_result",
     }:
-        return "invalid_result"
+        return error
+    if result == "invalid_result":
+        return "invalid_psl_result"
     if state == "failed":
         return "provider_error"
     return None

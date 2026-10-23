@@ -20,7 +20,7 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 
 from .archive_paths import path_is_within
 from .ipc import ensure_daemon, request
@@ -41,6 +41,7 @@ async def _daemon_request(
 @dataclass
 class WebState:
     catalog_path: Path
+    allowed_media_roots: tuple[Path, ...] = ()
     requester: RequestFunction = _daemon_request
     session_token: str = field(default_factory=lambda: secrets.token_urlsafe(32))
     bootstrap_token: str = field(default_factory=lambda: secrets.token_urlsafe(32))
@@ -52,9 +53,14 @@ class WebState:
     last_seen: float = field(default_factory=time.monotonic)
     refresh_lock: threading.Lock = field(default_factory=threading.Lock)
     media_files: dict[str, tuple[Path, int]] = field(default_factory=dict)
+    catalog_payload: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.catalog_path = self.catalog_path.expanduser().resolve(strict=True)
+        roots = self.allowed_media_roots or (self.catalog_path.parent,)
+        self.allowed_media_roots = tuple(
+            dict.fromkeys(Path(root).expanduser().resolve(strict=False) for root in roots)
+        )
         self.reload_media_allowlist()
 
     @property
@@ -79,6 +85,12 @@ class WebState:
             if not path.is_file() or path.name != "telegram_archive.html":
                 raise RuntimeError("Daemon вернул недопустимый путь HTML-каталога")
             self.catalog_path = path
+            roots = result.get("media_roots") or [path.parent]
+            self.allowed_media_roots = tuple(
+                dict.fromkeys(
+                    Path(str(root)).expanduser().resolve(strict=False) for root in roots
+                )
+            )
             self.reload_media_allowlist()
             return result
 
@@ -100,7 +112,7 @@ class WebState:
             media.extend(post.get("media") or [])
         for profile in payload.get("profiles") or []:
             media.extend(profile.get("photos") or [])
-        root = self.catalog_path.parent.resolve(strict=False)
+        catalog_root = self.catalog_path.parent.resolve(strict=False)
         allowed: dict[str, tuple[Path, int]] = {}
         for item in media:
             if not isinstance(item, dict) or not item.get("available"):
@@ -113,16 +125,32 @@ class WebState:
             if relative.startswith("/") or "\\" in relative:
                 continue
             try:
-                target = (root / relative).resolve(strict=True)
+                target = (catalog_root / relative).resolve(strict=True)
             except (OSError, RuntimeError):
                 continue
-            if not target.is_file() or not path_is_within(target, root):
+            root_index = next(
+                (
+                    index
+                    for index, root in enumerate(self.allowed_media_roots)
+                    if path_is_within(target, root)
+                ),
+                None,
+            )
+            if root_index is None or not target.is_file():
                 continue
             expected = int(item.get("size") or 0)
             if expected > 0 and target.stat().st_size != expected:
                 continue
-            allowed["/" + relative] = (target, expected)
+            selected_root = self.allowed_media_roots[root_index]
+            try:
+                rooted_path = target.relative_to(selected_root).as_posix()
+            except ValueError:
+                continue
+            web_url = f"/media/r{root_index}/{quote(rooted_path, safe='/._-~')}"
+            allowed[web_url] = (target, expected)
+            item["url"] = web_url
         self.media_files = allowed
+        self.catalog_payload = payload
 
 
 class HoardWebServer(ThreadingHTTPServer):
@@ -243,6 +271,24 @@ class HoardWebHandler(BaseHTTPRequestHandler):
 
     def _interactive_html(self) -> bytes:
         source = self.state.catalog_path.read_text(encoding="utf-8")
+        marker = "window.HOARD_CATALOG="
+        start = source.find(marker)
+        if start < 0:
+            raise RuntimeError("HTML-каталог не содержит локальный снимок")
+        _, end = json.JSONDecoder().raw_decode(source, start + len(marker))
+        data = json.dumps(
+            self.state.catalog_payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        data = (
+            data.replace("&", "\\u0026")
+            .replace("<", "\\u003c")
+            .replace(">", "\\u003e")
+            .replace("\u2028", "\\u2028")
+            .replace("\u2029", "\\u2029")
+        )
+        source = source[: start + len(marker)] + data + source[end:]
         nonce = self.state.nonce
         source = source.replace(
             '<style data-hoard-bundle="style">',
@@ -288,7 +334,7 @@ class HoardWebHandler(BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
     def _serve_media(self, request_path: str) -> None:
-        selected = self.state.media_files.get(unquote(request_path))
+        selected = self.state.media_files.get(request_path)
         if selected is None:
             self._reject(HTTPStatus.NOT_FOUND, "Файл не найден")
             return
@@ -364,7 +410,7 @@ class HoardWebHandler(BaseHTTPRequestHandler):
                 return
             self._send_json(result)
             return
-        if unquote(parsed.path) in self.state.media_files:
+        if parsed.path in self.state.media_files:
             self._serve_media(parsed.path)
             return
         self._reject(HTTPStatus.NOT_FOUND, "Страница не найдена")
@@ -385,7 +431,6 @@ class HoardWebHandler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/ai/preview":
                 result = self.state.call("ai_telegram_batch_preview", body, timeout=30)
             elif parsed.path == "/api/ai/start":
-                body["external_confirmed"] = True
                 result = self.state.call("ai_telegram_batch_start", body, timeout=30)
             elif parsed.path == "/api/catalog/refresh":
                 result = self.state.refresh_catalog()
@@ -449,7 +494,14 @@ def run_web(*, open_browser: bool = True, lifetime: int = 1800) -> str:
     catalog = Path(catalog_value).expanduser().resolve(strict=True)
     if catalog.name != "telegram_archive.html" or not catalog.is_file():
         raise RuntimeError("Не удалось подготовить локальный HTML-каталог")
-    state = WebState(catalog, lifetime=max(60, min(int(lifetime), 86_400)))
+    media_roots = tuple(
+        Path(str(value)) for value in report.get("media_roots") or [catalog.parent]
+    )
+    state = WebState(
+        catalog,
+        allowed_media_roots=media_roots,
+        lifetime=max(60, min(int(lifetime), 86_400)),
+    )
     server = create_web_server(state)
     server.timeout = 1
     url = state.start_url

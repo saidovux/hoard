@@ -24,6 +24,11 @@ class ArchiveScreen(WorkspaceScreen):
         self._profile_ids: list[int] = []
         self._selected_profiles: set[int] = set()
         self._profile_source = ""
+        self._profile_items: list[dict] = []
+        self._profile_offset = 0
+        self._profile_limit = 50
+        self._profile_total = 0
+        self._profiles_loading = False
 
     def compose_workspace(self) -> ComposeResult:
         yield Static(id="archive-summary")
@@ -38,24 +43,27 @@ class ArchiveScreen(WorkspaceScreen):
             yield Button("Анализировать профиль", id="telegram-ai")
             yield Button("Выбрать / снять", id="profile-select")
             yield Button("Анализировать выбранные", id="profiles-ai")
+            yield Button("Открыть активную AI-группу", id="batch-reopen")
         yield Select(
             [("Все публикации", "")],
             value="",
             allow_blank=False,
             id="profile-source-filter",
         )
+        with Horizontal(classes="action-row", id="profile-pages"):
+            yield Button("← Профили", id="profiles-previous")
+            yield Static(id="profiles-page-label")
+            yield Button("Профили →", id="profiles-next")
         yield DataTable(id="archive-table", cursor_type="row")
 
     def render_data(self, status: dict) -> None:
         stats = status.get("stats") or {}
-        profiles = status.get("profiles") or []
-        photo_count = sum(int(item.get("photo_count") or 0) for item in profiles)
         text = Text()
         text.append(f"Кружки {stats.get('downloads', 0)}", style="#FFFFFF")
         text.append("  ·  ", style="#888888")
         text.append(f"Профили {stats.get('authors', 0)}", style="#FFFFFF")
         text.append("  ·  ", style="#888888")
-        text.append(f"Фото профилей {photo_count}\n", style="#FFFFFF")
+        text.append(f"Фото профилей {stats.get('profile_photos', 0)}\n", style="#FFFFFF")
         text.append("HTML  ", style="#888888")
         text.append(str(status.get("catalog") or "путь недоступен"), style="#FFFFFF")
         self.query_one("#archive-summary", Static).update(text)
@@ -97,14 +105,7 @@ class ArchiveScreen(WorkspaceScreen):
             table.add_columns(
                 "✓", "Имя", "Username", "Telegram ID", "Источники", "Фото", "Последнее"
             )
-            rows = status.get("profiles") or []
-            if self._profile_source:
-                selected_source = int(self._profile_source)
-                rows = [
-                    row
-                    for row in rows
-                    if selected_source in {int(item) for item in row.get("source_ids") or []}
-                ]
+            rows = self._profile_items
             for row in rows:
                 self._profile_ids.append(int(row.get("author_id") or 0))
                 author_id = int(row.get("author_id") or 0)
@@ -141,12 +142,23 @@ class ArchiveScreen(WorkspaceScreen):
         self.query_one("#profile-select", Button).display = self.mode == "profiles"
         self.query_one("#profiles-ai", Button).display = self.mode == "profiles"
         self.query_one("#profile-source-filter", Select).display = self.mode == "profiles"
+        self.query_one("#batch-reopen", Button).display = self.mode == "profiles"
+        self.query_one("#profile-pages", Horizontal).display = self.mode == "profiles"
+        if self.mode == "profiles":
+            start = self._profile_offset + 1 if rows else 0
+            end = self._profile_offset + len(rows)
+            self.query_one("#profiles-page-label", Static).update(
+                f"{start}–{end} из {self._profile_total}"
+            )
+            self.query_one("#profiles-previous", Button).disabled = self._profile_offset <= 0
+            self.query_one("#profiles-next", Button).disabled = end >= self._profile_total
 
     def on_select_changed(self, event: Select.Changed) -> None:
         if event.select.id != "profile-source-filter":
             return
         self._profile_source = "" if event.value is Select.BLANK else str(event.value)
-        self._render_table(self.hoard_app.status or {})
+        self._profile_offset = 0
+        self._load_profile_page()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         button_id = str(event.button.id)
@@ -157,6 +169,8 @@ class ArchiveScreen(WorkspaceScreen):
                     "primary" if mode == self.mode else "default"
                 )
             self._render_table(self.hoard_app.status or {})
+            if self.mode == "profiles":
+                self._load_profile_page()
         elif button_id == "catalog-build":
             self._build_catalog()
         elif button_id == "telegram-enrich":
@@ -169,6 +183,41 @@ class ArchiveScreen(WorkspaceScreen):
             self._toggle_profile_selection()
         elif button_id == "profiles-ai":
             self._analyze_selected_profiles()
+        elif button_id == "profiles-previous":
+            self._profile_offset = max(0, self._profile_offset - self._profile_limit)
+            self._load_profile_page()
+        elif button_id == "profiles-next":
+            self._profile_offset += self._profile_limit
+            self._load_profile_page()
+        elif button_id == "batch-reopen":
+            self.hoard_app.reopen_active_telegram_batch()
+
+    def _load_profile_page(self) -> None:
+        if self._profiles_loading:
+            return
+        self._profiles_loading = True
+        self.run_worker(
+            self._load_profiles(), name="archive-profile-page", exit_on_error=False
+        )
+
+    async def _load_profiles(self) -> None:
+        try:
+            args = {"limit": self._profile_limit, "offset": self._profile_offset}
+            if self._profile_source:
+                args["source_id"] = int(self._profile_source)
+            page = await self.hoard_app.api.ai_call("ai_telegram_profile_list", args)
+            if "items" in page:
+                self._profile_items = list(page.get("items") or [])
+                self._profile_total = int(page.get("total") or 0)
+            else:
+                self._profile_items = list((self.hoard_app.status or {}).get("profiles") or [])
+                self._profile_total = len(self._profile_items)
+        except Exception as exc:
+            self.hoard_app.set_notice(str(exc) or type(exc).__name__, error=True)
+        finally:
+            self._profiles_loading = False
+        if self.is_mounted and self.mode == "profiles":
+            self._render_table(self.hoard_app.status or {})
 
     def _build_catalog(self) -> None:
         self.run_worker(

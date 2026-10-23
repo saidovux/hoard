@@ -109,7 +109,10 @@ def test_web_requires_bootstrap_cookie_exact_host_origin_and_csrf(tmp_path):
         assert state.session_token not in text
         assert "API-ключ" not in text
 
-        status, _headers, payload = request(server, "GET", "/avatar.png", headers=common)
+        media_url = next(iter(state.media_files))
+        assert media_url.startswith("/media/r0/")
+        assert media_url in text
+        status, _headers, payload = request(server, "GET", media_url, headers=common)
         assert status == 200
         assert payload == b"synthetic-image"
 
@@ -149,6 +152,72 @@ def test_web_requires_bootstrap_cookie_exact_host_origin_and_csrf(tmp_path):
 
         status, _headers, _payload = request(
             server, "GET", "/hoard_objects/../hoard.sqlite3", headers=common
+        )
+        assert status == 404
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_web_serves_catalog_media_from_each_explicit_allowed_root(tmp_path):
+    catalog_root = tmp_path / "catalog"
+    media_root = tmp_path / "source-media"
+    catalog_root.mkdir()
+    media_root.mkdir()
+    catalog = catalog_root / "telegram_archive.html"
+    media = media_root / "avatar.png"
+    media.write_bytes(b"second-root-image")
+    snapshot = {
+        "posts": [],
+        "videos": [],
+        "profiles": [
+            {
+                "photos": [
+                    {
+                        "url": "../source-media/avatar.png",
+                        "available": True,
+                        "size": media.stat().st_size,
+                    }
+                ]
+            }
+        ],
+    }
+    catalog.write_text(
+        '<!doctype html><style data-hoard-bundle="style"></style>'
+        '<script data-hoard-bundle="data">window.HOARD_CATALOG='
+        + json.dumps(snapshot)
+        + ";</script>"
+        '<script data-hoard-bundle="app"></script>',
+        encoding="utf-8",
+    )
+    state = WebState(
+        catalog,
+        allowed_media_roots=(catalog_root, media_root),
+        requester=FakeDaemon(),
+    )
+    server = create_web_server(state)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        status, headers, _payload = request(
+            server,
+            "GET",
+            f"/start/{state.bootstrap_token}",
+            headers={"Host": state.host_header},
+        )
+        assert status == 303
+        common = {
+            "Host": state.host_header,
+            "Cookie": headers["Set-Cookie"].split(";", 1)[0],
+        }
+        media_url = next(iter(state.media_files))
+        assert media_url == "/media/r1/avatar.png"
+        status, _headers, payload = request(server, "GET", media_url, headers=common)
+        assert status == 200
+        assert payload == b"second-root-image"
+        status, _headers, _payload = request(
+            server, "GET", "/media/r1/%2e%2e/secret", headers=common
         )
         assert status == 404
     finally:

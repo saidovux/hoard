@@ -46,6 +46,31 @@ def single_instance(path: Path) -> Iterator[None]:
                 fcntl.flock(lock, fcntl.LOCK_UN)
 
 
+def instance_running(path: Path) -> bool:
+    """Return whether another process currently holds the daemon lock."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+b") as lock:
+        if is_windows():
+            import msvcrt
+
+            lock.seek(0)
+            try:
+                msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError:
+                return True
+            lock.seek(0)
+            msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+            return False
+        import fcntl
+
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return True
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        return False
+
+
 def write_endpoint(path: Path, port: int, token: str) -> None:
     """Atomically publish the loopback IPC endpoint in per-user state."""
     if not (0 < port < 65536) or len(token) < 32:
