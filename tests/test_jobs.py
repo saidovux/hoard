@@ -112,3 +112,44 @@ async def test_failed_job_requires_explicit_retry(tmp_path):
     store.retry_job(jid)
     assert store.recent_jobs()[0]["state"] == "queued"
     store.close()
+
+
+async def test_deferred_catalog_report_does_not_block_other_queued_work(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr("hoard.telegram_storage.time.time", lambda: 1_000.0)
+    store = Store(tmp_path / "test.sqlite3", migrate_legacy=False)
+    store.telegram.set_catalog_dirty()
+    store.telegram.record_catalog_report_failure("OSError: disk full", now=1_000.0)
+    report_id = store.enqueue("telegram.report", {}, unique_key="telegram-report")
+    demo_id = store.enqueue("demo", {})
+    demo_finished = asyncio.Event()
+    report_calls = 0
+
+    async def report(_payload):
+        nonlocal report_calls
+        report_calls += 1
+        return "unexpected"
+
+    async def demo(_payload):
+        demo_finished.set()
+        return "done"
+
+    runner = JobRunner(
+        store,
+        {"telegram.report": report, "demo": demo},
+        parallel=1,
+    )
+    await runner.start()
+    await asyncio.wait_for(demo_finished.wait(), timeout=2)
+    await wait_for(
+        lambda: store.db.execute("SELECT state FROM jobs WHERE id=?", (demo_id,)).fetchone()[0]
+        == "done"
+    )
+    await runner.stop()
+
+    assert report_calls == 0
+    assert store.db.execute(
+        "SELECT state FROM jobs WHERE id=?", (report_id,)
+    ).fetchone()[0] == "queued"
+    store.close()

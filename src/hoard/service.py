@@ -99,10 +99,15 @@ class Service:
     def _source(self, source_id: int) -> dict | None:
         return self.store.source(source_id)
 
-    def _queue_report(self) -> int:
-        return self.store.enqueue(
+    def _queue_report(self) -> int | None:
+        if not self.store.telegram.catalog_report_due():
+            self.runner.wakeup()
+            return None
+        job_id = self.store.enqueue(
             "telegram.report", {}, unique_key="telegram-report"
         )
+        self.runner.wakeup()
+        return job_id
 
     def enqueue_ai(
         self,
@@ -127,6 +132,9 @@ class Service:
         else:
             self._ai_key_state = "verified"
             return result
+        finally:
+            if self.store.telegram.catalog_dirty():
+                self._queue_report()
 
     async def _ai_chat(self, payload: dict) -> str:
         try:
@@ -137,6 +145,9 @@ class Service:
         else:
             self._ai_key_state = "verified"
             return result
+        finally:
+            if self.store.telegram.catalog_dirty():
+                self._queue_report()
 
     @staticmethod
     def _scan_error(exc: Exception) -> str:
@@ -227,19 +238,43 @@ class Service:
         async with self._report_lock:
             preferred = payload.get("archive_root")
             report = None
-            # A Telegram job may write while the snapshot is being built. The dirty
-            # marker makes the build converge without regenerating after each message.
-            for _ in range(3):
-                report = await asyncio.to_thread(
-                    partial(
-                        build_catalog_from_db,
-                        self.store.filename,
-                        archive_root=preferred,
+            try:
+                # A Telegram or AI job may write while the snapshot is being built.
+                # Three immediate passes absorb short bursts; durable reconciliation
+                # schedules a cooled-down follow-up if mutations continue.
+                for _ in range(3):
+                    worker = asyncio.create_task(
+                        asyncio.to_thread(
+                            partial(
+                                build_catalog_from_db,
+                                self.store.filename,
+                                archive_root=preferred,
+                            )
+                        )
                     )
+                    try:
+                        report = await asyncio.shield(worker)
+                    except asyncio.CancelledError:
+                        # ``to_thread`` keeps running after coroutine cancellation.
+                        # Hold the report lock until the real writer has stopped.
+                        try:
+                            await worker
+                        except Exception as exc:
+                            self.store.telegram.record_catalog_report_failure(
+                                f"{type(exc).__name__}: {exc}"
+                            )
+                        raise
+                    if not self.store.telegram.catalog_dirty():
+                        break
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.store.telegram.record_catalog_report_failure(
+                    f"{type(exc).__name__}: {exc}"
                 )
-                if not self.store.telegram.catalog_dirty():
-                    break
+                raise
             assert report is not None
+            self.store.telegram.record_catalog_report_success()
             self.store.event("ok", f"HTML-каталог обновлён: {report}")
             return f"HTML-каталог обновлён: {report}"
 

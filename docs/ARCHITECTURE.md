@@ -13,7 +13,7 @@ background service.
   `request()` boundary. Dialogs, screens, status formatting, reusable widgets and TCSS remain
   separate. The package imports neither storage nor Telethon.
 - `ipc.py` starts the daemon detached when required and sends one JSON request per private
-  Unix-socket connection. Client and daemon must both report Hoard 0.7.1.5 and IPC protocol `1`.
+  Unix-socket connection. Client and daemon must both report Hoard 0.7.1.6 and IPC protocol `1`.
   A held instance lock with no ready socket means initialization is in progress, so the client
   waits for that owner instead of spawning a second daemon.
 - `service.py` owns the database, two independently limited job runners and the sole
@@ -183,7 +183,18 @@ Every catalog-visible Telegram or PSL mutation sets `catalog_dirty` and incremen
 `catalog_revision` in the same transaction. The builder records the revision belonging to its
 SQLite snapshot, publishes the complete temporary file, then clears dirty with a conditional
 update only if the revision is unchanged. A concurrent mutation therefore stays dirty and the
-existing report worker coalesces another build; no scan or second queue system is required.
+existing Telegram job loop reconciles another deduplicated report job; no scan or second queue
+system is required. It also reconciles a durable dirty marker after restart. Three immediate
+passes absorb a short mutation burst, followed by a two-second durable cooldown when changes keep
+arriving. Filesystem failures retain their reason and use bounded exponential backoff from 30
+seconds to one hour; a manual report bypasses that automatic delay.
+
+Report generation runs in a worker thread, but cancellation keeps the per-daemon report lock until
+that worker actually exits. A replacement generation therefore cannot write the same final HTML
+concurrently with a cancelled predecessor. The temporary-file `flush`, `fsync` and atomic
+`os.replace` boundary remains unchanged. Re-registering an identical normalized archive root only
+updates its service timestamp, and a post-metadata refresh invalidates the catalog only when a
+published value changes; a real root change remains atomic with its revision increment.
 
 The report builder retires the short-lived split layout by moving
 `<archive>/telegram/objects/` into `hoard_objects/` and rewriting only matching media paths in

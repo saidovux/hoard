@@ -88,6 +88,14 @@ class JobRunner:
 
     def _enqueue_due_jobs(self) -> None:
         # Keep schedulers small and synchronous; all work remains an ordinary job.
+        if (
+            "telegram.report" in self.handlers
+            and self.store.telegram.catalog_dirty()
+            and self.store.telegram.catalog_report_due()
+        ):
+            self.store.enqueue(
+                "telegram.report", {}, unique_key="telegram-report"
+            )
         if "telegram.scan" in self.handlers:
             for source in self.store.due_sources():
                 self.store.enqueue(
@@ -112,12 +120,21 @@ class JobRunner:
                 self._enqueue_due_jobs()
                 slots = max(0, self.parallel - len(self._active))
                 for job in self.store.queued_jobs(
-                    limit=slots,
+                    # One deferred report must not hide otherwise runnable work.
+                    limit=slots + int("telegram.report" in self.handlers),
                     kinds=self.handlers.keys(),
                 ):
+                    if slots <= 0:
+                        break
+                    if (
+                        job["kind"] == "telegram.report"
+                        and not self.store.telegram.catalog_report_due()
+                    ):
+                        continue
                     if not self.store.mark_running(job["id"]):
                         continue
                     self._active[job["id"]] = asyncio.create_task(self._run_one(job))
+                    slots -= 1
                 self._wakeup.clear()
                 try:
                     # ``wait_for(Event.wait())`` creates a helper task whose

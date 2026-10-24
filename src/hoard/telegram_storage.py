@@ -13,6 +13,8 @@ from .models import parse_post_url
 TELEGRAM_SCHEMA_VERSION = 3
 
 MEDIA_RETRY_DELAYS = (60, 300, 1800, 7200, 21600, 86400)
+CATALOG_REPORT_RETRY_DELAYS = (30, 120, 600, 1800, 3600)
+CATALOG_REPORT_COOLDOWN = 2.0
 
 
 def utc_now() -> str:
@@ -175,19 +177,23 @@ class TelegramStorage:
                 (str(root.expanduser().resolve()),),
             )
 
-    def _persist_archive_root(self, root: Path) -> None:
+    def _persist_archive_root(self, root: Path) -> bool:
         resolved = root.expanduser().resolve()
         with self.db:
-            self.db.execute(
+            changed = self.db.execute(
                 """INSERT INTO tg_settings(key,value) VALUES('archive_root',?)
-                ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value
+                WHERE tg_settings.value<>excluded.value""",
                 (str(resolved),),
-            )
+            ).rowcount == 1
             self.db.execute(
                 """INSERT INTO tg_archive_roots(path) VALUES(?)
                 ON CONFLICT(path) DO UPDATE SET last_used_at=datetime('now')""",
                 (str(resolved),),
             )
+            if changed:
+                self._set_dirty_sql()
+        return changed
 
     def get_setting(self, key: str, default: str = "") -> str:
         row = self.db.execute("SELECT value FROM tg_settings WHERE key=?", (key,)).fetchone()
@@ -195,11 +201,14 @@ class TelegramStorage:
 
     def set_setting(self, key: str, value: str) -> None:
         with self.db:
-            self.db.execute(
-                """INSERT INTO tg_settings(key,value) VALUES(?,?)
-                ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
-                (key, value),
-            )
+            self._set_setting_sql(key, value)
+
+    def _set_setting_sql(self, key: str, value: str) -> None:
+        self.db.execute(
+            """INSERT INTO tg_settings(key,value) VALUES(?,?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+            (key, value),
+        )
 
     def set_catalog_dirty(self, dirty: bool = True) -> None:
         with self.db:
@@ -230,6 +239,36 @@ class TelegramStorage:
             )
         return cursor.rowcount == 1
 
+    def catalog_report_due(self, *, now: float | None = None) -> bool:
+        try:
+            retry_at = float(self.get_setting("catalog_report_retry_at", "0"))
+        except ValueError:
+            retry_at = 0
+        return retry_at <= (time.time() if now is None else float(now))
+
+    def record_catalog_report_failure(self, error: str, *, now: float | None = None) -> int:
+        try:
+            previous = int(self.get_setting("catalog_report_failures", "0"))
+        except ValueError:
+            previous = 0
+        failures = max(0, previous) + 1
+        delay = CATALOG_REPORT_RETRY_DELAYS[
+            min(failures - 1, len(CATALOG_REPORT_RETRY_DELAYS) - 1)
+        ]
+        retry_at = (time.time() if now is None else float(now)) + delay
+        with self.db:
+            self._set_setting_sql("catalog_report_failures", str(failures))
+            self._set_setting_sql("catalog_report_retry_at", str(retry_at))
+            self._set_setting_sql("catalog_report_last_error", error[:500])
+        return delay
+
+    def record_catalog_report_success(self, *, now: float | None = None) -> None:
+        # A short durable cooldown bounds rebuild frequency when mutations never stop.
+        retry_at = (time.time() if now is None else float(now)) + CATALOG_REPORT_COOLDOWN
+        with self.db:
+            self._set_setting_sql("catalog_report_failures", "0")
+            self._set_setting_sql("catalog_report_retry_at", str(retry_at))
+
     def archive_root(self, preferred: str | Path | None = None, *, persist: bool = False) -> Path:
         if preferred is not None:
             root = Path(preferred).expanduser().resolve()
@@ -237,7 +276,6 @@ class TelegramStorage:
                 raise ValueError("Корень архива должен быть каталогом")
             if persist:
                 self._persist_archive_root(root)
-                self.set_catalog_dirty()
             return root
         configured = self.get_setting("archive_root")
         if configured:
@@ -525,7 +563,20 @@ class TelegramStorage:
         status: str = "ready",
         error: str = "",
     ) -> None:
+        values = (
+            channel_title[:300],
+            post_text[:20000],
+            published_at,
+            status,
+            error[:500],
+        )
         with self.db:
+            previous = self.db.execute(
+                """SELECT channel_title,post_text,published_at,status,error
+                FROM tg_post_metadata WHERE source_id=?""",
+                (int(source_id),),
+            ).fetchone()
+            changed = previous is None or tuple(previous) != values
             self.db.execute(
                 """INSERT INTO tg_post_metadata(source_id,channel_title,post_text,
                 published_at,fetched_at,status,error) VALUES(?,?,?,?,?,?,?)
@@ -535,15 +586,13 @@ class TelegramStorage:
                 status=excluded.status,error=excluded.error""",
                 (
                     int(source_id),
-                    channel_title[:300],
-                    post_text[:20000],
-                    published_at,
+                    *values[:3],
                     utc_now(),
-                    status,
-                    error[:500],
+                    *values[3:],
                 ),
             )
-            self._set_dirty_sql()
+            if changed:
+                self._set_dirty_sql()
 
     def post_media(self, source_id: int, media_id: str) -> dict[str, Any] | None:
         row = self.db.execute(
