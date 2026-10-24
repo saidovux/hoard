@@ -19,16 +19,6 @@ def utc_now() -> str:
     return datetime.now(UTC).isoformat()
 
 
-def _first(values: list[str]) -> str:
-    present = [value for value in values if value]
-    return min(present) if present else ""
-
-
-def _last(values: list[str]) -> str:
-    present = [value for value in values if value]
-    return max(present) if present else ""
-
-
 class TelegramStorage:
     """Telegram data layer sharing Hoard's existing SQLite connection."""
 
@@ -301,10 +291,17 @@ class TelegramStorage:
         return {"attempts": attempts, "retry_at": retry_at, "delay": delay}
 
     def clear_media_failure(self, source_id: int, message_id: int) -> None:
+        key = (int(source_id), int(message_id))
+        existing = self.db.execute(
+            "SELECT 1 FROM tg_media_failures WHERE source_id=? AND message_id=?",
+            key,
+        ).fetchone()
+        if existing is None:
+            return
         with self.db:
             self.db.execute(
                 "DELETE FROM tg_media_failures WHERE source_id=? AND message_id=?",
-                (int(source_id), int(message_id)),
+                key,
             )
 
     def allowed_media_roots(self, archive_root: Path) -> list[Path]:
@@ -332,81 +329,72 @@ class TelegramStorage:
         observed_at: str,
         source_id: int | None,
     ) -> None:
-        current = self.db.execute(
-            "SELECT * FROM tg_profiles WHERE author_id=?", (author_id,)
-        ).fetchone()
-        if current is None:
-            self.db.execute(
-                """INSERT INTO tg_profiles(author_id,current_username,display_name,
-                first_seen,last_seen) VALUES(?,?,?,?,?)""",
-                (author_id, username or "", display_name, observed_at, observed_at),
-            )
-        else:
-            first_seen = _first([str(current["first_seen"]), observed_at])
-            last_seen = _last([str(current["last_seen"]), observed_at])
-            is_newest = (
-                not current["last_seen"]
-                or not observed_at
-                or observed_at >= current["last_seen"]
-            )
-            next_username = str(current["current_username"])
-            next_name = str(current["display_name"])
-            if is_newest:
-                if username is not None:
-                    next_username = username
-                if display_name:
-                    next_name = display_name
-            self.db.execute(
-                """UPDATE tg_profiles SET current_username=?,display_name=?,
-                first_seen=?,last_seen=? WHERE author_id=?""",
-                (next_username, next_name, first_seen, last_seen, author_id),
-            )
+        profile = {
+            "author_id": int(author_id),
+            "username": username or "",
+            "username_known": int(username is not None),
+            "display_name": display_name,
+            "observed_at": observed_at,
+        }
+        self.db.execute(
+            """INSERT INTO tg_profiles(author_id,current_username,display_name,
+            first_seen,last_seen) VALUES(
+            :author_id,:username,:display_name,:observed_at,:observed_at)
+            ON CONFLICT(author_id) DO UPDATE SET
+            current_username=CASE
+              WHEN (tg_profiles.last_seen='' OR :observed_at=''
+                    OR :observed_at>=tg_profiles.last_seen) AND :username_known=1
+              THEN excluded.current_username ELSE tg_profiles.current_username END,
+            display_name=CASE
+              WHEN (tg_profiles.last_seen='' OR :observed_at=''
+                    OR :observed_at>=tg_profiles.last_seen) AND excluded.display_name<>''
+              THEN excluded.display_name ELSE tg_profiles.display_name END,
+            first_seen=CASE
+              WHEN tg_profiles.first_seen='' THEN excluded.first_seen
+              WHEN excluded.first_seen='' THEN tg_profiles.first_seen
+              WHEN excluded.first_seen<tg_profiles.first_seen THEN excluded.first_seen
+              ELSE tg_profiles.first_seen END,
+            last_seen=CASE
+              WHEN tg_profiles.last_seen='' THEN excluded.last_seen
+              WHEN excluded.last_seen='' THEN tg_profiles.last_seen
+              WHEN excluded.last_seen>tg_profiles.last_seen THEN excluded.last_seen
+              ELSE tg_profiles.last_seen END""",
+            profile,
+        )
         if username:
-            row = self.db.execute(
-                """SELECT first_seen,last_seen FROM tg_username_history
-                WHERE author_id=? AND username=?""",
-                (author_id, username),
-            ).fetchone()
-            if row is None:
-                self.db.execute(
-                    """INSERT INTO tg_username_history(author_id,username,first_seen,last_seen)
-                    VALUES(?,?,?,?)""",
-                    (author_id, username, observed_at, observed_at),
-                )
-            else:
-                self.db.execute(
-                    """UPDATE tg_username_history SET first_seen=?,last_seen=?
-                    WHERE author_id=? AND username=?""",
-                    (
-                        _first([str(row["first_seen"]), observed_at]),
-                        _last([str(row["last_seen"]), observed_at]),
-                        author_id,
-                        username,
-                    ),
-                )
+            self.db.execute(
+                """INSERT INTO tg_username_history(
+                author_id,username,first_seen,last_seen) VALUES(?,?,?,?)
+                ON CONFLICT(author_id,username) DO UPDATE SET
+                first_seen=CASE
+                  WHEN tg_username_history.first_seen='' THEN excluded.first_seen
+                  WHEN excluded.first_seen='' THEN tg_username_history.first_seen
+                  WHEN excluded.first_seen<tg_username_history.first_seen
+                  THEN excluded.first_seen ELSE tg_username_history.first_seen END,
+                last_seen=CASE
+                  WHEN tg_username_history.last_seen='' THEN excluded.last_seen
+                  WHEN excluded.last_seen='' THEN tg_username_history.last_seen
+                  WHEN excluded.last_seen>tg_username_history.last_seen
+                  THEN excluded.last_seen ELSE tg_username_history.last_seen END""",
+                (author_id, username, observed_at, observed_at),
+            )
         if source_id is not None:
-            row = self.db.execute(
-                """SELECT first_seen,last_seen FROM tg_profile_sources
-                WHERE author_id=? AND source_id=?""",
-                (author_id, source_id),
-            ).fetchone()
-            if row is None:
-                self.db.execute(
-                    """INSERT INTO tg_profile_sources(author_id,source_id,first_seen,last_seen)
-                    VALUES(?,?,?,?)""",
-                    (author_id, source_id, observed_at, observed_at),
-                )
-            else:
-                self.db.execute(
-                    """UPDATE tg_profile_sources SET first_seen=?,last_seen=?
-                    WHERE author_id=? AND source_id=?""",
-                    (
-                        _first([str(row["first_seen"]), observed_at]),
-                        _last([str(row["last_seen"]), observed_at]),
-                        author_id,
-                        source_id,
-                    ),
-                )
+            self.db.execute(
+                """INSERT INTO tg_profile_sources(
+                author_id,source_id,first_seen,last_seen) VALUES(?,?,?,?)
+                ON CONFLICT(author_id,source_id) DO UPDATE SET
+                first_seen=CASE
+                  WHEN tg_profile_sources.first_seen='' THEN excluded.first_seen
+                  WHEN excluded.first_seen='' THEN tg_profile_sources.first_seen
+                  WHEN excluded.first_seen<tg_profile_sources.first_seen
+                  THEN excluded.first_seen ELSE tg_profile_sources.first_seen END,
+                last_seen=CASE
+                  WHEN tg_profile_sources.last_seen='' THEN excluded.last_seen
+                  WHEN excluded.last_seen='' THEN tg_profile_sources.last_seen
+                  WHEN excluded.last_seen>tg_profile_sources.last_seen
+                  THEN excluded.last_seen ELSE tg_profile_sources.last_seen END""",
+                (author_id, source_id, observed_at, observed_at),
+            )
 
     def observe_profile(
         self,

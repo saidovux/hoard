@@ -375,6 +375,59 @@ async def test_iteration_flood_wait_also_settles_in_flight_transfers(tmp_path):
     store.close()
 
 
+async def test_plain_comments_coalesce_ordered_checkpoint_writes(tmp_path):
+    messages = [
+        ConcurrentMessage(message_id * 3 + 1, video=False) for message_id in range(100)
+    ]
+    store, engine, _client = make_scan(tmp_path, messages)
+    statements: list[str] = []
+    store.db.set_trace_callback(statements.append)
+
+    assert await engine.scan(store.sources()[0]) == (100, 0)
+
+    store.db.set_trace_callback(None)
+    advances = [
+        statement
+        for statement in statements
+        if statement.lstrip().upper().startswith("UPDATE SOURCES SET LAST_ID=MAX")
+    ]
+    assert len(advances) == 4
+    assert store.sources()[0]["last_id"] == messages[-1].id
+    store.close()
+
+
+async def test_partial_checkpoint_flushes_while_iterator_is_waiting(tmp_path, monkeypatch):
+    class WaitingClient(ConcurrentClient):
+        def __init__(self, messages):
+            super().__init__(messages)
+            self.waiting = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def iter_messages(self, _entity, reply_to, min_id, reverse):
+            del reply_to, reverse
+            message = self.messages[0]
+            if message.id > min_id:
+                yield message
+                self.waiting.set()
+                await self.release.wait()
+
+    monkeypatch.setattr("hoard.telegram.SCAN_CHECKPOINT_MAX_DELAY", 0.01)
+    message = ConcurrentMessage(101, video=False)
+    store = Store(tmp_path / "hoard.sqlite3")
+    store.add_source(Post("channelx", 7), str(tmp_path / "archive"), 120)
+    client = WaitingClient([message])
+    engine = TelegramEngine(store, download_limit=3)
+    engine.connect = lambda: asyncio.sleep(0, result=client)
+    scan = asyncio.create_task(engine.scan(store.sources()[0]))
+    await asyncio.wait_for(client.waiting.wait(), timeout=1)
+
+    await asyncio.sleep(0.05)
+    assert store.sources()[0]["last_id"] == 101
+    client.release.set()
+    assert await scan == (1, 0)
+    store.close()
+
+
 def test_progress_tracks_individual_and_aggregate_transfers():
     reports: list[dict] = []
     engine = TelegramEngine(store=None, report_progress=reports.append, download_limit=2)

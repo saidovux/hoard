@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import stat
 import time
 from collections.abc import Collection
 from pathlib import Path
@@ -134,6 +135,16 @@ class Store:
             )
         ]
 
+    def source(self, source_id: int) -> dict | None:
+        """Return one source without aggregating every configured source."""
+        row = self.db.execute(
+            """SELECT sources.*,
+            (SELECT COUNT(*) FROM downloads WHERE downloads.source_id=sources.id)
+            AS download_count FROM sources WHERE sources.id=?""",
+            (int(source_id),),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
     def due_sources(self) -> list[dict]:
         return [
             dict(row)
@@ -187,7 +198,8 @@ class Store:
         ):
             path = Path(row["file_path"])
             try:
-                available = path.is_file() and path.stat().st_size == row["size"]
+                file_stat = path.stat()
+                available = stat.S_ISREG(file_stat.st_mode) and file_stat.st_size == row["size"]
             except OSError:
                 available = False
             if not available:
@@ -203,7 +215,12 @@ class Store:
             return False
         file = Path(row["file_path"])
         try:
-            return file.is_file() and file.stat().st_size == row["size"] and row["size"] > 0
+            file_stat = file.stat()
+            return (
+                stat.S_ISREG(file_stat.st_mode)
+                and file_stat.st_size == row["size"]
+                and row["size"] > 0
+            )
         except OSError:
             return False
 
@@ -231,20 +248,19 @@ class Store:
                       author_name=excluded.author_name, file_path=excluded.file_path,
                       size=excluded.size,observed_at=excluded.observed_at,
                       state=excluded.state""", payload)
+                if payload.get("author_id") is not None:
+                    self.telegram._observe_profile(
+                        author_id=int(payload["author_id"]),
+                        username=str(payload.get("author_username") or ""),
+                        display_name=str(payload.get("author_name") or "")[:300],
+                        observed_at=str(payload["observed_at"]),
+                        source_id=source_id,
+                    )
+                self.telegram._set_dirty_sql()
             if advance:
                 self.db.execute(
                     "UPDATE sources SET last_id=MAX(last_id,?) WHERE id=?",
                     (message_id, source_id),
-                )
-        if payload:
-            self.telegram.set_catalog_dirty()
-            if payload.get("author_id") is not None:
-                self.telegram.observe_profile(
-                    author_id=int(payload["author_id"]),
-                    username=str(payload.get("author_username") or ""),
-                    display_name=str(payload.get("author_name") or ""),
-                    observed_at=str(payload["observed_at"]),
-                    source_id=source_id,
                 )
 
     def recent_downloads(self, count: int = 40) -> list[dict]:

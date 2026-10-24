@@ -97,7 +97,7 @@ class Service:
         self.progress = value
 
     def _source(self, source_id: int) -> dict | None:
-        return next((item for item in self.store.sources() if item["id"] == source_id), None)
+        return self.store.source(source_id)
 
     def _queue_report(self) -> int:
         return self.store.enqueue(

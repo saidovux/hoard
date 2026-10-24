@@ -13,7 +13,7 @@ background service.
   `request()` boundary. Dialogs, screens, status formatting, reusable widgets and TCSS remain
   separate. The package imports neither storage nor Telethon.
 - `ipc.py` starts the daemon detached when required and sends one JSON request per private
-  Unix-socket connection. Client and daemon must both report Hoard 0.7.1.4 and IPC protocol `1`.
+  Unix-socket connection. Client and daemon must both report Hoard 0.7.1.5 and IPC protocol `1`.
   A held instance lock with no ready socket means initialization is in progress, so the client
   waits for that owner instead of spawning a second daemon.
 - `service.py` owns the database, two independently limited job runners and the sole
@@ -140,6 +140,12 @@ later successful files remain durable and are deduplicated on the next scan. Mis
 size-mismatched video notes move the scan cursor back to the earliest affected message. A missing
 legacy JSON sidecar alone does not trigger a network re-download because SQLite already has the
 required catalog metadata.
+
+Cursor writes for a processed prefix are coalesced into bounded 32-comment batches. A 250 ms
+deadline flushes a partial batch even while the scanner awaits the next Telegram item; scan exit
+and every blocking failure flush the preceding safe prefix synchronously. No SQLite transaction
+is held across iteration or transfer waits. Archive validation follows symbolic links as before,
+but one `stat()` now establishes both regular-file type and exact recorded size.
 
 The `scan_source` IPC operation validates that one source exists and is enabled, then enqueues the
 same `telegram.scan` payload and `telegram:<id>` unique key used by the scheduler. It therefore

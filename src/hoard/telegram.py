@@ -19,6 +19,8 @@ from .telegram_download import download_video_note
 from .telegram_storage import utc_now
 
 TELEGRAM_REORDER_FACTOR = 4
+SCAN_CHECKPOINT_BATCH = 32
+SCAN_CHECKPOINT_MAX_DELAY = 0.25
 
 
 @dataclass(slots=True)
@@ -622,6 +624,10 @@ class TelegramEngine:
         reorder_limit = TELEGRAM_REORDER_FACTOR * self.download_limit
         reorder: deque[_ScanEntry] = deque()
         active: dict[asyncio.Task, _ScanEntry] = {}
+        pending_checkpoint: int | None = None
+        pending_checkpoint_count = 0
+        checkpoint_timer: asyncio.TimerHandle | None = None
+        checkpoint_error: BaseException | None = None
 
         async def transfer(
             msg, identity: dict[str, Any]
@@ -649,14 +655,53 @@ class TelegramEngine:
             self.store.event("ok", f"Сохранён кружок {post.name} / {msg.id}")
             return True, True, None
 
+        def raise_checkpoint_error() -> None:
+            if checkpoint_error is not None:
+                raise checkpoint_error
+
+        def flush_checkpoint() -> None:
+            nonlocal pending_checkpoint, pending_checkpoint_count, checkpoint_timer
+            raise_checkpoint_error()
+            if checkpoint_timer is not None:
+                checkpoint_timer.cancel()
+                checkpoint_timer = None
+            if pending_checkpoint is None:
+                return
+            message_id = pending_checkpoint
+            pending_checkpoint = None
+            pending_checkpoint_count = 0
+            self.store.checkpoint(source["id"], message_id)
+
+        def scheduled_checkpoint() -> None:
+            nonlocal checkpoint_timer, checkpoint_error
+            checkpoint_timer = None
+            try:
+                flush_checkpoint()
+            except BaseException as exc:
+                checkpoint_error = exc
+
+        def stage_checkpoint(message_id: int) -> None:
+            nonlocal pending_checkpoint, pending_checkpoint_count, checkpoint_timer
+            raise_checkpoint_error()
+            pending_checkpoint = message_id
+            pending_checkpoint_count += 1
+            if pending_checkpoint_count >= SCAN_CHECKPOINT_BATCH:
+                flush_checkpoint()
+            elif checkpoint_timer is None:
+                checkpoint_timer = asyncio.get_running_loop().call_later(
+                    SCAN_CHECKPOINT_MAX_DELAY,
+                    scheduled_checkpoint,
+                )
+
         def drain_processed_prefix() -> None:
             nonlocal checkpoint_open
             while reorder and reorder[0].complete:
                 entry = reorder.popleft()
                 if not entry.processed:
+                    flush_checkpoint()
                     checkpoint_open = False
                 elif checkpoint_open:
-                    self.store.checkpoint(source["id"], entry.message_id, advance=True)
+                    stage_checkpoint(entry.message_id)
 
         def accept_done(done: set[asyncio.Task]) -> None:
             nonlocal downloaded, flood_wait
@@ -698,6 +743,7 @@ class TelegramEngine:
         try:
             try:
                 while flood_wait is None:
+                    raise_checkpoint_error()
                     await harvest(wait=False)
                     while len(reorder) >= reorder_limit and flood_wait is None:
                         await harvest(wait=True)
@@ -772,6 +818,7 @@ class TelegramEngine:
             while active:
                 await harvest(wait=True)
             drain_processed_prefix()
+            flush_checkpoint()
             if flood_wait is not None:
                 raise flood_wait
             return checked, downloaded
@@ -783,6 +830,8 @@ class TelegramEngine:
                 await asyncio.gather(*active, return_exceptions=True)
             raise
         finally:
+            if checkpoint_timer is not None:
+                checkpoint_timer.cancel()
             closer = getattr(iterator, "aclose", None)
             try:
                 if closer is not None:

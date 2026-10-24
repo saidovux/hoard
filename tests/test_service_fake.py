@@ -106,6 +106,10 @@ async def test_one_failed_media_does_not_poison_source_and_is_retried(tmp_path):
     store = Store(tmp_path / "db.sqlite")
     store.add_source(Post("channelx", 7), str(tmp_path / "archive"), 120)
     messages = [FakeMessage(21, False), FakeMessage(22, True), FakeMessage(23, True)]
+    messages[1].sender_id = 202
+    messages[1].sender = SimpleNamespace(
+        username="failed_author", first_name="Failed", last_name="Author"
+    )
     fake = SelectiveFailureClient(messages, {22: OSError("synthetic failure")})
     engine = TelegramEngine(store)
     engine.connect = lambda: asyncio.sleep(0, result=fake)
@@ -113,6 +117,10 @@ async def test_one_failed_media_does_not_poison_source_and_is_retried(tmp_path):
     assert await engine.scan(store.sources()[0]) == (3, 1)
     assert store.sources()[0]["last_id"] == 21
     assert store.seen(store.sources()[0]["id"], 23) is True
+    profile = store.db.execute(
+        "SELECT current_username,display_name FROM tg_profiles WHERE author_id=202"
+    ).fetchone()
+    assert tuple(profile) == ("failed_author", "Failed Author")
     failure = store.db.execute("SELECT * FROM tg_media_failures").fetchone()
     assert failure["message_id"] == 22
     assert failure["attempts"] == 1
