@@ -375,11 +375,47 @@ class Store:
                 parameters,
             )
 
-    def retry_job(self, jid: int) -> None:
+    def retry_job(self, jid: int) -> int:
+        """Requeue a failed job without violating the active unique key.
+
+        Returns the id of the job that is now responsible for the logical work.
+        If another queued/running job already owns the same ``unique_key``, that
+        job is returned instead of creating a duplicate or raising
+        ``IntegrityError`` from the partial unique index.
+        """
         with self.db:
-            cur = self.db.execute(
-                "UPDATE jobs SET state='queued',result='' WHERE id=? AND state='failed'",
-                (jid,),
-            )
+            row = self.db.execute(
+                "SELECT unique_key FROM jobs WHERE id=? AND state='failed'",
+                (int(jid),),
+            ).fetchone()
+            if row is None:
+                raise ValueError("Нужна существующая задача со статусом failed")
+            unique_key = row["unique_key"]
+            if unique_key is not None:
+                active = self.db.execute(
+                    """SELECT id FROM jobs WHERE unique_key=?
+                    AND state IN ('queued','running') LIMIT 1""",
+                    (str(unique_key),),
+                ).fetchone()
+                if active is not None:
+                    return int(active["id"])
+            try:
+                cur = self.db.execute(
+                    "UPDATE jobs SET state='queued',result='' WHERE id=? AND state='failed'",
+                    (int(jid),),
+                )
+            except sqlite3.IntegrityError:
+                # A concurrent enqueue created the active owner between the
+                # check and the update.  Defer to it rather than surfacing the
+                # index violation as an IPC error.
+                active = self.db.execute(
+                    """SELECT id FROM jobs WHERE unique_key=?
+                    AND state IN ('queued','running') LIMIT 1""",
+                    (str(unique_key),),
+                ).fetchone()
+                if active is not None:
+                    return int(active["id"])
+                raise
             if cur.rowcount != 1:
                 raise ValueError("Нужна существующая задача со статусом failed")
+            return int(jid)

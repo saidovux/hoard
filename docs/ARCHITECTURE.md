@@ -13,7 +13,7 @@ background service.
   `request()` boundary. Dialogs, screens, status formatting, reusable widgets and TCSS remain
   separate. The package imports neither storage nor Telethon.
 - `ipc.py` starts the daemon detached when required and sends one JSON request per private
-  Unix-socket connection. Client and daemon must both report Hoard 0.7.1.6 and IPC protocol `1`.
+  Unix-socket connection. Client and daemon must both report Hoard 0.7.1.7 and IPC protocol `1`.
   A held instance lock with no ready socket means initialization is in progress, so the client
   waits for that owner instead of spawning a second daemon.
 - `service.py` owns the database, two independently limited job runners and the sole
@@ -40,9 +40,12 @@ background service.
   expires after inactivity.
 
 Closing or cancelling the interface does not signal the service. Collector pause/stop cancels
-active jobs through `JobRunner`, which returns interrupted jobs to `queued`; the daemon stays
-available for management. The AI runner follows the daemon rather than the collector and uses its
-own concurrency limit. Each runner selects only its registered job kinds, so a long AI request
+active jobs through `JobRunner`, which returns interrupted jobs to `queued`; concurrent stop
+requests are serialized so the loop is cancelled once and cleanup completes. A temporary SQLite
+error while scheduling or marking a job records an event and retries with bounded backoff
+instead of terminating the only loop that drains durable work. The daemon stays available for
+management. The AI runner follows the daemon rather than the collector and uses its own
+concurrency limit. Each runner selects only its registered job kinds, so a long AI request
 cannot take a Telegram slot or acquire the Telegram lock. Interrupted AI jobs become `failed` and
 require an explicit retry because a cancelled paid request may already have reached the provider.
 Shutdown closes both runners, the Telegram client, database and socket.
@@ -187,14 +190,21 @@ existing Telegram job loop reconciles another deduplicated report job; no scan o
 system is required. It also reconciles a durable dirty marker after restart. Three immediate
 passes absorb a short mutation burst, followed by a two-second durable cooldown when changes keep
 arriving. Filesystem failures retain their reason and use bounded exponential backoff from 30
-seconds to one hour; a manual report bypasses that automatic delay.
+seconds to one hour; an explicit retry bypasses that automatic delay, coalesces with an already
+active report job instead of creating a duplicate, and a successful report clears the previous
+error.
 
 Report generation runs in a worker thread, but cancellation keeps the per-daemon report lock until
-that worker actually exits. A replacement generation therefore cannot write the same final HTML
-concurrently with a cancelled predecessor. The temporary-file `flush`, `fsync` and atomic
-`os.replace` boundary remains unchanged. Re-registering an identical normalized archive root only
-updates its service timestamp, and a post-metadata refresh invalidates the catalog only when a
-published value changes; a real root change remains atomic with its revision increment.
+that worker actually exits. Repeated cancellation is absorbed until `asyncio.to_thread()` is
+finished, and concurrent runner stops are serialized, so a replacement generation cannot write
+the same final HTML concurrently with a cancelled predecessor. The builder also holds a
+cross-process advisory lock in `hoard_objects/.catalog.lock` from before its SQLite snapshot until
+the final file and dirty marker are written. That covers a direct `hoard telegram report` running
+beside the daemon: an older snapshot cannot finish last and overwrite a newer catalog. The
+temporary-file `flush`, `fsync` and atomic `os.replace` boundary remains unchanged. Re-registering
+an identical normalized archive root only updates its service timestamp, and a post-metadata
+refresh invalidates the catalog only when a published value changes; a real root change remains
+atomic with its revision increment.
 
 The report builder retires the short-lived split layout by moving
 `<archive>/telegram/objects/` into `hoard_objects/` and rewriting only matching media paths in

@@ -1,4 +1,5 @@
 import asyncio
+import sqlite3
 
 from hoard.jobs import JobRunner
 from hoard.storage import Store
@@ -151,5 +152,108 @@ async def test_deferred_catalog_report_does_not_block_other_queued_work(
     assert report_calls == 0
     assert store.db.execute(
         "SELECT state FROM jobs WHERE id=?", (report_id,)
+    ).fetchone()[0] == "queued"
+    store.close()
+
+
+async def test_mark_running_error_recovers_and_runner_still_stops(tmp_path):
+    store = Store(tmp_path / "test.sqlite3", migrate_legacy=False)
+    finished = asyncio.Event()
+
+    async def demo(_payload):
+        finished.set()
+        return "done"
+
+    job_id = store.enqueue("demo", {})
+    runner = JobRunner(store, {"demo": demo}, parallel=1)
+    original_mark = store.mark_running
+    calls = 0
+
+    def flaky_mark(jid):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise sqlite3.OperationalError("database is locked")
+        return original_mark(jid)
+
+    store.mark_running = flaky_mark
+    runner._idle_timeout = 0.05
+
+    await runner.start()
+    await asyncio.wait_for(finished.wait(), 3)
+    await wait_for(
+        lambda: store.db.execute(
+            "SELECT state FROM jobs WHERE id=?", (job_id,)
+        ).fetchone()[0] == "done"
+    )
+    assert runner.running is True
+    assert calls >= 2
+
+    await runner.stop()
+
+    assert runner.running is False
+    store.close()
+
+
+async def test_scheduler_error_recovers_and_runner_still_stops(tmp_path):
+    store = Store(tmp_path / "test.sqlite3", migrate_legacy=False)
+    finished = asyncio.Event()
+
+    async def demo(_payload):
+        finished.set()
+        return "done"
+
+    job_id = store.enqueue("demo", {})
+    runner = JobRunner(store, {"demo": demo}, parallel=1)
+    original = runner._enqueue_due_jobs
+    calls = 0
+
+    def flaky_scheduler():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise sqlite3.OperationalError("database is locked")
+        original()
+
+    runner._enqueue_due_jobs = flaky_scheduler
+    runner._scheduler_error_delay = 0.01
+    runner._idle_timeout = 0.05
+
+    await runner.start()
+    await asyncio.wait_for(finished.wait(), 3)
+    await wait_for(
+        lambda: store.db.execute(
+            "SELECT state FROM jobs WHERE id=?", (job_id,)
+        ).fetchone()[0] == "done"
+    )
+    assert runner.running is True
+    assert any(
+        "scheduler" in event["text"]
+        for event in store.recent_events()
+    )
+
+    await runner.stop()
+
+    assert runner.running is False
+    assert store.db.execute(
+        "SELECT state FROM jobs WHERE id=?", (job_id,)
+    ).fetchone()[0] == "done"
+    store.close()
+
+
+def test_retry_returns_existing_active_job_instead_of_integrity_error(tmp_path):
+    store = Store(tmp_path / "test.sqlite3", migrate_legacy=False)
+    old = store.enqueue("telegram.report", {}, unique_key="telegram-report")
+    store.mark_running(old)
+    store.finish_job(old, "failed", "OSError: disk full")
+    active = store.enqueue("telegram.report", {}, unique_key="telegram-report")
+
+    assert store.retry_job(old) == active
+
+    assert store.db.execute(
+        "SELECT state FROM jobs WHERE id=?", (old,)
+    ).fetchone()[0] == "failed"
+    assert store.db.execute(
+        "SELECT state FROM jobs WHERE id=?", (active,)
     ).fetchone()[0] == "queued"
     store.close()

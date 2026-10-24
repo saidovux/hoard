@@ -268,6 +268,13 @@ class TelegramStorage:
         with self.db:
             self._set_setting_sql("catalog_report_failures", "0")
             self._set_setting_sql("catalog_report_retry_at", str(retry_at))
+            # Do not keep a resolved failure visible in diagnostics forever.
+            self._set_setting_sql("catalog_report_last_error", "")
+
+    def clear_catalog_report_retry(self) -> None:
+        """Let an explicit user retry bypass the automatic failure backoff."""
+        with self.db:
+            self._set_setting_sql("catalog_report_retry_at", "0")
 
     def archive_root(self, preferred: str | Path | None = None, *, persist: bool = False) -> Path:
         if preferred is not None:

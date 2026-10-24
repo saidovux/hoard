@@ -43,6 +43,7 @@ class Service:
         self.progress: dict = {}
         self._telegram_lock = asyncio.Lock()
         self._report_lock = asyncio.Lock()
+        self._stop_lock = asyncio.Lock()
         self.engine = engine or TelegramEngine(self.store, self._progress)
         self.runner = JobRunner(
             self.store,
@@ -234,10 +235,44 @@ class Service:
             if self.store.telegram.catalog_dirty():
                 self._queue_report()
 
+    @staticmethod
+    async def _wait_for_report_worker(
+        worker: asyncio.Task,
+    ) -> tuple[bool, object | None, BaseException | None]:
+        """Wait for a build thread even when the report task is cancelled again.
+
+        ``asyncio.to_thread`` cannot stop its thread.  A repeated ``cancel()``
+        used to interrupt ``await worker`` inside the cancellation handler and
+        release ``_report_lock`` while ``build_catalog_from_db`` could still
+        replace the HTML file.  Absorb every cancellation until the worker is
+        really finished, then let the caller re-raise it.
+        """
+        cancelled = False
+        while True:
+            try:
+                result = await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                cancelled = True
+                current = asyncio.current_task()
+                if current is not None:
+                    current.uncancel()
+                if worker.done():
+                    break
+                continue
+            except BaseException as exc:
+                return cancelled, None, exc
+            return cancelled, result, None
+        try:
+            result = worker.result()
+        except BaseException as exc:
+            return cancelled, None, exc
+        return cancelled, result, None
+
     async def _telegram_report(self, payload: dict) -> str:
         async with self._report_lock:
             preferred = payload.get("archive_root")
             report = None
+            worker_error: BaseException | None = None
             try:
                 # A Telegram or AI job may write while the snapshot is being built.
                 # Three immediate passes absorb short bursts; durable reconciliation
@@ -252,21 +287,28 @@ class Service:
                             )
                         )
                     )
-                    try:
-                        report = await asyncio.shield(worker)
-                    except asyncio.CancelledError:
-                        # ``to_thread`` keeps running after coroutine cancellation.
-                        # Hold the report lock until the real writer has stopped.
-                        try:
-                            await worker
-                        except Exception as exc:
-                            self.store.telegram.record_catalog_report_failure(
-                                f"{type(exc).__name__}: {exc}"
-                            )
-                        raise
+                    cancelled, result, worker_error = await self._wait_for_report_worker(
+                        worker
+                    )
+                    if worker_error is not None:
+                        if cancelled:
+                            # A cancellation must win after the thread exits.
+                            raise asyncio.CancelledError
+                        raise worker_error
+                    if cancelled:
+                        # The build completed, but the job was cancelled while
+                        # waiting for it.  Do not run another pass or report success.
+                        raise asyncio.CancelledError
+                    report = result
                     if not self.store.telegram.catalog_dirty():
                         break
             except asyncio.CancelledError:
+                if worker_error is not None and not isinstance(
+                    worker_error, asyncio.CancelledError
+                ):
+                    self.store.telegram.record_catalog_report_failure(
+                        f"{type(worker_error).__name__}: {worker_error}"
+                    )
                 raise
             except Exception as exc:
                 self.store.telegram.record_catalog_report_failure(
@@ -289,12 +331,13 @@ class Service:
         return result
 
     async def start(self) -> str:
-        if self.running:
-            return "Обработчик задач уже работает"
-        await self.runner.start()
-        was_paused = self.collector_state == "paused"
-        self.collector_state = "running"
-        return "Сборщик продолжил работу" if was_paused else "Сборщик запущен"
+        async with self._stop_lock:
+            if self.running:
+                return "Обработчик задач уже работает"
+            await self.runner.start()
+            was_paused = self.collector_state == "paused"
+            self.collector_state = "running"
+            return "Сборщик продолжил работу" if was_paused else "Сборщик запущен"
 
     async def start_background(self) -> None:
         """Start non-Telegram work owned by the single Hoard daemon."""
@@ -308,14 +351,18 @@ class Service:
         await self.ai_runner.stop()
 
     async def stop(self, *, paused: bool = False) -> str:
-        await self.runner.stop()
-        async with self._telegram_lock:
-            await self.engine.disconnect()
-        self.progress = {}
-        self.collector_state = "paused" if paused else "stopped"
-        if paused:
-            return "Сборщик приостановлен; незавершённые задания сохранены"
-        return "Сборщик остановлен; служба доступна для управления"
+        # Pause and shutdown may arrive through different IPC connections at
+        # the same time.  Serialize the whole transition so the runner is
+        # cancelled once and the engine is disconnected once.
+        async with self._stop_lock:
+            await self.runner.stop()
+            async with self._telegram_lock:
+                await self.engine.disconnect()
+            self.progress = {}
+            self.collector_state = "paused" if paused else "stopped"
+            if paused:
+                return "Сборщик приостановлен; незавершённые задания сохранены"
+            return "Сборщик остановлен; служба доступна для управления"
 
     async def _auth_call(self, operation) -> dict:
         try:
@@ -528,9 +575,18 @@ class Service:
             ).fetchone()
             if job is not None and str(job["kind"]).startswith("ai."):
                 raise ValueError("AI-запросы повторяются только через ai_attempt_retry")
-            self.store.retry_job(int(args["id"]))
+            job_id = self.store.retry_job(int(args["id"]))
+            if job is not None and str(job["kind"]) == "telegram.report":
+                # A user retry is explicit: it must not wait for the automatic
+                # filesystem-failure backoff.
+                self.store.telegram.clear_catalog_report_retry()
             self.runner.wakeup()
-            return {"message": "Задание возвращено в очередь"}
+            message = (
+                "Задание возвращено в очередь"
+                if job_id == int(args["id"])
+                else f"Задание уже выполняется или стоит в очереди: #{job_id}"
+            )
+            return {"message": message, "job_id": job_id}
         if method == "start":
             return {"message": await self.start()}
         if method == "pause":

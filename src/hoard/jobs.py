@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import json
 from collections.abc import Awaitable, Callable
 
@@ -33,6 +32,10 @@ class JobRunner:
         self._loop: asyncio.Task | None = None
         self._active: dict[int, asyncio.Task] = {}
         self._wakeup = asyncio.Event()
+        self._lifecycle_lock = asyncio.Lock()
+        self._scheduler_error_delay = 1.0
+        self._scheduler_error_delay_max = 30.0
+        self._idle_timeout = 2.0
 
     @property
     def running(self) -> bool:
@@ -42,20 +45,43 @@ class JobRunner:
         self._wakeup.set()
 
     async def start(self) -> None:
-        if self.running:
-            return
-        self.store.recover_interrupted_jobs(
-            self.handlers.keys(),
-            retry=self.retry_interrupted,
-        )
-        self._loop = asyncio.create_task(self._run(), name=f"hoard-{self.name}-runner")
+        async with self._lifecycle_lock:
+            if self.running:
+                return
+            self.store.recover_interrupted_jobs(
+                self.handlers.keys(),
+                retry=self.retry_interrupted,
+            )
+            self._loop = asyncio.create_task(
+                self._run(), name=f"hoard-{self.name}-runner"
+            )
 
     async def stop(self) -> None:
-        if self._loop is not None:
-            self._loop.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._loop
+        # Two concurrent pause/shutdown requests must not cancel the runner
+        # loop twice: a second cancel can interrupt its cleanup and destroy the
+        # active-task bookkeeping.  The first stop owns the transition.
+        async with self._lifecycle_lock:
+            loop = self._loop
+            if loop is None:
+                return
             self._loop = None
+            if not loop.done():
+                loop.cancel()
+            result = await asyncio.gather(loop, return_exceptions=True)
+            error = result[0] if result else None
+            if isinstance(error, Exception) and not isinstance(
+                error, asyncio.CancelledError
+            ):
+                self._record_error("runner", error)
+
+    def _record_error(self, scope: str, exc: BaseException) -> None:
+        try:
+            self.store.event(
+                "error", f"{self.name}: {scope}: {type(exc).__name__}: {exc}"
+            )
+        except Exception:
+            # Diagnostics must never break the runner or shutdown.
+            pass
 
     async def _run_one(self, job: dict) -> None:
         jid = job["id"]
@@ -117,21 +143,45 @@ class JobRunner:
     async def _run(self) -> None:
         try:
             while True:
-                self._enqueue_due_jobs()
                 slots = max(0, self.parallel - len(self._active))
-                for job in self.store.queued_jobs(
-                    # One deferred report must not hide otherwise runnable work.
-                    limit=slots + int("telegram.report" in self.handlers),
-                    kinds=self.handlers.keys(),
-                ):
+                try:
+                    self._enqueue_due_jobs()
+                    jobs = self.store.queued_jobs(
+                        # One deferred report must not hide otherwise runnable work.
+                        limit=slots + int("telegram.report" in self.handlers),
+                        kinds=self.handlers.keys(),
+                    )
+                except Exception as exc:
+                    # A temporary SQLite/filesystem error must not silently kill
+                    # the only loop that drains durable queued work.  Pause with
+                    # bounded backoff, keep active jobs running, and try again.
+                    self._record_error("scheduler", exc)
+                    await asyncio.sleep(self._scheduler_error_delay)
+                    self._scheduler_error_delay = min(
+                        self._scheduler_error_delay * 2,
+                        self._scheduler_error_delay_max,
+                    )
+                    continue
+                self._scheduler_error_delay = 1.0
+
+                for job in jobs:
                     if slots <= 0:
                         break
-                    if (
-                        job["kind"] == "telegram.report"
-                        and not self.store.telegram.catalog_report_due()
-                    ):
-                        continue
-                    if not self.store.mark_running(job["id"]):
+                    try:
+                        if (
+                            job["kind"] == "telegram.report"
+                            and not self.store.telegram.catalog_report_due()
+                        ):
+                            continue
+                    except Exception as exc:
+                        self._record_error("scheduler", exc)
+                        break
+                    try:
+                        marked = self.store.mark_running(job["id"])
+                    except Exception as exc:
+                        self._record_error("mark_running", exc)
+                        break
+                    if not marked:
                         continue
                     self._active[job["id"]] = asyncio.create_task(self._run_one(job))
                     slots -= 1
@@ -141,13 +191,16 @@ class JobRunner:
                     # cancellation can stall on Python 3.11's Windows loops.
                     # Timeout the runner task itself so shutdown cancellation
                     # remains direct and deterministic.
-                    async with asyncio.timeout(2):
+                    async with asyncio.timeout(self._idle_timeout):
                         await self._wakeup.wait()
                 except TimeoutError:
                     pass
         finally:
-            for task in self._active.values():
+            tasks = list(self._active.values())
+            for task in tasks:
                 task.cancel()
-            if self._active:
-                await asyncio.gather(*self._active.values(), return_exceptions=True)
-            self._active.clear()
+            if tasks:
+                try:
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                finally:
+                    self._active.clear()

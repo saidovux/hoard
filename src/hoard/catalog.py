@@ -1,11 +1,15 @@
 """Build the autonomous Telegram HTML catalog from SQLite."""
 from __future__ import annotations
 
+import errno
 import json
 import os
 import re
 import tempfile
-from contextlib import suppress
+import threading
+import time
+from collections.abc import Iterator
+from contextlib import contextmanager, suppress
 from datetime import UTC, datetime
 from filecmp import cmp
 from importlib import resources
@@ -26,6 +30,70 @@ CATALOG_SCHEMA_VERSION = 2
 STYLE_TOKEN = "/*__HOARD_STYLE__*/"
 DATA_TOKEN = "/*__HOARD_DATA__*/"
 APP_TOKEN = "/*__HOARD_APP__*/"
+CATALOG_LOCK_FILENAME = ".catalog.lock"
+
+_PUBLISH_LOCKS: dict[str, threading.Lock] = {}
+_PUBLISH_LOCKS_GUARD = threading.Lock()
+
+
+def _publish_thread_lock(target: Path) -> threading.Lock:
+    """Return one in-process lock for a normalized catalog target."""
+    key = str(target.expanduser().resolve(strict=False))
+    with _PUBLISH_LOCKS_GUARD:
+        return _PUBLISH_LOCKS.setdefault(key, threading.Lock())
+
+
+@contextmanager
+def _catalog_write_lock(root: Path) -> Iterator[None]:
+    """Serialize snapshot, build and publication in this and other processes.
+
+    Locking only ``os.replace()`` would still let a builder that snapshotted an
+    older revision finish later and overwrite a newer catalog.  The lock is
+    therefore held from before the SQLite snapshot until the final file and
+    dirty marker are written.
+    """
+    target = telegram_catalog_file(root)
+    lock_path = telegram_objects_dir(root) / CATALOG_LOCK_FILENAME
+    with _publish_thread_lock(target):
+        descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                if os.fstat(descriptor).st_size == 0:
+                    os.write(descriptor, b"\0")
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                while True:
+                    try:
+                        msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+                        break
+                    except OSError as exc:
+                        # Windows has no portable blocking flock(); poll so a
+                        # killed owner releases its lock without a stale result.
+                        if exc.errno not in {
+                            errno.EACCES,
+                            errno.EAGAIN,
+                            getattr(errno, "EDEADLK", errno.EACCES),
+                        }:
+                            raise
+                        time.sleep(0.05)
+                try:
+                    yield
+                finally:
+                    os.lseek(descriptor, 0, os.SEEK_SET)
+                    with suppress(OSError):
+                        msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(descriptor, fcntl.LOCK_EX)
+                try:
+                    yield
+                finally:
+                    with suppress(OSError):
+                        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(descriptor)
 
 
 def _text(value: object) -> str:
@@ -562,45 +630,46 @@ def build_catalog(
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     target = telegram_catalog_file(root)
     ensure_private(telegram_objects_dir(root))
+    index = _template_text("index.html", template_dir)
+    style = _template_text("style.css", template_dir)
+    app = _template_text("app.js", template_dir)
     temporary: Path | None = None
-    try:
-        index = _template_text("index.html", template_dir)
-        style = _template_text("style.css", template_dir)
-        app = _template_text("app.js", template_dir)
-        _migrate_obsolete_split_catalog(store, root)
-        revision, rows, analyses, allowed_roots = _catalog_snapshot(store, root)
-        payload = _build_payload(
-            rows=rows,
-            analyses=analyses,
-            archive_root=root,
-            allowed_roots=allowed_roots,
-            revision=revision,
-        )
-        content = _bundle_html(
-            index,
-            style=style,
-            data=_serialize_data(payload),
-            app=app,
-        )
-        descriptor, temporary_name = tempfile.mkstemp(
-            prefix=".telegram_archive-", suffix=".tmp", dir=root
-        )
-        temporary = Path(temporary_name)
-        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
-            stream.write(content)
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, target)
-        temporary = None
-        if os.name != "nt":
-            target.chmod(0o600)
-        store.telegram.clear_catalog_dirty(revision)
-    except BaseException:
-        store.telegram.set_catalog_dirty()
-        raise
-    finally:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
+    with _catalog_write_lock(root):
+        try:
+            _migrate_obsolete_split_catalog(store, root)
+            revision, rows, analyses, allowed_roots = _catalog_snapshot(store, root)
+            payload = _build_payload(
+                rows=rows,
+                analyses=analyses,
+                archive_root=root,
+                allowed_roots=allowed_roots,
+                revision=revision,
+            )
+            content = _bundle_html(
+                index,
+                style=style,
+                data=_serialize_data(payload),
+                app=app,
+            )
+            descriptor, temporary_name = tempfile.mkstemp(
+                prefix=".telegram_archive-", suffix=".tmp", dir=root
+            )
+            temporary = Path(temporary_name)
+            with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
+                stream.write(content)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, target)
+            temporary = None
+            if os.name != "nt":
+                target.chmod(0o600)
+            store.telegram.clear_catalog_dirty(revision)
+        except BaseException:
+            store.telegram.set_catalog_dirty()
+            raise
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
     return target
 
 
