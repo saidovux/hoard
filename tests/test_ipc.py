@@ -69,6 +69,19 @@ async def test_current_daemon_version_and_protocol_are_accepted(monkeypatch):
     await ensure_daemon()
 
 
+async def test_invalid_download_limit_is_reported_before_daemon_detaches(tmp_path, monkeypatch):
+    async def unavailable(method, args=None, timeout=12):
+        raise OSError("not running")
+
+    monkeypatch.setattr("hoard.ipc.request", unavailable)
+    monkeypatch.setattr("hoard.ipc.state_dir", lambda: tmp_path)
+    monkeypatch.setattr("hoard.ipc.instance_running", lambda _path: False)
+    monkeypatch.setenv("HOARD_TG_DOWNLOADS", "many")
+
+    with pytest.raises(ValueError, match="HOARD_TG_DOWNLOADS.*1.*4"):
+        await ensure_daemon()
+
+
 async def test_initializing_daemon_is_waited_for_without_starting_a_second_process(
     tmp_path, monkeypatch
 ):

@@ -70,6 +70,14 @@ def progress_lines(status: dict) -> list[str]:
             parts.append(f"сохранено {downloaded}")
         lines.append(" · ".join(parts))
 
+    active = progress.get("active_downloads")
+    aggregate_speed = progress.get("aggregate_speed_bps")
+    if active:
+        activity = f"Активных загрузок: {active}"
+        if aggregate_speed:
+            activity += f" · суммарно {format_bytes(aggregate_speed)}/s"
+        lines.append(activity)
+
     filename = progress.get("file")
     current = progress.get("bytes")
     total = progress.get("total")

@@ -7,6 +7,7 @@ import subprocess
 import sys
 
 from . import __version__
+from .config import telegram_download_limit
 from .paths import endpoint_path, ensure_private, socket_path, state_dir
 from .platform_support import instance_running, is_windows, read_endpoint
 
@@ -97,6 +98,9 @@ async def ensure_daemon() -> None:
         raise RuntimeError(
             f"Процесс daemon работает, но ещё инициализируется; проверь {log}"
         )
+    # Validate inherited daemon configuration before detaching so the invoking
+    # terminal receives the actionable value error instead of only a log path.
+    telegram_download_limit()
     command = [sys.executable, "-m", "hoard", "daemon"]
     options = {
         "stdin": subprocess.DEVNULL,

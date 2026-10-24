@@ -11,6 +11,7 @@ from rich.console import Console
 
 from hoard import __version__
 from hoard.console_ui import HoardCLI, fmt_bytes, progress_text, progress_view
+from hoard.tui.state import progress_lines
 
 
 class Prompt:
@@ -72,6 +73,30 @@ def test_progress_bar_uses_real_total():
     Console(file=out, width=80).print(progress_view(data))
     assert "25%" in out.getvalue()
     assert "clip.mp4" in out.getvalue()
+
+
+def test_concurrent_progress_keeps_individual_and_aggregate_speeds_distinct():
+    data = {
+        "progress": {
+            "source": "channel/42",
+            "checked": 9,
+            "downloaded": 4,
+            "active_downloads": 3,
+            "aggregate_speed_bps": 4096,
+            "file": "clip.mp4",
+            "bytes": 1024,
+            "total": 2048,
+            "speed_bps": 512,
+        }
+    }
+
+    legacy = progress_text(data)
+    textual = "\n".join(progress_lines(data))
+    assert "активных загрузок: 3" in legacy
+    assert "суммарно: 4.0 KiB/s" in legacy
+    assert "clip.mp4 · 1.0 KiB / 2.0 KiB · 512 B/s" in legacy
+    assert "Активных загрузок: 3 · суммарно 4.0 KiB/s" in textual
+    assert "1.0 KiB / 2.0 KiB · 512 B/s" in textual
 
 
 def test_source_wizard_uses_ipc_without_starting_telegram():

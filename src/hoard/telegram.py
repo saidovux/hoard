@@ -1,19 +1,33 @@
 """Telegram MTProto operations owned exclusively by the background service."""
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import time
+from collections import deque
+from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
 from .archive_paths import post_media_path, profile_photo_path, video_note_path
-from .config import read_credentials
+from .config import read_credentials, telegram_download_limit
 from .models import Post, iso_date, post_comment_link
 from .paths import ensure_private, session_path
 from .telegram_download import download_video_note
 from .telegram_storage import utc_now
+
+TELEGRAM_REORDER_FACTOR = 4
+
+
+@dataclass(slots=True)
+class _ScanEntry:
+    """One encountered comment waiting for an ordered cursor decision."""
+
+    message_id: int
+    complete: bool = False
+    processed: bool = False
 
 
 class AuthState(StrEnum):
@@ -65,14 +79,93 @@ class _ProfilePhotoStream:
 
 
 class TelegramEngine:
-    def __init__(self, store, report_progress=None):
+    def __init__(self, store, report_progress=None, *, download_limit: int | None = None):
         self.store = store
         self.report_progress = report_progress or (lambda _: None)
         self.progress: dict = {}
+        self.download_limit = telegram_download_limit(download_limit)
+        self._scan_progress: dict[str, Any] = {}
+        self._active_downloads: dict[tuple[int, int], dict[str, Any]] = {}
+        self._progress_sequence = 0
         self.client = None
         self.phone = ""
         self.phone_code_hash = ""
         self.authorization_step = AuthState.DISCONNECTED
+
+    def _publish_progress(self, preferred: tuple[int, int] | None = None) -> None:
+        """Publish one compatible file view plus aggregate concurrent telemetry."""
+        value = self._scan_progress.copy()
+        active = self._active_downloads
+        if active:
+            selected = active.get(preferred) if preferred is not None else None
+            if selected is None:
+                selected = max(active.values(), key=lambda item: item["sequence"])
+            value.update(
+                {
+                    key: selected[key]
+                    for key in ("message", "file", "bytes", "total", "percent", "speed_bps")
+                    if key in selected
+                }
+            )
+        if value or active:
+            value["active_downloads"] = len(active)
+            value["aggregate_speed_bps"] = sum(
+                float(item.get("speed_bps") or 0) for item in active.values()
+            )
+        self.progress = value
+        self.report_progress(value.copy())
+
+    def _set_scan_progress(self, **values: Any) -> None:
+        self._scan_progress.update(values)
+        self._publish_progress()
+
+    def _begin_download_progress(
+        self, key: tuple[int, int], *, message_id: int, filename: str
+    ) -> None:
+        self._progress_sequence += 1
+        self._active_downloads[key] = {
+            "message": message_id,
+            "file": filename,
+            "bytes": 0,
+            "total": 0,
+            "percent": 0,
+            "speed_bps": None,
+            "sequence": self._progress_sequence,
+        }
+        self._publish_progress(key)
+
+    def _update_download_progress(
+        self,
+        key: tuple[int, int],
+        *,
+        current: int,
+        total: int,
+        speed_bps: float | None,
+    ) -> None:
+        item = self._active_downloads.get(key)
+        if item is None:
+            return
+        self._progress_sequence += 1
+        item.update(
+            {
+                "bytes": current,
+                "total": total,
+                "percent": round(100 * current / total) if total else 0,
+                "speed_bps": speed_bps,
+                "sequence": self._progress_sequence,
+            }
+        )
+        self._publish_progress(key)
+
+    def _finish_download_progress(self, key: tuple[int, int]) -> None:
+        self._active_downloads.pop(key, None)
+        self._publish_progress()
+
+    def _clear_progress(self) -> None:
+        self._scan_progress.clear()
+        self._active_downloads.clear()
+        self.progress = {}
+        self.report_progress({})
 
     def auth_result(self, message: str = "") -> dict[str, Any]:
         return {
@@ -437,8 +530,12 @@ class TelegramEngine:
     async def _message_identity(self, msg) -> dict[str, Any]:
         sender = getattr(msg, "sender", None)
         if sender is None:
+            from telethon.errors import FloodWaitError
+
             try:
                 sender = await msg.get_sender()
+            except FloodWaitError:
+                raise
             except Exception:
                 sender = None
         return self._sender_identity(sender, getattr(msg, "sender_id", None))
@@ -498,8 +595,8 @@ class TelegramEngine:
     async def scan(self, source: dict) -> tuple[int, int]:
         """Walk linked-post comments from the last checkpoint, oldest first.
 
-        Checkpoints are written after each completed media. On exception, do not
-        advance the cursor beyond unprocessed messages.
+        Downloads finish independently, but the source cursor advances only across
+        the contiguous processed prefix in Telegram traversal order.
         """
         client = await self.connect()
         if not await client.is_user_authorized():
@@ -520,69 +617,178 @@ class TelegramEngine:
         from telethon.errors import FloodWaitError
 
         checked = downloaded = 0
-        checkpoint_blocked = False
-        # Telethon docs: channel/reply_to returns the linked discussion thread.
-        async for msg in client.iter_messages(entity, reply_to=post.message_id,
-                                               min_id=cursor, reverse=True):
-            checked += 1
-            self.progress = {"source": post.name, "message": msg.id,
-                                     "checked": checked, "downloaded": downloaded,
-                                     "percent": 0, "file": ""}
-            self.report_progress(self.progress.copy())
-            if getattr(msg, "video_note", None) is not None:
-                identity = await self._message_identity(msg)
-                if identity["author_id"] is not None:
-                    author_id = int(identity["author_id"])
-                    self.store.telegram.observe_profile(
-                        author_id=author_id,
-                        username=identity["author_username"],
-                        display_name=identity["author_name"],
-                        observed_at=iso_date(getattr(msg, "date", None)),
-                        source_id=int(source["id"]),
-                    )
-                    if self.store.telegram.profile_photo_due(author_id):
-                        self.store.enqueue(
-                            "telegram.profile_photos",
-                            {"author_id": author_id},
-                            unique_key=f"telegram-profile-photos:{author_id}",
-                        )
-                if not self.store.seen(source["id"], msg.id):
-                    if not self.store.telegram.media_download_due(source["id"], msg.id):
-                        checkpoint_blocked = True
-                        continue
-                    try:
-                        video = await self.download_one(client, post, source, msg, identity)
-                    except FloodWaitError:
-                        raise
-                    except Exception as exc:
-                        failure = self.store.telegram.record_media_failure(
-                            source["id"], msg.id, error=f"{type(exc).__name__}: {exc}"
-                        )
-                        checkpoint_blocked = True
-                        self.store.event(
-                            "error",
-                            f"Кружок {post.name} / {msg.id} не сохранён; "
-                            f"повтор через {failure['delay']} с.",
-                        )
-                        continue
-                    self.store.telegram.clear_media_failure(source["id"], msg.id)
-                    self.store.checkpoint(
-                        source["id"], msg.id, video, advance=not checkpoint_blocked
-                    )
-                    downloaded += 1
-                    self.store.event("ok", f"Сохранён кружок {post.name} / {msg.id}")
-                else:
-                    self.store.telegram.clear_media_failure(source["id"], msg.id)
-                    self.store.checkpoint(
-                        source["id"], msg.id, advance=not checkpoint_blocked
-                    )
-            else:
-                self.store.checkpoint(
-                    source["id"], msg.id, advance=not checkpoint_blocked
+        checkpoint_open = True
+        flood_wait: BaseException | None = None
+        reorder_limit = TELEGRAM_REORDER_FACTOR * self.download_limit
+        reorder: deque[_ScanEntry] = deque()
+        active: dict[asyncio.Task, _ScanEntry] = {}
+
+        async def transfer(
+            msg, identity: dict[str, Any]
+        ) -> tuple[bool, bool, BaseException | None]:
+            try:
+                video = await self.download_one(client, post, source, msg, identity)
+            except asyncio.CancelledError:
+                raise
+            except FloodWaitError as exc:
+                return False, False, exc
+            except Exception as exc:
+                failure = self.store.telegram.record_media_failure(
+                    source["id"], msg.id, error=f"{type(exc).__name__}: {exc}"
                 )
-        self.progress = {}
-        self.report_progress({})
-        return checked, downloaded
+                self.store.event(
+                    "error",
+                    f"Кружок {post.name} / {msg.id} не сохранён; "
+                    f"повтор через {failure['delay']} с.",
+                )
+                return False, False, None
+            self.store.telegram.clear_media_failure(source["id"], msg.id)
+            # Register the durable file immediately. Cursor movement is coordinated
+            # separately and may still be blocked by an earlier traversal entry.
+            self.store.checkpoint(source["id"], msg.id, video, advance=False)
+            self.store.event("ok", f"Сохранён кружок {post.name} / {msg.id}")
+            return True, True, None
+
+        def drain_processed_prefix() -> None:
+            nonlocal checkpoint_open
+            while reorder and reorder[0].complete:
+                entry = reorder.popleft()
+                if not entry.processed:
+                    checkpoint_open = False
+                elif checkpoint_open:
+                    self.store.checkpoint(source["id"], entry.message_id, advance=True)
+
+        def accept_done(done: set[asyncio.Task]) -> None:
+            nonlocal downloaded, flood_wait
+            for task in done:
+                entry = active.pop(task)
+                processed, was_downloaded, wait_error = task.result()
+                entry.complete = True
+                entry.processed = processed
+                if was_downloaded:
+                    downloaded += 1
+                if flood_wait is None and wait_error is not None:
+                    flood_wait = wait_error
+            self._set_scan_progress(downloaded=downloaded)
+            drain_processed_prefix()
+
+        async def harvest(*, wait: bool) -> None:
+            if not active:
+                return
+            if wait:
+                done, _ = await asyncio.wait(active, return_when=asyncio.FIRST_COMPLETED)
+            else:
+                done = {task for task in active if task.done()}
+            if done:
+                accept_done(done)
+
+        iterator = client.iter_messages(
+            entity,
+            reply_to=post.message_id,
+            min_id=cursor,
+            reverse=True,
+        ).__aiter__()
+        self._set_scan_progress(
+            source=post.name,
+            checked=checked,
+            downloaded=downloaded,
+            percent=0,
+            file="",
+        )
+        try:
+            try:
+                while flood_wait is None:
+                    await harvest(wait=False)
+                    while len(reorder) >= reorder_limit and flood_wait is None:
+                        await harvest(wait=True)
+                    if flood_wait is not None:
+                        break
+                    try:
+                        # Telethon docs: channel/reply_to is the linked discussion thread.
+                        msg = await anext(iterator)
+                    except StopAsyncIteration:
+                        break
+
+                    await harvest(wait=False)
+                    if flood_wait is not None:
+                        break
+
+                    identity: dict[str, Any] | None = None
+                    needs_download = False
+                    if getattr(msg, "video_note", None) is not None:
+                        identity = await self._message_identity(msg)
+                        if identity["author_id"] is not None:
+                            author_id = int(identity["author_id"])
+                            self.store.telegram.observe_profile(
+                                author_id=author_id,
+                                username=identity["author_username"],
+                                display_name=identity["author_name"],
+                                observed_at=iso_date(getattr(msg, "date", None)),
+                                source_id=int(source["id"]),
+                            )
+                            if self.store.telegram.profile_photo_due(author_id):
+                                self.store.enqueue(
+                                    "telegram.profile_photos",
+                                    {"author_id": author_id},
+                                    unique_key=f"telegram-profile-photos:{author_id}",
+                                )
+                        if not self.store.seen(source["id"], msg.id):
+                            if self.store.telegram.media_download_due(source["id"], msg.id):
+                                needs_download = True
+                            else:
+                                entry = _ScanEntry(int(msg.id), complete=True, processed=False)
+                        else:
+                            self.store.telegram.clear_media_failure(source["id"], msg.id)
+                            entry = _ScanEntry(int(msg.id), complete=True, processed=True)
+                    else:
+                        entry = _ScanEntry(int(msg.id), complete=True, processed=True)
+
+                    if needs_download:
+                        while len(active) >= self.download_limit and flood_wait is None:
+                            await harvest(wait=True)
+                        if flood_wait is not None:
+                            break
+                        entry = _ScanEntry(int(msg.id))
+                        task = asyncio.create_task(
+                            transfer(msg, identity or {}),
+                            name=f"hoard-tg-download-{source['id']}-{msg.id}",
+                        )
+                        active[task] = entry
+
+                    reorder.append(entry)
+                    checked += 1
+                    self._set_scan_progress(
+                        source=post.name,
+                        message=msg.id,
+                        checked=checked,
+                        downloaded=downloaded,
+                    )
+                    drain_processed_prefix()
+            except FloodWaitError as exc:
+                flood_wait = exc
+
+            # A FloodWait stops discovery, but already-started transfers are allowed
+            # to settle so their durable successes are retained.
+            while active:
+                await harvest(wait=True)
+            drain_processed_prefix()
+            if flood_wait is not None:
+                raise flood_wait
+            return checked, downloaded
+        except BaseException:
+            for task in active:
+                if not task.done():
+                    task.cancel()
+            if active:
+                await asyncio.gather(*active, return_exceptions=True)
+            raise
+        finally:
+            closer = getattr(iterator, "aclose", None)
+            try:
+                if closer is not None:
+                    await closer()
+            finally:
+                self._clear_progress()
 
     async def download_one(
         self,
@@ -615,6 +821,10 @@ class TelegramEngine:
                           (old_size is not None and output.stat().st_size != old_size))
         if needs_download:
             partial.unlink(missing_ok=True)
+            progress_key = (int(source["id"]), int(msg.id))
+            self._begin_download_progress(
+                progress_key, message_id=int(msg.id), filename=output.name
+            )
             try:
                 with partial.open("wb") as f:
                     last_at = time.monotonic()
@@ -627,13 +837,12 @@ class TelegramEngine:
                         if elapsed >= 0.5:
                             last_speed = max(0.0, (current - last_size) / elapsed)
                             last_at, last_size = now, current
-                        self.progress.update({
-                            "speed_bps": last_speed,
-                            "file": output.name,
-                            "bytes": current, "total": total,
-                            "percent": round(100 * current / total) if total else 0,
-                        })
-                        self.report_progress(self.progress.copy())
+                        self._update_download_progress(
+                            progress_key,
+                            current=current,
+                            total=total,
+                            speed_bps=last_speed,
+                        )
                     # File object avoids Telethon appending a file extension to .part.
                     result = await download_video_note(client, msg, f, callback)
                     f.flush()
@@ -644,6 +853,8 @@ class TelegramEngine:
             except BaseException:
                 partial.unlink(missing_ok=True)
                 raise
+            finally:
+                self._finish_download_progress(progress_key)
         video["size"] = output.stat().st_size
         # The sidecar remains a portable record alongside every video note.
         metadata = {

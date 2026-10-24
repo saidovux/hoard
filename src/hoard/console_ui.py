@@ -73,6 +73,12 @@ def progress_text(status: dict) -> str:
     checked = p.get("checked", 0)
     saved = p.get("downloaded", 0)
     label = f"{p.get('source', 'Telegram')} · комментариев: {checked} · новых кружков: {saved}"
+    active = p.get("active_downloads")
+    aggregate_speed = p.get("aggregate_speed_bps")
+    if active:
+        label += f" · активных загрузок: {active}"
+        if aggregate_speed:
+            label += f" · суммарно: {fmt_bytes(aggregate_speed)}/s"
     if p.get("file"):
         current, total = p.get("bytes"), p.get("total")
         amount = fmt_bytes(current)

@@ -7,6 +7,25 @@ from pathlib import Path
 
 from .paths import config_dir, ensure_private
 
+TELEGRAM_DOWNLOADS_DEFAULT = 3
+TELEGRAM_DOWNLOADS_MAX = 4
+
+
+def telegram_download_limit(value: str | int | None = None) -> int:
+    """Read the independent per-scan transfer limit with a strict safe range."""
+    raw = os.environ.get("HOARD_TG_DOWNLOADS", str(TELEGRAM_DOWNLOADS_DEFAULT))
+    if value is not None:
+        raw = str(value)
+    try:
+        limit = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "HOARD_TG_DOWNLOADS должен быть целым числом от 1 до 4"
+        ) from exc
+    if not 1 <= limit <= TELEGRAM_DOWNLOADS_MAX:
+        raise ValueError("HOARD_TG_DOWNLOADS должен быть целым числом от 1 до 4")
+    return limit
+
 
 def credentials_file() -> Path:
     return config_dir() / "config.json"

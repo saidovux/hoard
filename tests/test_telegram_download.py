@@ -145,9 +145,11 @@ async def test_optimized_download_uses_512k_and_preserves_atomic_result(tmp_path
     assert client.final_existed_during_download is False
     assert not output.with_suffix(".mp4.part").exists()
     assert json.loads(output.with_suffix(".json").read_text())["size"] == len(payload)
-    assert progress[-1]["bytes"] == len(payload)
-    assert progress[-1]["total"] == len(payload)
-    assert progress[-1]["percent"] == 100
+    file_progress = [item for item in progress if item.get("file") == output.name]
+    assert file_progress[-1]["bytes"] == len(payload)
+    assert file_progress[-1]["total"] == len(payload)
+    assert file_progress[-1]["percent"] == 100
+    assert progress[-1] == {}
     store.close()
 
 

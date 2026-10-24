@@ -1,4 +1,4 @@
-# Hoard 0.7.1.3
+# Hoard 0.7.1.4
 
 Hoard is a local-first Linux and Windows archive for Telegram posts, profiles and video notes
 found in a channel post's comments. It uses Telethon, SQLite, an autonomous offline HTML catalog
@@ -20,8 +20,8 @@ do not yet have a saved avatar.
 The 0.7.1.2 patch installs `cryptg` with Hoard. Telethon detects it automatically and uses its
 native AES-IGE implementation for Telegram transport encryption; Hoard does not replace or wrap
 Telethon's cryptography. This reduces local cryptographic processing time for video notes, profile
-photos and post media. End-to-end download speed can still be limited by the network, Telegram,
-Telethon's request sizing and Hoard's deliberately sequential Telegram job handling.
+photos and post media. End-to-end download speed can still be limited by the network, Telegram
+and Telethon's request sizing. Telegram jobs remain serialized around one authorized client.
 
 The 0.7.1.3 patch requests video-note documents from Telegram in 512 KiB parts instead of
 Telethon's 128 KiB default for files up to 100 MiB. It uses the same Telethon primitive as
@@ -30,6 +30,14 @@ retry handling. Hoard checks that private Telethon contract before using it and 
 original `download_media()` path if the installed client or media is incompatible. Profile photos
 and post media are unchanged. Larger requests reduce sequential round trips but do not guarantee
 the same end-to-end improvement on a real Telegram connection.
+
+The 0.7.1.4 patch downloads up to three independent video notes concurrently inside one source
+scan while retaining the single authorized client and global Telegram lock. Scheduling is bounded,
+and the source cursor advances only across the continuous successfully processed traversal prefix:
+a later completed file is registered durably but cannot hide an earlier failure. Set
+`HOARD_TG_DOWNLOADS` before daemon startup to select `1` through `4`; the default is `3` and any
+other value fails with an explicit configuration error. This limit is independent of the generic
+job-runner and AI limits.
 
 ## Terminal interfaces
 
@@ -78,7 +86,7 @@ For development, install the test tools with `python -m pip install -e '.[dev]'`
 
 An upgrade keeps the existing XDG configuration, database, Telegram session and archive.
 If an older daemon is still running, execute `hoard shutdown` before starting the upgraded
-installation. The 0.7.1.3 client accepts only a daemon reporting the same application version and
+installation. The 0.7.1.4 client accepts only a daemon reporting the same application version and
 IPC protocol `1`; it reports the mismatch instead of starting a competing service. If a matching
 daemon already owns the service lock but is still initializing, clients wait for it and show a
 specific startup diagnostic.
@@ -156,8 +164,9 @@ The report is one portable HTML file. New media objects use stable ID-based path
 ```
 
 SQLite checkpoints and file-size checks prevent duplicate downloads and recover missing or
-truncated archive files. The progress view reports the current file, real byte count, real
-percentage when Telegram supplies a total, measured speed, queue state and recent errors.
+truncated archive files. The progress view reports one current file with its own byte count and
+speed, plus the active-transfer count and aggregate speed when downloads overlap. Percentages are
+shown only when Telegram supplies a total; queue state and recent errors remain visible.
 
 Existing pre-0.4 paths are not moved, copied or deleted. Their SQLite records and safe JSON
 sidecars are migrated in place and referenced by the catalog. Existing source cursors are kept.
@@ -288,6 +297,10 @@ the Telegram pool; the AI pool follows the daemon lifecycle and keeps working wh
 collector is stopped. Their concurrency limits are separate: `HOARD_MAX_JOBS` for the existing
 pool and `HOARD_AI_MAX_JOBS` (default `2`) for AI. A long DeepSeek request therefore cannot occupy
 a Telegram worker or Telegram lock.
+
+`HOARD_TG_DOWNLOADS` is a third, narrower limit: it controls only simultaneous video-note
+transfers within one serialized Telegram scan (`1` to `4`, default `3`). It neither increases the
+number of JobRunner workers nor permits another Telegram job to bypass the global session lock.
 
 The AI screen provides persistent chats with rename/archive, paginated history, text and up to
 four explicitly selected local images, provider/model/prompt-version selection, versioned prompt

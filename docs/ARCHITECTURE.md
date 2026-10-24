@@ -13,7 +13,7 @@ background service.
   `request()` boundary. Dialogs, screens, status formatting, reusable widgets and TCSS remain
   separate. The package imports neither storage nor Telethon.
 - `ipc.py` starts the daemon detached when required and sends one JSON request per private
-  Unix-socket connection. Client and daemon must both report Hoard 0.7.1.3 and IPC protocol `1`.
+  Unix-socket connection. Client and daemon must both report Hoard 0.7.1.4 and IPC protocol `1`.
   A held instance lock with no ready socket means initialization is in progress, so the client
   waits for that owner instead of spawning a second daemon.
 - `service.py` owns the database, two independently limited job runners and the sole
@@ -125,13 +125,21 @@ leaves files and `sources.last_id` untouched. Unique constraints make the operat
 Old media may stay outside `telegram/`; the report emits a relative path or a `file:` URI when
 Windows drives differ. It never creates an implicit second media archive.
 
-Enabled sources become unique `telegram.scan` jobs when due. Telegram scans are serialized,
-while the generic queue retains extension points for other modules. Profile photos, post metadata,
-post media and report generation are separate deduplicated job kinds. A source checkpoint is
-advanced after each processed comment. Media records are committed only after a file is fully
-written, fsynced and atomically renamed. Missing or size-mismatched video notes move the scan
-cursor back to the earliest affected message. A missing legacy JSON sidecar alone does not trigger
-a network re-download because SQLite already has the required catalog metadata.
+Enabled sources become unique `telegram.scan` jobs when due. Telegram jobs remain serialized by
+the global session lock, while one scan uses the same authorized client for a bounded set of video
+note transfers. `HOARD_TG_DOWNLOADS` selects `1` through `4` transfers (default `3`) independently
+of `HOARD_MAX_JOBS`; both active transfers and the traversal reorder buffer are bounded. Profile
+photos, post metadata, post media and report generation remain separate deduplicated job kinds.
+
+The scan coordinator commits cursor movement in encountered traversal order rather than assuming
+contiguous Telegram message IDs. A completed media file is first registered with
+`checkpoint(..., advance=False)` after it is fully written, fsynced and atomically renamed. The
+source cursor then advances only across the continuous processed prefix, including ordinary
+comments and valid previously saved media. A retry-deferred or failed transfer blocks that prefix;
+later successful files remain durable and are deduplicated on the next scan. Missing or
+size-mismatched video notes move the scan cursor back to the earliest affected message. A missing
+legacy JSON sidecar alone does not trigger a network re-download because SQLite already has the
+required catalog metadata.
 
 The `scan_source` IPC operation validates that one source exists and is enabled, then enqueues the
 same `telegram.scan` payload and `telegram:<id>` unique key used by the scheduler. It therefore
@@ -208,23 +216,27 @@ SQLite, Telegram sessions, AI attachments and arbitrary filesystem paths have no
 
 ## Progress and errors
 
-Telethon's progress callback supplies current and total bytes. Hoard measures transfer speed
-from callback deltas and exposes it over IPC together with queue counts. The UI shows a percent
-only when the total is non-zero and never invents an ETA. Routine Telegram failures are stored
-as actionable messages; exception class details are returned only when local `HOARD_DEBUG=1`
-is explicitly enabled.
+Telethon's progress callback supplies current and total bytes. Hoard keeps independent transfer
+state and speed for each active video note. IPC retains the established single-file fields and
+adds optional `active_downloads` and `aggregate_speed_bps`; aggregate speed is the sum of current
+per-file rates and never replaces `speed_bps`. The UI shows a percent only when the selected file's
+total is non-zero and never invents an ETA. Routine Telegram failures are stored as actionable
+messages; exception class details are returned only when local `HOARD_DEBUG=1` is explicitly
+enabled.
 
 `cryptg` is a required runtime dependency. Telethon imports it as its preferred native AES-IGE
-backend independently of Hoard's transfer adapter. Hoard neither implements Telegram
-cryptography nor parallelizes Telegram transfers.
+backend independently of Hoard's transfer adapter. Hoard does not implement Telegram
+cryptography. Concurrency is limited to the bounded per-scan scheduler; Telegram jobs and client
+ownership remain serialized.
 
 Video-note documents use the small `telegram_download.py` compatibility adapter. Telethon 1.45's
 public `download_file(part_size_kb=...)` cannot forward the message context required to refresh an
 expired document reference, so the adapter checks the private `_download_file` signature and uses
 that existing recovery-aware primitive with 512 KiB parts. The primitive retains its sender, DC,
 CDN, retry and cancellation behavior. An unknown contract, missing document or unknown size takes
-the unchanged `download_media()` fallback. The surrounding `.part`, `fsync`, atomic replacement,
-sidecar and checkpoint boundaries remain in `TelegramEngine.download_one()`.
+the unchanged `download_media()` fallback. The surrounding `.part`, `fsync`, atomic replacement
+and sidecar boundaries remain in `TelegramEngine.download_one()`. Durable media registration and
+ordered cursor movement are coordinated separately by `TelegramEngine.scan()`.
 
 ## AI Core — round 1
 
