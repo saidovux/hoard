@@ -13,7 +13,7 @@ background service.
   `request()` boundary. Dialogs, screens, status formatting, reusable widgets and TCSS remain
   separate. The package imports neither storage nor Telethon.
 - `ipc.py` starts the daemon detached when required and sends one JSON request per private
-  Unix-socket connection. Client and daemon must both report Hoard 0.7.1.1 and IPC protocol `1`.
+  Unix-socket connection. Client and daemon must both report Hoard 0.7.1.2 and IPC protocol `1`.
   A held instance lock with no ready socket means initialization is in progress, so the client
   waits for that owner instead of spawning a second daemon.
 - `service.py` owns the database, two independently limited job runners and the sole
@@ -213,6 +213,11 @@ from callback deltas and exposes it over IPC together with queue counts. The UI 
 only when the total is non-zero and never invents an ETA. Routine Telegram failures are stored
 as actionable messages; exception class details are returned only when local `HOARD_DEBUG=1`
 is explicitly enabled.
+
+`cryptg` is a required runtime dependency. Telethon imports it as its preferred native AES-IGE
+backend, so video notes, profile photos and post media retain the ordinary `download_media()`
+path and all existing atomic-write and recovery behavior. Hoard neither implements Telegram
+cryptography nor parallelizes Telegram transfers.
 
 ## AI Core — round 1
 
