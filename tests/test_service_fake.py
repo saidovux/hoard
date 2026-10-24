@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 from telethon.errors import FloodWaitError
+from telethon.tl import types as tl_types
 
 from hoard.archive_paths import video_note_path
 from hoard.models import Post
@@ -210,6 +211,7 @@ class ProfileClient(FakeClient):
         self.unavailable = unavailable
         self.error = error
         self.photo_downloads = 0
+        self.thumb_calls: list[object | None] = []
 
     async def get_entity(self, username):
         return SimpleNamespace(
@@ -228,8 +230,9 @@ class ProfileClient(FakeClient):
         for photo in self.photos[:limit]:
             yield photo
 
-    async def download_media(self, msg, file, progress_callback=None):
+    async def download_media(self, msg, file, progress_callback=None, thumb=None):
         self.photo_downloads += 1
+        self.thumb_calls.append(thumb)
         file.write(f"photo-{msg.id}".encode())
         return file
 
@@ -254,6 +257,69 @@ async def test_profile_photos_are_limited_deduplicated_and_independent(tmp_path)
     assert fake.photo_downloads == 30
     profile = store.db.execute("SELECT * FROM tg_profiles WHERE author_id=101").fetchone()
     assert profile["current_username"] == "current_name"
+    store.close()
+
+
+async def test_video_avatar_uses_largest_still_sibling(tmp_path):
+    store = Store(tmp_path / "db.sqlite")
+    store.telegram.observe_profile(author_id=101, username="user", display_name="User")
+    photo = SimpleNamespace(
+        id=501,
+        date=datetime(2026, 1, 1, tzinfo=UTC),
+        sizes=[
+            tl_types.PhotoSize(type="m", w=320, h=320, size=1000),
+            tl_types.PhotoSize(type="x", w=800, h=800, size=3000),
+        ],
+        video_sizes=[tl_types.VideoSize(type="v", w=640, h=640, size=5000)],
+    )
+    fake = ProfileClient([photo])
+    engine = TelegramEngine(store)
+    engine.connect = lambda: asyncio.sleep(0, result=fake)
+
+    assert "новых: 1" in await engine.refresh_profile_photos(101)
+    assert len(fake.thumb_calls) == 1
+    assert fake.thumb_calls[0] is photo.sizes[1]
+    row = store.db.execute(
+        "SELECT file_path,size FROM tg_profile_photos WHERE photo_id='501'"
+    ).fetchone()
+    assert Path(row["file_path"]).read_bytes().startswith(b"photo-501")
+    assert int(row["size"]) == len(b"photo-501")
+    store.close()
+
+
+async def test_existing_video_content_is_redownloaded_as_still(tmp_path):
+    store = Store(tmp_path / "db.sqlite")
+    store.telegram.observe_profile(author_id=101, username="user", display_name="User")
+    photo = SimpleNamespace(
+        id=502,
+        date=datetime(2026, 1, 1, tzinfo=UTC),
+        sizes=[
+            tl_types.PhotoSize(type="x", w=800, h=800, size=3000),
+            tl_types.VideoSize(type="v", w=640, h=640, size=5000),
+        ],
+    )
+    fake = ProfileClient([photo])
+    engine = TelegramEngine(store)
+    engine.connect = lambda: asyncio.sleep(0, result=fake)
+    archive = tmp_path / "archive"
+    bad = archive / "hoard_objects" / "profiles" / "author_101" / "photos" / "photo_502.jpg"
+    bad.parent.mkdir(parents=True)
+    bad.write_bytes(b"\x00\x00\x00\x18ftypisom" + b"x" * 32)
+    store.telegram.record_profile_photo(
+        101,
+        "502",
+        file_path=str(bad),
+        size=bad.stat().st_size,
+        photo_date="2026-01-01",
+    )
+    store.telegram.archive_root(archive, persist=True)
+    store.db.execute("UPDATE tg_profiles SET photos_retry_at=0 WHERE author_id=101")
+    store.db.commit()
+
+    assert "новых: 1" in await engine.refresh_profile_photos(101)
+    assert bad.read_bytes() == b"photo-502"
+    assert len(fake.thumb_calls) == 1
+    assert fake.thumb_calls[0] is photo.sizes[0]
     store.close()
 
 

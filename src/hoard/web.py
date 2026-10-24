@@ -3,17 +3,20 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import json
 import mimetypes
 import os
 import re
 import secrets
+import socket
 import subprocess
 import sys
 import threading
 import time
 import webbrowser
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from http import HTTPStatus
 from http.cookies import SimpleCookie
@@ -30,6 +33,10 @@ from .platform_support import is_windows
 RequestFunction = Callable[[str, dict[str, Any], float], Awaitable[dict[str, Any]]]
 _ID = re.compile(r"^[a-f0-9]{32}$")
 _READY_FILE = "web.ready.json"
+_LAUNCH_LOCK_FILE = "web.launch.lock"
+_SERVER_LOCK_FILE = "web.server.lock"
+_WEB_LAUNCH_TIMEOUT = 240.0
+_WEB_POLL_INTERVAL = 0.1
 
 
 async def _daemon_request(
@@ -451,9 +458,75 @@ def _ready_path() -> Path:
     return state_dir() / _READY_FILE
 
 
-def _write_ready(port: int) -> None:
+def _launch_lock_path() -> Path:
+    return state_dir() / _LAUNCH_LOCK_FILE
+
+
+def _server_lock_path() -> Path:
+    return state_dir() / _SERVER_LOCK_FILE
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if is_windows():
+        import ctypes
+
+        process_query_limited_information = 0x1000
+        still_active = 259
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(
+            process_query_limited_information, False, int(pid)
+        )
+        if not handle:
+            return False
+        try:
+            exit_code = ctypes.c_ulong()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)):
+                return False
+            return int(exit_code.value) == still_active
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _read_state() -> dict[str, Any] | None:
+    try:
+        value = json.loads(_ready_path().read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, ValueError, TypeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _write_state(
+    status: str,
+    *,
+    pid: int | None = None,
+    port: int = 0,
+    url: str = "",
+    error: str = "",
+) -> None:
     ensure_private(state_dir())
-    payload = json.dumps({"pid": os.getpid(), "port": int(port)}, separators=(",", ":"))
+    payload = json.dumps(
+        {
+            "pid": int(os.getpid() if pid is None else pid),
+            "status": status,
+            "port": int(port),
+            "url": str(url),
+            "error": str(error)[:500],
+            "updated_at": time.time(),
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
     path = _ready_path()
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     try:
@@ -468,95 +541,271 @@ def _write_ready(port: int) -> None:
 
 
 def _remove_ready(pid: int) -> None:
-    path = _ready_path()
+    value = _read_state()
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, OSError, ValueError, TypeError):
-        return
-    try:
-        owner_pid = int(value.get("pid") or 0) if isinstance(value, dict) else 0
+        owner_pid = int(value.get("pid") or 0) if value else 0
     except (TypeError, ValueError):
         owner_pid = 0
     if owner_pid == int(pid):
-        path.unlink(missing_ok=True)
+        _ready_path().unlink(missing_ok=True)
+
+
+def _state_phase(value: dict[str, Any] | None) -> str:
+    if not value:
+        return ""
+    status = str(value.get("status") or "ready")
+    return status if status in {"preparing", "starting", "ready", "error"} else ""
+
+
+def _state_pid(value: dict[str, Any] | None) -> int:
+    try:
+        return int(value.get("pid") or 0) if value else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def _state_port(value: dict[str, Any] | None) -> int:
+    try:
+        port = int(value.get("port") or 0) if value else 0
+    except (TypeError, ValueError):
+        return 0
+    return port if 0 < port <= 65535 else 0
+
+
+def _state_url(value: dict[str, Any] | None) -> str:
+    return str(value.get("url") or "") if value else ""
+
+
+def _open_browser(url: str) -> None:
+    """Browser launch is best-effort; the printed/returned URL remains usable."""
+    with contextlib.suppress(Exception):
+        webbrowser.open(url, new=2)
+
+
+def _web_reachable(port: int) -> bool:
+    if port <= 0:
+        return False
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=1):
+            return True
+    except OSError:
+        return False
+
+
+@contextmanager
+def _file_lock(path: Path, *, blocking: bool) -> Iterator[bool]:
+    ensure_private(path.parent)
+    descriptor = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        if is_windows():
+            import msvcrt
+
+            if os.fstat(descriptor).st_size == 0:
+                os.write(descriptor, b"\0")
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            while True:
+                try:
+                    msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError as exc:
+                    if exc.errno not in {
+                        errno.EACCES,
+                        errno.EAGAIN,
+                        getattr(errno, "EDEADLK", errno.EACCES),
+                    }:
+                        raise
+                    if not blocking:
+                        yield False
+                        return
+                    time.sleep(_WEB_POLL_INTERVAL)
+            try:
+                yield True
+            finally:
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                with contextlib.suppress(OSError):
+                    msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            try:
+                fcntl.flock(
+                    descriptor,
+                    fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB),
+                )
+            except OSError as exc:
+                if not blocking and exc.errno in {errno.EACCES, errno.EAGAIN}:
+                    yield False
+                    return
+                raise
+            try:
+                yield True
+            finally:
+                with contextlib.suppress(OSError):
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        os.close(descriptor)
+
+
+def _wait_for_web(
+    pid: int,
+    process: subprocess.Popen | None,
+    log: Path,
+) -> str:
+    deadline = time.monotonic() + _WEB_LAUNCH_TIMEOUT
+    while time.monotonic() < deadline:
+        value = _read_state()
+        if _state_pid(value) == pid:
+            phase = _state_phase(value)
+            if phase == "ready":
+                url = _state_url(value)
+                if url and _web_reachable(_state_port(value)):
+                    return url
+            elif phase == "error":
+                detail = str(value.get("error") or "неизвестная ошибка")
+                raise RuntimeError(f"Веб-интерфейс не запустился: {detail}")
+        if process is not None and process.poll() is not None:
+            value = _read_state()
+            if _state_pid(value) == pid and _state_phase(value) == "error":
+                detail = str(value.get("error") or "неизвестная ошибка")
+                raise RuntimeError(f"Веб-интерфейс не запустился: {detail}")
+            raise RuntimeError(f"Веб-интерфейс не запустился; проверь {log}")
+        if process is None and not _pid_alive(pid):
+            raise RuntimeError(f"Веб-интерфейс завершился при подготовке; проверь {log}")
+        time.sleep(_WEB_POLL_INTERVAL)
+    if process is not None:
+        with contextlib.suppress(OSError):
+            process.terminate()
+        with contextlib.suppress(Exception):
+            process.wait(timeout=5)
+        _remove_ready(pid)
+    raise RuntimeError(
+        "Веб-интерфейс не завершил подготовку за "
+        f"{int(_WEB_LAUNCH_TIMEOUT)} с; проверь {log}"
+    )
 
 
 def run_web(*, open_browser: bool = True, lifetime: int = 1800) -> str:
     """Run the explicit loopback-only browser session until idle expiry or Ctrl+C."""
-    asyncio.run(ensure_daemon())
-    report = asyncio.run(request("telegram_report", timeout=180))
-    catalog_value = str(report.get("catalog") or "").strip()
-    if not catalog_value:
-        raise RuntimeError(
-            "Ответ daemon устарел и не содержит путь каталога. "
-            "Выполни `hoard shutdown` и повтори"
-        )
-    catalog = Path(catalog_value).expanduser().resolve(strict=True)
-    if catalog.name != "telegram_archive.html" or not catalog.is_file():
-        raise RuntimeError("Не удалось подготовить локальный HTML-каталог")
-    media_roots = tuple(
-        Path(str(value)) for value in report.get("media_roots") or [catalog.parent]
-    )
-    state = WebState(
-        catalog,
-        allowed_media_roots=media_roots,
-        lifetime=max(60, min(int(lifetime), 86_400)),
-    )
-    server = create_web_server(state)
-    server.timeout = 1
-    url = state.start_url
-    _write_ready(state.port)
-    try:
-        print(f"Hoard Web: {url}", flush=True)
-        print("Только 127.0.0.1 · Ctrl+C для закрытия", flush=True)
-        if open_browser:
-            webbrowser.open(url, new=2)
-        while time.monotonic() - state.last_seen <= state.lifetime:
-            server.handle_request()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        server.server_close()
-        _remove_ready(os.getpid())
-    return url
+    with _file_lock(_server_lock_path(), blocking=False) as acquired:
+        if not acquired:
+            value = _read_state()
+            url = _state_url(value)
+            if (
+                _state_phase(value) == "ready"
+                and url
+                and _web_reachable(_state_port(value))
+            ):
+                print(f"Hoard Web уже запущен: {url}", flush=True)
+                if open_browser:
+                    _open_browser(url)
+                return url
+            raise RuntimeError(
+                "Веб-интерфейс уже запускается; повтори через несколько секунд"
+            )
+
+        _write_state("preparing")
+        server: HoardWebServer | None = None
+        url = ""
+        failed = False
+        try:
+            asyncio.run(ensure_daemon())
+            report = asyncio.run(request("telegram_report", timeout=180))
+            catalog_value = str(report.get("catalog") or "").strip()
+            if not catalog_value:
+                raise RuntimeError(
+                    "Ответ daemon устарел и не содержит путь каталога. "
+                    "Выполни `hoard shutdown` и повтори"
+                )
+            catalog = Path(catalog_value).expanduser().resolve(strict=True)
+            if catalog.name != "telegram_archive.html" or not catalog.is_file():
+                raise RuntimeError("Не удалось подготовить локальный HTML-каталог")
+            media_roots = tuple(
+                Path(str(value)) for value in report.get("media_roots") or [catalog.parent]
+            )
+            state = WebState(
+                catalog,
+                allowed_media_roots=media_roots,
+                lifetime=max(60, min(int(lifetime), 86_400)),
+            )
+            server = create_web_server(state)
+            server.timeout = 1
+            url = state.start_url
+            _write_state("ready", port=state.port, url=url)
+            print(f"Hoard Web: {url}", flush=True)
+            print("Только 127.0.0.1 · Ctrl+C для закрытия", flush=True)
+            if open_browser:
+                _open_browser(url)
+            while time.monotonic() - state.last_seen <= state.lifetime:
+                server.handle_request()
+        except KeyboardInterrupt:
+            pass
+        except Exception as exc:
+            failed = True
+            _write_state(
+                "error", error=f"{type(exc).__name__}: {exc}"[:500]
+            )
+            raise
+        finally:
+            if server is not None:
+                server.server_close()
+            if not failed:
+                _remove_ready(os.getpid())
+        return url
 
 
-def launch_web_process() -> None:
-    """Start the browser client independently; it never owns or stops the daemon."""
+def launch_web_process(*, open_browser: bool = True) -> str:
+    """Start or reuse the browser client; it never owns or stops the daemon."""
     ensure_private(state_dir())
     log = state_dir() / "web.log"
     log.touch(mode=0o600, exist_ok=True)
-    ready = _ready_path()
-    ready.unlink(missing_ok=True)
-    command = [sys.executable, "-m", "hoard", "web"]
-    options: dict[str, Any] = {
-        "stdin": subprocess.DEVNULL,
-        "close_fds": True,
-    }
-    if is_windows():
-        options["creationflags"] = (
-            subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
-        )
-    else:
-        options["start_new_session"] = True
-    with log.open("ab") as stream:
-        options["stdout"] = stream
-        options["stderr"] = stream
-        process = subprocess.Popen(command, **options)
-    deadline = time.monotonic() + 5
-    while time.monotonic() < deadline:
-        if process.poll() is not None:
-            break
-        try:
-            value = json.loads(ready.read_text(encoding="utf-8"))
-        except (FileNotFoundError, OSError, ValueError, TypeError):
-            value = None
-        try:
-            ready_pid = int(value.get("pid") or 0) if isinstance(value, dict) else 0
-            ready_port = int(value.get("port") or 0) if isinstance(value, dict) else 0
-        except (TypeError, ValueError):
-            ready_pid = ready_port = 0
-        if ready_pid == process.pid and 0 < ready_port <= 65535:
-            return
-        time.sleep(0.1)
-    raise RuntimeError(f"Веб-интерфейс не запустился; проверь {log}")
+    process: subprocess.Popen | None = None
+    reused_url = ""
+    pid = 0
+
+    with _file_lock(_launch_lock_path(), blocking=True):
+        value = _read_state()
+        phase = _state_phase(value)
+        existing_pid = _state_pid(value)
+        if existing_pid and _pid_alive(existing_pid):
+            if phase == "ready":
+                existing_url = _state_url(value)
+                if not existing_url or not _web_reachable(_state_port(value)):
+                    raise RuntimeError(
+                        "Веб-интерфейс уже запущен, но не отвечает; "
+                        "закрой его или дождись завершения"
+                    )
+                if open_browser:
+                    _open_browser(existing_url)
+                reused_url = existing_url
+                pid = existing_pid
+            elif phase in {"preparing", "starting"}:
+                pid = existing_pid
+            elif phase == "error":
+                detail = str(value.get("error") or "неизвестная ошибка")
+                raise RuntimeError(f"Веб-интерфейс не запустился: {detail}")
+            else:
+                _remove_ready(existing_pid)
+        else:
+            if existing_pid:
+                _remove_ready(existing_pid)
+            command = [sys.executable, "-m", "hoard", "web"]
+            options: dict[str, Any] = {
+                "stdin": subprocess.DEVNULL,
+                "close_fds": True,
+            }
+            if is_windows():
+                options["creationflags"] = (
+                    subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+                )
+            else:
+                options["start_new_session"] = True
+            with log.open("ab") as stream:
+                options["stdout"] = stream
+                options["stderr"] = stream
+                process = subprocess.Popen(command, **options)
+            pid = process.pid
+            _write_state("starting", pid=pid)
+
+    if reused_url:
+        return reused_url
+    return _wait_for_web(pid, process, log)

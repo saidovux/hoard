@@ -13,7 +13,7 @@ background service.
   `request()` boundary. Dialogs, screens, status formatting, reusable widgets and TCSS remain
   separate. The package imports neither storage nor Telethon.
 - `ipc.py` starts the daemon detached when required and sends one JSON request per private
-  Unix-socket connection. Client and daemon must both report Hoard 0.7.1.7 and IPC protocol `1`.
+  Unix-socket connection. Client and daemon must both report Hoard 0.7.1.8 and IPC protocol `1`.
   A held instance lock with no ready socket means initialization is in progress, so the client
   waits for that owner instead of spawning a second daemon.
 - `service.py` owns the database, two independently limited job runners and the sole
@@ -35,6 +35,12 @@ background service.
   bootstrap/session token, HttpOnly SameSite cookie, independent CSRF token and CSP protect every
   write. Only media paths already validated into the current catalog snapshot and still contained
   by one of the daemon-reported archive roots are served through an opaque root-prefixed URL.
+  The launcher and server coordinate through private state files: `preparing` is published before
+  catalog generation, `ready` only after the HTTP socket is bound, and `error` retains a sanitized
+  failure message. PIDs and a server lock prevent a second launch or reuse of a stale ready file;
+  the launcher waits for the real build (up to four minutes), verifies a loopback connection, and
+  terminates only its own timed-out child. A healthy existing server is reused and its bootstrap
+  URL is returned to the TUI/CLI.
 - The socket and all XDG state directories are user-only. No persistent or remotely reachable
   TCP/HTTP listener exists; the loopback browser session starts only by explicit user action and
   expires after inactivity.
@@ -157,11 +163,16 @@ selected post. The status response includes bounded profile summaries with photo
 the TUI never needs direct database access.
 
 Profile photo enumeration is capped at 30 per check. Saved Telegram photo IDs prevent duplicate
-downloads. The scheduler backfills due profile IDs already in SQLite and retries temporary
+downloads. Telegram may expose an animated avatar through `video_sizes`; Hoard downloads the
+largest still `PhotoSize` sibling instead, so the `.jpg` file is decodable by the HTML gallery.
+A still-less video is skipped, and an existing video container under a photo path is re-fetched on
+the next check. The scheduler backfills due profile IDs already in SQLite and retries temporary
 failures without rewinding any source checkpoint. Privacy/RPC failures and FloodWait retry times
 are recorded on the profile and do not fail the source scan. Authorization loss, inaccessible
 peers, privacy/access restrictions, FloodWait and network failures have distinct retry classes;
 local filesystem write failures fail the photo job and are never mislabeled as network trouble.
+A Telegram transfer with no byte progress for two minutes is cancelled as a retryable network
+stall, so a dropped connection cannot leave one scan task alive forever.
 
 ## Offline catalog
 

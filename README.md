@@ -1,4 +1,4 @@
-# Hoard 0.7.1.7
+# Hoard 0.7.1.8
 
 Hoard is a local-first Linux and Windows archive for Telegram posts, profiles and video notes
 found in a channel post's comments. It uses Telethon, SQLite, an autonomous offline HTML catalog
@@ -64,6 +64,15 @@ snapshot, so an older snapshot cannot be published after a newer one. Retrying a
 longer waits for the automatic backoff or creates a duplicate active job, and a successful report
 clears the previous diagnostic error.
 
+The 0.7.1.8 patch comes from a live Telegram/archive pass. Web startup now publishes explicit
+`preparing`, `ready` and `error` states, waits through the real HTML build instead of failing
+after five seconds, reuses a healthy server and never leaves an orphan child on timeout. The TUI
+shows preparation and the resulting URL. Telegram video avatars are downloaded through a still
+`PhotoSize` sibling, so their `.jpg` files are real images rather than MP4 content that a browser
+cannot display; existing broken video-avatar records are repaired on their next profile check.
+A transfer that makes no progress for two minutes is aborted with a retryable network error
+instead of holding the collector indefinitely after a dropped connection.
+
 ## Terminal interfaces
 
 The round-three interface is a complete Telegram workspace:
@@ -111,7 +120,7 @@ For development, install the test tools with `python -m pip install -e '.[dev]'`
 
 An upgrade keeps the existing XDG configuration, database, Telegram session and archive.
 If an older daemon is still running, execute `hoard shutdown` before starting the upgraded
-installation. The 0.7.1.7 client accepts only a daemon reporting the same application version and
+installation. The 0.7.1.8 client accepts only a daemon reporting the same application version and
 IPC protocol `1`; it reports the mismatch instead of starting a competing service. If a matching
 daemon already owns the service lock but is still initializing, clients wait for it and show a
 specific startup diagnostic.

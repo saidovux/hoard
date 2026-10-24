@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import time
@@ -21,6 +22,85 @@ from .telegram_storage import utc_now
 TELEGRAM_REORDER_FACTOR = 4
 SCAN_CHECKPOINT_BATCH = 32
 SCAN_CHECKPOINT_MAX_DELAY = 0.25
+TELEGRAM_DOWNLOAD_IDLE_TIMEOUT = 120.0
+
+
+async def _await_with_stall_detection(awaitable, last_activity, *, timeout: float):
+    """Abort one Telegram transfer when no bytes arrive for ``timeout`` seconds.
+
+    Telethon's recovery-aware download loop can otherwise wait indefinitely after
+    a dropped connection.  Cancellation of the surrounding scan must still cancel
+    the transfer normally.
+    """
+    task = asyncio.create_task(awaitable)
+    try:
+        while not task.done():
+            done, _ = await asyncio.wait({task}, timeout=timeout)
+            if task in done:
+                break
+            if time.monotonic() - last_activity() >= timeout:
+                task.cancel()
+                with contextlib.suppress(BaseException):
+                    await task
+                raise TimeoutError(
+                    "Загрузка Telegram остановилась; повтор после восстановления связи"
+                )
+        return await task
+    except BaseException:
+        if not task.done():
+            task.cancel()
+            with contextlib.suppress(BaseException):
+                await task
+        raise
+
+
+def _is_video_container(path: Path) -> bool:
+    """Detect MP4/ISO-BMFF content saved under the profile-photo .jpg name."""
+    try:
+        with path.open("rb") as stream:
+            header = stream.read(12)
+    except OSError:
+        return False
+    return len(header) >= 12 and header[4:8] == b"ftyp"
+
+
+def _still_photo_thumb(photo):
+    """Pick the largest still size when Telegram exposes a video avatar.
+
+    ``download_media(photo)`` selects the largest size, which can be an MP4
+    ``VideoSize``.  The HTML catalog renders profile photos as images, so use a
+    still ``PhotoSize`` sibling instead of storing an MP4 with a .jpg suffix.
+    Passing the size object avoids Telethon's index reordering of photo/video
+    sizes.
+    """
+    sizes = list(getattr(photo, "sizes", None) or [])
+    if not sizes:
+        return None
+    try:
+        from telethon.tl import types as tl_types
+    except ImportError:
+        return None
+    video_sizes = list(getattr(photo, "video_sizes", None) or [])
+    if not video_sizes and not any(
+        isinstance(size, tl_types.VideoSize) for size in sizes
+    ):
+        return None
+    still = [
+        (index, size)
+        for index, size in enumerate(sizes)
+        if isinstance(size, (tl_types.PhotoSize, tl_types.PhotoSizeProgressive))
+    ]
+    if not still:
+        return None
+
+    def rank(item: tuple[int, object]) -> tuple[int, int]:
+        size = item[1]
+        return (
+            int(getattr(size, "w", 0)) * int(getattr(size, "h", 0)),
+            int(getattr(size, "size", 0)),
+        )
+
+    return max(still, key=rank)[1]
 
 
 @dataclass(slots=True)
@@ -879,9 +959,12 @@ class TelegramEngine:
                     last_at = time.monotonic()
                     last_size = 0
                     last_speed = None
+                    last_activity = last_at
+
                     def callback(current: int, total: int) -> None:
-                        nonlocal last_at, last_size, last_speed
+                        nonlocal last_at, last_size, last_speed, last_activity
                         now = time.monotonic()
+                        last_activity = now
                         elapsed = now - last_at
                         if elapsed >= 0.5:
                             last_speed = max(0.0, (current - last_size) / elapsed)
@@ -892,8 +975,13 @@ class TelegramEngine:
                             total=total,
                             speed_bps=last_speed,
                         )
+
                     # File object avoids Telethon appending a file extension to .part.
-                    result = await download_video_note(client, msg, f, callback)
+                    result = await _await_with_stall_detection(
+                        download_video_note(client, msg, f, callback),
+                        lambda: last_activity,
+                        timeout=TELEGRAM_DOWNLOAD_IDLE_TIMEOUT,
+                    )
                     f.flush()
                     os.fsync(f.fileno())
                 if result is None or not partial.exists() or partial.stat().st_size == 0:
@@ -1040,6 +1128,7 @@ class TelegramEngine:
                             path.is_file()
                             and int(existing["size"]) > 0
                             and path.stat().st_size == int(existing["size"])
+                            and not _is_video_container(path)
                         ):
                             continue
                     except (OSError, TypeError, ValueError):
@@ -1047,6 +1136,7 @@ class TelegramEngine:
                 output = profile_photo_path(
                     self.store.telegram.archive_root(), int(author_id), photo_id
                 )
+                thumb = _still_photo_thumb(photo)
                 partial = output.with_name(f"{output.name}.part")
                 try:
                     try:
@@ -1055,8 +1145,24 @@ class TelegramEngine:
                     except OSError as exc:
                         raise ProfilePhotoWriteError(str(exc)) from exc
                     with partial.open("wb") as stream:
-                        result = await client.download_media(
-                            photo, file=_ProfilePhotoStream(stream)
+                        photo_activity = [time.monotonic()]
+
+                        def photo_progress(
+                            _current: int,
+                            _total: int,
+                            activity=photo_activity,
+                        ) -> None:
+                            activity[0] = time.monotonic()
+
+                        result = await _await_with_stall_detection(
+                            client.download_media(
+                                photo,
+                                file=_ProfilePhotoStream(stream),
+                                progress_callback=photo_progress,
+                                **({"thumb": thumb} if thumb is not None else {}),
+                            ),
+                            lambda activity=photo_activity: activity[0],
+                            timeout=TELEGRAM_DOWNLOAD_IDLE_TIMEOUT,
                         )
                         try:
                             stream.flush()
@@ -1065,6 +1171,11 @@ class TelegramEngine:
                             raise ProfilePhotoWriteError(str(exc)) from exc
                     if result is None:
                         raise RuntimeError("Telegram не вернул фотографию профиля")
+                    if _is_video_container(partial):
+                        # No still sibling was available.  Never publish an MP4
+                        # under a .jpg path that the image gallery cannot decode.
+                        partial.unlink(missing_ok=True)
+                        continue
                     try:
                         if not partial.is_file() or partial.stat().st_size == 0:
                             raise ProfilePhotoWriteError(

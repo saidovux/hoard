@@ -4,17 +4,25 @@ from __future__ import annotations
 import base64
 import http.client
 import json
+import os
 import shutil
 import subprocess
 import threading
+import time
 from pathlib import Path
 
 import pytest
 
+from hoard import web as web_module
 from hoard.catalog import build_catalog
 from hoard.models import Post
 from hoard.storage import Store
-from hoard.web import WebState, create_web_server, run_web
+from hoard.web import (
+    WebState,
+    create_web_server,
+    launch_web_process,
+    run_web,
+)
 
 
 class FakeDaemon:
@@ -46,7 +54,7 @@ def request(server, method, path, *, headers=None, body=None):
     return result
 
 
-def test_web_rejects_old_daemon_reply_clearly(monkeypatch):
+def test_web_rejects_old_daemon_reply_clearly(monkeypatch, tmp_path):
     async def daemon_ready():
         return None
 
@@ -54,11 +62,137 @@ def test_web_rejects_old_daemon_reply_clearly(monkeypatch):
         assert method == "telegram_report"
         return {}
 
+    monkeypatch.setattr("hoard.web.state_dir", lambda: tmp_path / "state")
     monkeypatch.setattr("hoard.web.ensure_daemon", daemon_ready)
     monkeypatch.setattr("hoard.web.request", old_report)
 
     with pytest.raises(RuntimeError, match=r"hoard shutdown"):
         run_web(open_browser=False)
+    state = json.loads((tmp_path / "state" / "web.ready.json").read_text())
+    assert state["status"] == "error"
+    assert "hoard shutdown" in state["error"]
+
+
+class FakeWebProcess:
+    def __init__(self, pid: int = 43210):
+        self.pid = pid
+        self.returncode: int | None = None
+        self.terminated = False
+
+    def poll(self) -> int | None:
+        return self.returncode
+
+    def terminate(self) -> None:
+        self.terminated = True
+        self.returncode = -15
+
+    def wait(self, timeout: float | None = None) -> int | None:
+        return self.returncode
+
+
+def _prepare_launcher(monkeypatch, tmp_path):
+    monkeypatch.setattr("hoard.web.state_dir", lambda: tmp_path / "state")
+    monkeypatch.setattr("hoard.web._WEB_POLL_INTERVAL", 0.01)
+    monkeypatch.setattr("hoard.web._web_reachable", lambda port: port > 0)
+    monkeypatch.setattr("hoard.web.webbrowser.open", lambda *args, **kwargs: True)
+
+
+def _popen_writing_state(monkeypatch, process, *, delay=0.1, status="ready", error=""):
+    def fake_popen(*args, **kwargs):
+        def publish():
+            web_module._write_state(
+                status,
+                pid=process.pid,
+                port=45678 if status == "ready" else 0,
+                url="http://127.0.0.1:45678/start/synthetic"
+                if status == "ready"
+                else "",
+                error=error,
+            )
+
+        threading.Timer(delay, publish).start()
+        return process
+
+    monkeypatch.setattr("hoard.web.subprocess.Popen", fake_popen)
+
+
+def test_launch_web_waits_for_real_ready_state(monkeypatch, tmp_path):
+    _prepare_launcher(monkeypatch, tmp_path)
+    process = FakeWebProcess()
+    _popen_writing_state(monkeypatch, process, delay=0.15)
+
+    started = time.monotonic()
+    url = launch_web_process()
+
+    assert url == "http://127.0.0.1:45678/start/synthetic"
+    assert time.monotonic() - started >= 0.1
+    state = json.loads((tmp_path / "state" / "web.ready.json").read_text())
+    assert state["status"] == "ready"
+    assert state["pid"] == process.pid
+
+
+def test_launch_web_reuses_ready_server_without_spawning(monkeypatch, tmp_path):
+    _prepare_launcher(monkeypatch, tmp_path)
+    web_module._write_state(
+        "ready",
+        pid=os.getpid(),
+        port=45678,
+        url="http://127.0.0.1:45678/start/existing",
+    )
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Popen must not run for a live ready server")
+
+    monkeypatch.setattr("hoard.web.subprocess.Popen", forbidden)
+
+    assert launch_web_process() == "http://127.0.0.1:45678/start/existing"
+
+
+def test_launch_web_ignores_stale_ready_state(monkeypatch, tmp_path):
+    _prepare_launcher(monkeypatch, tmp_path)
+    web_module._write_state(
+        "ready",
+        pid=999999,
+        port=45678,
+        url="http://127.0.0.1:45678/start/stale",
+    )
+    monkeypatch.setattr("hoard.web._pid_alive", lambda pid: False)
+    process = FakeWebProcess(pid=54321)
+    _popen_writing_state(monkeypatch, process, delay=0.1)
+
+    assert launch_web_process() == "http://127.0.0.1:45678/start/synthetic"
+    state = json.loads((tmp_path / "state" / "web.ready.json").read_text())
+    assert state["pid"] == process.pid
+
+
+def test_launch_web_surfaces_child_error(monkeypatch, tmp_path):
+    _prepare_launcher(monkeypatch, tmp_path)
+    process = FakeWebProcess()
+    _popen_writing_state(
+        monkeypatch,
+        process,
+        delay=0.05,
+        status="error",
+        error="RuntimeError: synthetic preparation failure",
+    )
+
+    with pytest.raises(RuntimeError, match="synthetic preparation failure"):
+        launch_web_process()
+
+
+def test_launch_web_timeout_terminates_owned_child(monkeypatch, tmp_path):
+    _prepare_launcher(monkeypatch, tmp_path)
+    monkeypatch.setattr("hoard.web._WEB_LAUNCH_TIMEOUT", 0.1)
+    process = FakeWebProcess()
+
+    def fake_popen(*args, **kwargs):
+        return process
+
+    monkeypatch.setattr("hoard.web.subprocess.Popen", fake_popen)
+
+    with pytest.raises(RuntimeError, match="не завершил подготовку"):
+        launch_web_process()
+    assert process.terminated is True
 
 
 def test_web_requires_bootstrap_cookie_exact_host_origin_and_csrf(tmp_path):

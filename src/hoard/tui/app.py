@@ -435,6 +435,9 @@ class HoardApp(App[None]):
         await self._poll_telegram_batch(str(batch["id"]))
 
     def open_web_interface(self) -> None:
+        # Preparation may take as long as the real HTML build.  Keep the TUI
+        # responsive and make the waiting state explicit instead of blocking.
+        self.set_notice("Подготавливаю локальный веб-интерфейс…")
         self.run_worker(
             self._launch_web_interface(), name="launch-web-interface", exit_on_error=False
         )
@@ -443,11 +446,11 @@ class HoardApp(App[None]):
         try:
             from hoard.web import launch_web_process
 
-            await asyncio.to_thread(launch_web_process)
+            url = await asyncio.to_thread(launch_web_process)
         except (OSError, RuntimeError) as exc:
             self.set_notice(str(exc), error=True)
             return
-        self.set_notice("Локальный веб-интерфейс запускается в браузере.")
+        self.set_notice(f"Веб-интерфейс готов: {url}")
 
     @staticmethod
     def _is_text_entry(widget: Widget | None) -> bool:

@@ -18,7 +18,7 @@ from telethon.tl import types
 from hoard.archive_paths import video_note_path
 from hoard.models import Post
 from hoard.storage import Store
-from hoard.telegram import TelegramEngine
+from hoard.telegram import TelegramEngine, _await_with_stall_detection
 from hoard.telegram_download import VIDEO_NOTE_PART_SIZE_KB
 
 
@@ -317,3 +317,42 @@ async def test_real_telethon_path_refreshes_expired_document_reference():
 
     assert stream.getvalue() == payload
     assert references == [b"old-reference", b"new-reference"]
+
+
+async def test_stalled_download_raises_timeout(tmp_path, monkeypatch):
+    store = Store(tmp_path / "db.sqlite")
+    store.add_source(Post("channel", 1), str(tmp_path / "archive"))
+    source = store.source(1)
+    message = SyntheticMessage(b"synthetic", message_id=22)
+
+    async def stalled(*_args, **_kwargs):
+        await asyncio.sleep(30)
+
+    monkeypatch.setattr("hoard.telegram.download_video_note", stalled)
+    monkeypatch.setattr("hoard.telegram.TELEGRAM_DOWNLOAD_IDLE_TIMEOUT", 0.05)
+    engine = TelegramEngine(store)
+
+    started = time.monotonic()
+    with pytest.raises(TimeoutError, match="остановилась"):
+        await engine.download_one(object(), Post("channel", 1), source, message)
+
+    assert time.monotonic() - started < 2
+    assert not list(Path(source["output"]).rglob("*.part"))
+    assert store.db.execute("SELECT COUNT(*) FROM downloads").fetchone()[0] == 0
+    store.close()
+
+
+async def test_stall_detector_cancels_inner_task():
+    finished = asyncio.Event()
+
+    async def never():
+        try:
+            await asyncio.sleep(30)
+        finally:
+            finished.set()
+
+    with pytest.raises(TimeoutError):
+        await _await_with_stall_detection(
+            never(), lambda: time.monotonic() - 1, timeout=0.05
+        )
+    assert finished.is_set()
