@@ -1,3 +1,3 @@
 """Hoard: a local-first Telegram media archiver."""
 
-__version__ = "0.7.1.2"
+__version__ = "0.7.1.3"

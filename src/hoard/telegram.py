@@ -12,6 +12,7 @@ from .archive_paths import post_media_path, profile_photo_path, video_note_path
 from .config import read_credentials
 from .models import Post, iso_date, post_comment_link
 from .paths import ensure_private, session_path
+from .telegram_download import download_video_note
 from .telegram_storage import utc_now
 
 
@@ -634,7 +635,7 @@ class TelegramEngine:
                         })
                         self.report_progress(self.progress.copy())
                     # File object avoids Telethon appending a file extension to .part.
-                    result = await client.download_media(msg, file=f, progress_callback=callback)
+                    result = await download_video_note(client, msg, f, callback)
                     f.flush()
                     os.fsync(f.fileno())
                 if result is None or not partial.exists() or partial.stat().st_size == 0:

@@ -1,4 +1,4 @@
-# Hoard 0.7.1.2
+# Hoard 0.7.1.3
 
 Hoard is a local-first Linux and Windows archive for Telegram posts, profiles and video notes
 found in a channel post's comments. It uses Telethon, SQLite, an autonomous offline HTML catalog
@@ -22,6 +22,14 @@ native AES-IGE implementation for Telegram transport encryption; Hoard does not 
 Telethon's cryptography. This reduces local cryptographic processing time for video notes, profile
 photos and post media. End-to-end download speed can still be limited by the network, Telegram,
 Telethon's request sizing and Hoard's deliberately sequential Telegram job handling.
+
+The 0.7.1.3 patch requests video-note documents from Telegram in 512 KiB parts instead of
+Telethon's 128 KiB default for files up to 100 MiB. It uses the same Telethon primitive as
+`download_media()` and passes message context for file-reference refresh, DC migration, CDN and
+retry handling. Hoard checks that private Telethon contract before using it and falls back to the
+original `download_media()` path if the installed client or media is incompatible. Profile photos
+and post media are unchanged. Larger requests reduce sequential round trips but do not guarantee
+the same end-to-end improvement on a real Telegram connection.
 
 ## Terminal interfaces
 
@@ -70,7 +78,7 @@ For development, install the test tools with `python -m pip install -e '.[dev]'`
 
 An upgrade keeps the existing XDG configuration, database, Telegram session and archive.
 If an older daemon is still running, execute `hoard shutdown` before starting the upgraded
-installation. The 0.7.1.2 client accepts only a daemon reporting the same application version and
+installation. The 0.7.1.3 client accepts only a daemon reporting the same application version and
 IPC protocol `1`; it reports the mismatch instead of starting a competing service. If a matching
 daemon already owns the service lock but is still initializing, clients wait for it and show a
 specific startup diagnostic.

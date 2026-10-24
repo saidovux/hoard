@@ -13,7 +13,7 @@ background service.
   `request()` boundary. Dialogs, screens, status formatting, reusable widgets and TCSS remain
   separate. The package imports neither storage nor Telethon.
 - `ipc.py` starts the daemon detached when required and sends one JSON request per private
-  Unix-socket connection. Client and daemon must both report Hoard 0.7.1.2 and IPC protocol `1`.
+  Unix-socket connection. Client and daemon must both report Hoard 0.7.1.3 and IPC protocol `1`.
   A held instance lock with no ready socket means initialization is in progress, so the client
   waits for that owner instead of spawning a second daemon.
 - `service.py` owns the database, two independently limited job runners and the sole
@@ -215,9 +215,16 @@ as actionable messages; exception class details are returned only when local `HO
 is explicitly enabled.
 
 `cryptg` is a required runtime dependency. Telethon imports it as its preferred native AES-IGE
-backend, so video notes, profile photos and post media retain the ordinary `download_media()`
-path and all existing atomic-write and recovery behavior. Hoard neither implements Telegram
+backend independently of Hoard's transfer adapter. Hoard neither implements Telegram
 cryptography nor parallelizes Telegram transfers.
+
+Video-note documents use the small `telegram_download.py` compatibility adapter. Telethon 1.45's
+public `download_file(part_size_kb=...)` cannot forward the message context required to refresh an
+expired document reference, so the adapter checks the private `_download_file` signature and uses
+that existing recovery-aware primitive with 512 KiB parts. The primitive retains its sender, DC,
+CDN, retry and cancellation behavior. An unknown contract, missing document or unknown size takes
+the unchanged `download_media()` fallback. The surrounding `.part`, `fsync`, atomic replacement,
+sidecar and checkpoint boundaries remain in `TelegramEngine.download_one()`.
 
 ## AI Core — round 1
 
