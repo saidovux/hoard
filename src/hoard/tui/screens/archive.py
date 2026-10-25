@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import webbrowser
+from pathlib import Path
+
 from rich.text import Text
 from textual.app import ComposeResult
 from textual.containers import Horizontal
@@ -38,6 +41,7 @@ class ArchiveScreen(WorkspaceScreen):
             yield Button("Задания", id="mode-jobs")
         with Horizontal(classes="action-row", id="archive-actions"):
             yield Button("Обновить HTML", id="catalog-build")
+            yield Button("Открыть HTML", id="catalog-open")
             yield Button("Обновить профили", id="telegram-enrich")
             yield Button("Повторить ошибку", id="job-retry")
             yield Button("Анализировать профиль", id="telegram-ai")
@@ -173,6 +177,8 @@ class ArchiveScreen(WorkspaceScreen):
                 self._load_profile_page()
         elif button_id == "catalog-build":
             self._build_catalog()
+        elif button_id == "catalog-open":
+            self._open_catalog()
         elif button_id == "telegram-enrich":
             self._confirm_enrich()
         elif button_id == "job-retry":
@@ -229,6 +235,25 @@ class ArchiveScreen(WorkspaceScreen):
             name="catalog-build",
             exit_on_error=False,
         )
+
+    def _open_catalog(self) -> None:
+        value = str((self.hoard_app.status or {}).get("catalog") or "").strip()
+        if not value:
+            self.hoard_app.set_notice("Путь HTML-каталога недоступен", error=True)
+            return
+        try:
+            path = Path(value).expanduser().resolve(strict=True)
+            if not path.is_file():
+                raise OSError("not a file")
+        except (OSError, RuntimeError, ValueError):
+            self.hoard_app.set_notice("HTML-каталог ещё не создан", error=True)
+            return
+        if webbrowser.open(path.as_uri(), new=2):
+            self.hoard_app.set_notice("HTML-каталог открыт в браузере.")
+        else:
+            self.hoard_app.set_notice(
+                f"Не удалось открыть браузер; каталог: {path}", error=True
+            )
 
     def _confirm_enrich(self) -> None:
         self.app.push_screen(

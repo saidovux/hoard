@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import subprocess
 import sys
+import threading
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -434,6 +435,37 @@ async def test_q_exits_without_daemon_control_calls():
 
 
 @pytest.mark.asyncio
+async def test_web_launch_runs_off_the_event_loop(monkeypatch):
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow_launch():
+        started.set()
+        release.wait(5)
+        return "http://127.0.0.1:45678/start/test"
+
+    monkeypatch.setattr("hoard.web.launch_web_process", slow_launch)
+    app = HoardApp(FakeAPI())
+    async with app.run_test() as pilot:
+        await wait_for_startup(app, pilot)
+        app.open_web_interface()
+        assert await asyncio.to_thread(started.wait, 1)
+        assert app.notice == ("Подготавливаю локальный веб-интерфейс…", False)
+
+        await pilot.press("?")
+        assert isinstance(app.screen, HelpScreen)
+        await pilot.press("escape")
+        await wait_for_condition(pilot, lambda: not isinstance(app.screen, HelpScreen))
+
+        release.set()
+        await wait_for_condition(
+            pilot,
+            lambda: app.notice is not None and app.notice[0].startswith("Веб-интерфейс готов"),
+        )
+    assert app.notice == ("Веб-интерфейс готов: http://127.0.0.1:45678/start/test", False)
+
+
+@pytest.mark.asyncio
 async def test_exit_stops_activity_timer():
     app = HoardApp(FakeAPI())
     async with app.run_test() as pilot:
@@ -465,6 +497,78 @@ async def test_empty_status_has_informative_states():
         assert "Событий пока нет" in str(app.screen.query_one("#events", Static).content)
 
 
+def test_progress_lines_preserve_aggregate_and_individual_speeds():
+    from hoard.tui.state import progress_lines
+
+    status = {
+        "progress": {
+            "source": "channel/42",
+            "checked": 9,
+            "downloaded": 4,
+            "active_downloads": 3,
+            "aggregate_speed_bps": 4096,
+            "file": "clip.mp4",
+            "bytes": 1024,
+            "total": 2048,
+            "speed_bps": 512,
+        }
+    }
+
+    lines = progress_lines(status)
+    assert "Источник: channel/42" in lines
+    assert "проверено 9 · сохранено 4" in lines
+    assert "Активных загрузок: 3 · суммарно 4.0 KiB/s" in lines
+    assert "clip.mp4" in lines
+    assert "1.0 KiB / 2.0 KiB · 512 B/s" in lines
+
+
+def test_format_bytes_and_progress_fraction_use_real_values():
+    from hoard.tui.state import format_bytes, progress_fraction
+
+    assert format_bytes(1024) == "1.0 KiB"
+    assert format_bytes(1536) == "1.5 KiB"
+    assert format_bytes(None) == "—"
+    assert format_bytes("bad") == "—"
+    assert progress_fraction({"progress": {"bytes": 50, "total": 200}}) == (50, 200)
+    assert progress_fraction({"progress": {"bytes": 50}}) is None
+    assert progress_fraction({"progress": {"bytes": "bad", "total": 200}}) is None
+
+
+@pytest.mark.asyncio
+async def test_activity_progress_bar_uses_real_total():
+    app = HoardApp(FakeAPI(status_fixture()))
+    async with app.run_test() as pilot:
+        await wait_for_startup(app, pilot)
+        app.open_section("activity")
+        await pilot.pause()
+        progress = str(app.screen.query_one(ProgressView).content)
+        assert "1.0 KiB / 4.0 KiB · 512 B/s" in progress
+        assert "25%" in progress
+
+
+@pytest.mark.asyncio
+async def test_archive_can_open_existing_catalog(tmp_path, monkeypatch):
+    catalog = tmp_path / "telegram_archive.html"
+    catalog.write_text("<!doctype html>", encoding="utf-8")
+    status = status_fixture()
+    status["catalog"] = str(catalog)
+    opened: list[tuple[str, int]] = []
+    monkeypatch.setattr(
+        "hoard.tui.screens.archive.webbrowser.open",
+        lambda url, new=0: opened.append((url, new)) or True,
+    )
+    app = HoardApp(FakeAPI(status))
+    async with app.run_test(size=(100, 30)) as pilot:
+        await wait_for_startup(app, pilot)
+        app.open_section("archive")
+        await pilot.pause()
+        app.screen.query_one("#catalog-open").press()
+        await pilot.pause()
+
+    assert opened == [(catalog.resolve().as_uri(), 2)]
+    assert app.notice == ("HTML-каталог открыт в браузере.", False)
+
+
 @pytest.mark.asyncio
 async def test_activity_uses_only_available_progress_values():
     app = HoardApp(FakeAPI(status_fixture(total=None)))
@@ -487,6 +591,24 @@ async def test_ipc_error_is_visible_and_ui_can_close():
         error = app.screen.query_one("#status-error", Static)
         assert error.display
         assert "socket недоступен" in str(error.content)
+        await pilot.press("q")
+
+
+@pytest.mark.asyncio
+async def test_incompatible_daemon_shows_shutdown_instruction():
+    from hoard.ipc import DaemonCompatibilityError
+
+    message = (
+        "Запущена устаревшая служба Hoard (daemon 0.7.0, клиент 0.7.1.10).\n"
+        "Выполни: hoard shutdown\n"
+        "Затем снова запусти: hoard"
+    )
+    app = HoardApp(FakeAPI(error=DaemonCompatibilityError(message)))
+    async with app.run_test() as pilot:
+        await wait_for_startup(app, pilot)
+        error = str(app.screen.query_one("#status-error", Static).content)
+        assert "устаревшая служба" in error
+        assert "hoard shutdown" in error
         await pilot.press("q")
 
 
@@ -1294,8 +1416,10 @@ def test_cli_module_keeps_textual_lazy_for_noninteractive_commands():
     code = """
 import sys
 import hoard.cli as cli
+from hoard import __version__
+from hoard.ipc import IPC_PROTOCOL
 async def fake_request(*args, **kwargs):
-    return {"running": False}
+    return {"version": __version__, "protocol": IPC_PROTOCOL, "running": False}
 cli.request = fake_request
 sys.argv = ["hoard", "status", "--json"]
 cli.main()

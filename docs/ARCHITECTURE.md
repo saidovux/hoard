@@ -5,15 +5,16 @@ background service.
 
 ## Process boundary
 
-- `console_ui.py` renders the inline Rich/InquirerPy interface. It never imports or creates
-  a `TelegramClient`; every operation goes through IPC.
-- `tui/` is the optional full-screen Textual client launched only by `hoard tui`. `app.py` owns
-  lifecycle, contextual keyboard navigation, named mutation guards and the single in-flight
+- `cli.py` is the command dispatcher. `hoard`, `hoard ui` and `hoard tui` launch the Textual
+  client; `ui` and `tui` are compatibility aliases. Service commands remain non-interactive and
+  do not import Textual.
+- `tui/` is the only interactive terminal client: a full-screen Textual application. `app.py`
+  owns lifecycle, contextual keyboard navigation, named mutation guards and the single in-flight
   status refresh; `api.py` provides typed operations over the existing `ensure_daemon()` /
   `request()` boundary. Dialogs, screens, status formatting, reusable widgets and TCSS remain
-  separate. The package imports neither storage nor Telethon.
+  separate. The package imports neither storage nor Telethon, and never creates a Telegram client.
 - `ipc.py` starts the daemon detached when required and sends one JSON request per private
-  Unix-socket connection. Client and daemon must both report Hoard 0.7.1.9 and IPC protocol `1`.
+  Unix-socket connection. Client and daemon must both report Hoard 0.7.1.10 and IPC protocol `1`.
   A held instance lock with no ready socket means initialization is in progress, so the client
   waits for that owner instead of spawning a second daemon.
 - `service.py` owns the database, two independently limited job runners and the sole
@@ -43,7 +44,9 @@ background service.
   exited, and let the launcher wait for the real build (up to four minutes), verify a loopback
   connection, and terminate only its own timed-out child. Corrupt and stale state files are
   discarded under the lock. A healthy existing server is reused and its bootstrap URL is returned
-  to the TUI/CLI.
+  to the TUI/CLI. Known limitation for the next Web round: the ready record contains one
+  single-use bootstrap URL, so reopening an already authenticated Web can return a consumed URL
+  and appear stale. Authentication is intentionally not weakened to work around it.
 - The socket and all XDG state directories are user-only. No persistent or remotely reachable
   TCP/HTTP listener exists; the loopback browser session starts only by explicit user action and
   expires after inactivity.
@@ -58,17 +61,15 @@ concurrency limit. Each runner selects only its registered job kinds, so a long 
 cannot take a Telegram slot or acquire the Telegram lock. Interrupted AI jobs become `failed` and
 require an explicit retry because a cancelled paid request may already have reached the provider.
 Shutdown closes both runners, the Telegram client, database and socket.
-Menu keybindings are defined once for arrow and `h/j/k/l` navigation. Telegram IPC calls render
-an inline elapsed-time status with network/VPN guidance while the daemon owns the actual client.
-Views use a bounded responsive workspace and clear only the primary terminal screen between
-completed prompts; the UI never enters the alternate screen or refreshes while closed.
+Menu keybindings are defined once for arrow and `h/j/k/l` navigation. Telegram IPC failures render
+network/VPN guidance inside the active Textual modal while the daemon owns the actual client.
 
-The Textual client is a separate presentation option and may enter application mode. Its Overview
-screen performs no idle polling. The Activity screen owns a moderate 1.5-second timer only while
-active, and the app's async lock drops overlapping ticks. Screen suspension, unmount and app exit
-stop the timer. IPC startup and request errors render inside the stable black workspace so a slow
-or unavailable daemon never produces an unexplained empty screen. Exiting the client sends no
-collector, shutdown or Telegram command.
+The Textual client is the sole interactive presentation and may enter application mode. Its
+Overview screen performs no idle polling. The Activity screen owns a moderate 1.5-second timer
+only while active, and the app's async lock drops overlapping ticks. Screen suspension, unmount
+and app exit stop the timer. IPC startup and request errors render inside the stable black
+workspace so a slow or unavailable daemon never produces an unexplained empty screen. Exiting the
+client sends no collector, shutdown or Telegram command; a previously started Web stays alive.
 
 The Textual theme sets background, surface and panel to `#000000`; TCSS also fixes computed
 backgrounds for containers, navigation components, focus/hover/selected states, inputs, tables,

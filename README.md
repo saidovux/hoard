@@ -1,4 +1,4 @@
-# Hoard 0.7.1.9
+# Hoard 0.7.1.10
 
 Hoard is a local-first Linux and Windows archive for Telegram posts, profiles and video notes
 found in a channel post's comments. It uses Telethon, SQLite, an autonomous offline HTML catalog
@@ -83,12 +83,17 @@ before the stream is closed or `.part` is removed; Telethon does not suppress ca
 an arbitrary third-party coroutine that does would be allowed to finish rather than risk writing
 into a reused file.
 
-## Terminal interfaces
+The 0.7.1.10 release makes the existing full-screen Textual workspace the only interactive
+terminal interface. `hoard`, `hoard ui` and `hoard tui` open the same Textual application; `ui`
+and `tui` remain compatibility aliases. The old inline Rich/InquirerPy client and its InquirerPy
+dependency are removed. Service commands (`status`, `start`, `stop`, `scan`, `add`, `retry`,
+`telegram`, `web`, `shutdown`) remain non-interactive and do not import Textual. The Archive
+screen also retains a direct “Открыть HTML” action for an existing local catalog.
 
-The round-three interface is a complete Telegram workspace:
+## Terminal interface
 
 ```bash
-hoard tui
+hoard
 ```
 
 Its implemented sections are **Обзор**, **Telegram**, **Источники**, **Активность**, **Архив** and
@@ -107,9 +112,10 @@ The entire Textual surface, including navigation, focus, hover and help modal st
 even when the sidebar is hidden. Tables, buttons and inputs retain their native keyboard behavior.
 On terminals narrower than 60 columns the sidebar hides automatically.
 
-`hoard` and `hoard ui` continue to open the established inline
-Rich/InquirerPy interface. Scripts and all existing non-interactive commands are unchanged and do
-not import Textual.
+`hoard ui` and `hoard tui` are compatibility aliases for the same Textual application.
+Scripts and all existing non-interactive commands are unchanged, do not require a TTY and do not
+import Textual. Closing the TUI never stops the daemon or an already running Web session; reopen
+`hoard` to reconnect over the existing private IPC socket.
 
 ## Install on Linux
 
@@ -123,14 +129,14 @@ python -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -e .
-hoard tui
+hoard
 ```
 
 For development, install the test tools with `python -m pip install -e '.[dev]'`.
 
 An upgrade keeps the existing XDG configuration, database, Telegram session and archive.
 If an older daemon is still running, execute `hoard shutdown` before starting the upgraded
-installation. The 0.7.1.9 client accepts only a daemon reporting the same application version and
+installation. The 0.7.1.10 client accepts only a daemon reporting the same application version and
 IPC protocol `1`; it reports the mismatch instead of starting a competing service. If a matching
 daemon already owns the service lock but is still initializing, clients wait for it and show a
 specific startup diagnostic.
@@ -144,7 +150,7 @@ git clone https://github.com/saidovux/hoard.git
 cd hoard
 py -3 -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -e .
-.\.venv\Scripts\hoard.exe tui
+.\.venv\Scripts\hoard.exe
 ```
 
 No PowerShell execution policy changes are needed. Windows stores credentials in
@@ -155,7 +161,7 @@ Use `hoard shutdown` to fully close the service. Windows CI does not test live T
 
 ## First launch and Telegram login
 
-Run `hoard tui`, open **Telegram** and choose **Подключить**. Hoard performs the complete login as one
+Run `hoard`, open **Telegram** and choose **Подключить**. Hoard performs the complete login as one
 flow through the background daemon:
 
 1. It checks the saved session and finishes immediately if that session is still valid.
@@ -437,27 +443,20 @@ proof of account ownership, and Hoard does not identify people by face or recogn
 
 ## Background operation
 
-The UI communicates with one user-owned daemon over a mode-`0600` Unix socket on Linux (Windows uses authenticated loopback IPC). Selecting
-**Выход**, pressing Ctrl+C at a menu, or closing the terminal closes only the interface.
-The collector continues until it is paused, stopped or the daemon is shut down.
+The TUI communicates with one user-owned daemon over a mode-`0600` Unix socket on Linux (Windows
+uses authenticated loopback IPC). Pressing `q`, choosing exit, or closing the terminal closes
+only the interface. The collector continues until it is paused, stopped or the daemon is shut
+down.
 
 - **Pause** cancels active work safely and leaves it queued for **Continue**.
 - **Stop** stops the collector while keeping the management daemon available.
 - `hoard shutdown` closes both the collector and daemon cleanly.
 - Reopening `hoard` reconnects to the existing daemon.
 
-The legacy interface is inline, does not enter the alternate screen and refreshes only while the
-progress view is open. The terminal supplies its black background; Hoard uses orange
-`#F79646`, white primary text and gray secondary text. Its centered workspace expands up to
-112 columns, collapses cleanly on narrow terminals and replaces the previous view after every
-completed prompt, so navigation does not leave duplicate menus on screen.
-Lists support both arrow keys and Vim navigation: `j`/`k` move, `l` or Enter selects, and `h`
-returns to the parent menu. The same `h` shortcut leaves the live progress view.
-
-`hoard tui` is intentionally full-screen and restores the original terminal on exit. Its
+The Textual TUI is intentionally full-screen and restores the original terminal on exit. Its
 Overview and management screens are idle; only the visible Activity screen refreshes status.
-Both interfaces leave
-the same daemon and its Telegram and AI queues running after exit.
+Lists support arrow keys and Vim navigation: `j`/`k` move, `l` or Enter selects, and `h` returns.
+The daemon and its Telegram and AI queues keep running after exit.
 
 ## Non-interactive commands
 

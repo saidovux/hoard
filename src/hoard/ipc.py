@@ -24,8 +24,9 @@ def validate_daemon_status(status: dict) -> None:
     protocol = status.get("protocol")
     if daemon_version != __version__ or protocol != IPC_PROTOCOL:
         raise DaemonCompatibilityError(
-            f"Работает daemon версии {daemon_version}, клиент {__version__}. "
-            "Выполни `hoard shutdown` и повтори"
+            f"Запущена устаревшая служба Hoard (daemon {daemon_version}, клиент {__version__}).\n"
+            "Выполни: hoard shutdown\n"
+            "Затем снова запусти: hoard"
         )
 
 

@@ -7,7 +7,7 @@ import json
 import sys
 from pathlib import Path
 
-from .ipc import ensure_daemon, request
+from .ipc import ensure_daemon, request, validate_daemon_status
 
 
 async def run_command(args: argparse.Namespace):
@@ -34,6 +34,8 @@ async def run_command(args: argparse.Namespace):
     if args.command in {"stop", "shutdown", "status"}:
         try:
             data = await request(args.command)
+            if args.command == "status":
+                validate_daemon_status(data)
         except (OSError, ConnectionError, FileNotFoundError):
             data = (
                 {"message": "Hoard не запущен"}
@@ -103,14 +105,12 @@ def main():
     if args.command in {None, "ui", "tui"}:
         if not sys.stdin.isatty() or not sys.stdout.isatty():
             print(
-                "Ошибка: интерактивный CLI требует терминала. Для скриптов: hoard status",
+                "Ошибка: интерактивный TUI требует терминала. Для скриптов: hoard status",
                 file=sys.stderr,
             )
             raise SystemExit(1)
-        if args.command == "tui":
-            from .tui import launch
-        else:
-            from .console_ui import launch
+        from .tui import launch
+
         launch()
         return
     try:
