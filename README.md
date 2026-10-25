@@ -1,4 +1,4 @@
-# Hoard 0.7.1.11
+# Hoard 0.7.2.0
 
 Hoard is a local-first Linux and Windows archive for Telegram posts, profiles and video notes
 found in a channel post's comments. It uses Telethon, SQLite, an autonomous offline HTML catalog
@@ -6,8 +6,8 @@ and terminal interfaces. A private background daemon performs all Telegram work;
 interface does not stop downloads.
 
 This release adds one minimal AI workflow across the TUI and an explicit local browser client.
-It combines saved publications, profiles, photos, video notes and explicitly requested PSL
-history. The portable `telegram_archive.html` remains fully autonomous and makes no browser
+It combines saved publications, profiles, photos, video notes, extracted video-note frames and
+explicitly requested PSL history. The portable `telegram_archive.html` remains fully autonomous and makes no browser
 network requests. `hoard web` is a separate, short-lived loopback client; AI analysis is never
 started automatically. The project has no persistent or remotely accessible web service, Redis,
 Docker or Electron.
@@ -93,6 +93,23 @@ and fetches a new normalized snapshot only after a complete HTML publication; da
 counters and media allowlists are replaced without a full page reload, while search, filters,
 pagination, selection, scroll and active media playback are preserved.
 
+The 0.7.2.0 release adds automatic local frame extraction for every newly saved Telegram
+video note. A separate media job runs at most one FFmpeg process, writes three JPEG frames at
+20%, 50% and 80% of the real duration, and never delays the Telegram download path. A failed or
+cancelled extraction keeps the source MP4 and remains retryable. FFmpeg and FFprobe are optional
+runtime tools: without them the rest of Hoard continues to work and the UI explains how to
+retry after installation. Previously saved video notes are not mass-processed on upgrade; the
+Archive screen has an explicit resumable **Обработать старые кружки** action.
+
+Frames are stored next to their MP4, represented in SQLite, and published through the existing
+atomic catalog path, so an open Telegram Web receives them without a page reload. The TUI and
+Web show all three frames separately from profile photos. Explicit Telegram AI analysis can use
+profile photos, three frames from one selected video note, or three frames plus one profile photo
+of the same author. Frames are never mixed between people. All three frames are sent in one user
+message and one AI attempt; downloading a video never starts a paid request. Frame/photo
+fingerprints are checked again after preview, and existing operation-id, queue, retry, history and
+cost accounting rules remain in force.
+
 The 0.7.1.10 release makes the existing full-screen Textual workspace the only interactive
 terminal interface. `hoard`, `hoard ui` and `hoard tui` open the same Textual application; `ui`
 and `tui` remain compatibility aliases. The old inline Rich/InquirerPy client and its InquirerPy
@@ -109,8 +126,8 @@ hoard
 Its implemented sections are **Обзор**, **Telegram**, **Источники**, **Активность**, **Архив** and
 **AI**.
 They cover login including 2FA, collector start/pause/stop, source validation and editing,
-selected-source or global scans, downloads, profile summaries, jobs, errors, enrichment,
-manual HTML generation, AI chats and AI settings. **Telegram → Web** enables, opens and stops the
+selected-source or global scans, downloads, profile summaries, video-frame processing, jobs,
+errors, enrichment, manual HTML generation, AI chats and AI settings. **Telegram → Web** enables, opens and stops the
 separate local Web process; closing the TUI does not stop a running Web. All daemon operations use
 the private IPC layer; the TUI never opens
 SQLite or creates a Telegram client. Only the visible Activity screen polls, with one status
@@ -147,7 +164,7 @@ For development, install the test tools with `python -m pip install -e '.[dev]'`
 
 An upgrade keeps the existing XDG configuration, database, Telegram session and archive.
 If an older daemon is still running, execute `hoard shutdown` before starting the upgraded
-installation. The 0.7.1.11 client accepts only a daemon reporting the same application version and
+installation. The 0.7.2.0 client accepts only a daemon reporting the same application version and
 IPC protocol `1`; it reports the mismatch instead of starting a competing service. If a matching
 daemon already owns the service lock but is still initializing, clients wait for it and show a
 specific startup diagnostic.
@@ -317,12 +334,13 @@ when the TUI is closed. The autonomous `file://` catalog remains independent and
 HTTP requests.
 
 Interactive mode adds contextual actions to saved publications and profiles. It can analyze one
-profile, selected profiles, or every locally linked profile of a saved publication. Before any
-provider request it shows a local preview, lets the user choose one profile's photos, applies the
+profile, selected profiles, or every locally linked profile of a saved publication. The image
+source is explicit: saved profile photos, three frames of one selected video note, or those three
+frames plus one profile photo of the same author. Before any provider request it shows a local
+preview, lets the user choose a profile's photos or a ready video-note frame set, applies the
 configured automatic 18+ admission to local user profiles, and places the external-transfer and
-possible-cost disclosure directly above one explicit **Отправить N фото в DeepSeek и запустить
-анализ** button. There is no second confirmation dialog. Unknown post links do not start Telegram
-collection.
+possible-cost disclosure directly above one explicit send button. There is no second confirmation
+dialog. Unknown post links do not start Telegram collection.
 Progress shows queued, completed, skipped and failed profiles, each skip reason and an estimated
 USD cost when a matching user tariff exists. Otherwise cost is explicitly unknown. Finished
 results refresh automatically without a manual HTML rebuild. The browser remembers one active
@@ -331,7 +349,35 @@ visible once; the TUI can reopen the newest active group from **Архив → �
 
 The autonomous `<archive>/telegram_archive.html` does not contain a session, API key or active
 backend configuration and keeps working through `file://` exactly as before. Closing the Web or
-TUI client does not stop the daemon or its durable AI groups.
+TUI client does not stop the daemon or its durable AI groups. Browser video cards show the three
+extracted frames; the frame-specific AI action uses that exact local set.
+
+## Video-note frames and FFmpeg
+
+Each newly downloaded video note gets a durable local job. A separate one-slot media runner uses
+system `ffprobe` to read the actual duration and `ffmpeg` to save three JPEG frames at 20%, 50%
+and 80%. FFmpeg never runs inside the Telegram event loop, never modifies the MP4 and never starts
+an AI request. Frames live next to their source as
+`hoard_objects/video_notes/source_N/author_ID/message_M_frames/frame_01.jpg` through
+`frame_03.jpg`; SQLite stores their positions, timestamps, sizes, SHA-256 values and the source
+fingerprint. If three distinct decodable frames cannot be produced, the set is marked failed
+instead of reporting a fabricated partial success.
+
+FFmpeg is optional for the rest of Hoard. Install it with the system package manager, for example:
+
+```bash
+sudo pacman -S ffmpeg
+# Debian/Ubuntu: sudo apt install ffmpeg
+# Windows: winget install Gyan.FFmpeg
+```
+
+Existing video notes are not mass-processed after an upgrade. In **Архив → Кружки** choose
+**Обработать старые кружки** to start the bounded resumable backfill; **Пауза обработки кадров**
+stops scheduling new work and **Повторить ошибки кадров** retries failed/stale sets after fixing
+the dependency. Processing continues in the daemon when the TUI or Web is closed and does not
+download the MP4 again. Frame completion marks the catalog dirty; an open Web receives the new
+frames without a reload. The autonomous `file://` catalog also displays frames when their files
+remain inside the archive.
 
 Optional enrichment obtains post text/media and up to 30 latest profile photos visible to the
 authorized account:

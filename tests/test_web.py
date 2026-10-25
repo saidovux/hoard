@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import http.client
 import json
 import os
@@ -15,6 +16,7 @@ from pathlib import Path
 import pytest
 
 from hoard import web as web_module
+from hoard.archive_paths import video_note_path
 from hoard.catalog import build_catalog
 from hoard.models import Post
 from hoard.storage import Store
@@ -870,3 +872,131 @@ def test_interactive_web_opens_photo_profiles_and_profile_gallery_in_chromium(tm
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
+
+
+def frame_catalog(tmp_path: Path) -> tuple[Path, WebState, int, int]:
+    root = tmp_path / "archive"
+    root.mkdir()
+    store = Store(tmp_path / "frame-db.sqlite")
+    source_id = store.add_source(Post("channelx", 42), str(root))
+    store.telegram.observe_profile(
+        author_id=12345,
+        username="frame_user",
+        display_name="Frame User",
+        source_id=source_id,
+    )
+    video = video_note_path(root, source_id, 12345, 98)
+    video.parent.mkdir(parents=True, exist_ok=True)
+    video.write_bytes(b"video-bytes")
+    store.checkpoint(
+        source_id,
+        98,
+        {
+            "source_id": source_id,
+            "message_id": 98,
+            "author_id": 12345,
+            "author_username": "frame_user",
+            "author_name": "Frame User",
+            "date": "2026-10-25T00:00:00+00:00",
+            "media_url": "https://t.me/channelx/42?comment=98",
+            "file_path": str(video),
+            "size": video.stat().st_size,
+        },
+    )
+    frames = []
+    for position in (1, 2, 3):
+        path = video.with_name(f"frame_{position:02d}.jpg")
+        path.write_bytes(b"\xff\xd8\xff" + f"frame-{position}".encode() * 32)
+        frames.append(
+            {
+                "position": position,
+                "timestamp_seconds": position * 1.0,
+                "file_path": str(path),
+                "size": path.stat().st_size,
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            }
+        )
+    store.telegram.save_frame_set(
+        source_id,
+        98,
+        frame_set_id="frame-set",
+        algorithm_version=1,
+        duration=10.0,
+        video_size=video.stat().st_size,
+        video_mtime_ns=video.stat().st_mtime_ns,
+        frames=frames,
+    )
+    catalog = build_catalog(store)
+    state = WebState(catalog, requester=FakeDaemon())
+    store.close()
+    return catalog, state, source_id, 98
+
+
+def test_web_media_allowlist_serves_exactly_three_published_frames(tmp_path):
+    _catalog, state, _source_id, _message_id = frame_catalog(tmp_path)
+    server = create_web_server(state)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        common = _login(server, state)
+        frame_urls = [
+            url for url in state.media_files if url.endswith(".jpg")
+        ]
+        assert len(frame_urls) == 3
+        for url in frame_urls:
+            status, _headers, payload = request(server, "GET", url, headers=common)
+            assert status == 200
+            assert payload.startswith(b"\xff\xd8\xff")
+        status, _headers, _payload = request(
+            server, "GET", "/media/r0/does-not-exist.jpg", headers=common
+        )
+        assert status == 404
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+@pytest.mark.skipif(
+    shutil.which("chromium") is None or shutil.which("ffmpeg") is None,
+    reason="Chromium/FFmpeg is not installed",
+)
+def test_chromium_displays_frame_thumbnails_and_frame_ai_action(tmp_path):
+    _catalog, state, _source_id, _message_id = frame_catalog(tmp_path)
+    server = create_web_server(state)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    profile = tmp_path / "chromium-frames"
+    command = [
+        str(shutil.which("chromium")),
+        "--headless=new",
+        "--no-sandbox",
+        "--disable-gpu",
+        "--disable-background-networking",
+        f"--user-data-dir={profile}",
+        "--dump-dom",
+    ]
+    try:
+        login = subprocess.run(
+            [*command, state.start_url],
+            capture_output=True,
+            text=True,
+            timeout=40,
+            check=False,
+        )
+        assert login.returncode == 0, login.stderr
+        detail = subprocess.run(
+            [*command, f"{state.origin}/#profile/12345/profiles"],
+            capture_output=True,
+            text=True,
+            timeout=40,
+            check=False,
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+    assert detail.returncode == 0, detail.stderr
+    assert detail.stdout.count('class="frame-thumb"') == 3
+    assert "AI по кадрам" in detail.stdout
+    assert "3 кадра одного видео" in detail.stdout

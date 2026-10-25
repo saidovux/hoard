@@ -248,18 +248,23 @@
     return [...bytes].map((value) => value.toString(16).padStart(2, "0")).join("");
   }
 
-  function operationStorageKey(selector, photoIds) {
+  function operationStorageKey(selector, imageIds, imageMode = "photos", videoIds = {}) {
     const authors = Array.isArray(selector.author_ids)
       ? selector.author_ids.map(Number).filter(validProfileId).sort((a, b) => a - b)
       : [];
-    const photos = Object.fromEntries(Object.keys(photoIds).sort().map((id) => [
-      id, [...photoIds[id]].map(String),
+    const images = Object.fromEntries(Object.keys(imageIds).sort().map((id) => [
+      id, [...imageIds[id]].map(String),
+    ]));
+    const videos = Object.fromEntries(Object.keys(videoIds).sort().map((id) => [
+      id, String(videoIds[id]),
     ]));
     return `hoard.ai.operation:${JSON.stringify({
       authors,
       source_id: Number.isSafeInteger(Number(selector.source_id)) ? Number(selector.source_id) : null,
       source_url: String(selector.source_url || ""),
-      photos,
+      image_mode: String(imageMode || "photos"),
+      images,
+      videos,
     })}`;
   }
 
@@ -340,13 +345,17 @@
   }
 
   function analysisPreview(preview, selector) {
+    const imageMode = String(preview.image_mode || selector.image_mode || "photos");
+    const selectedKey = imageMode === "photos" ? "selected_photo_ids" : "selected_image_ids";
     const {dialog, body} = modal(
       preview.source ? "Профили публикации" :
         (preview.selected_count === 1 ? "Анализ профиля" : "Анализ выбранных профилей"),
     );
+    const modeLabel = imageMode === "frames" ? "3 кадра видеокружка" :
+      (imageMode === "combined" ? "3 кадра + фото профиля" : "фотографии профиля");
     body.append(element(
       "p", "workflow-summary",
-      `Выбрано ${preview.selected_count} · доступно ${preview.photo_count} локальных фото. `
+      `Выбрано ${preview.selected_count} · источник: ${modeLabel}. `
         + "На этом шаге запрос в DeepSeek не выполняется.",
     ));
     if (preview.source) {
@@ -356,20 +365,36 @@
         `${clean(source.channel_title || source.title, `@${source.username}`)} #${source.post_id}`,
       ));
     }
+    if (imageMode !== "photos") {
+      body.append(element(
+        "p", "muted",
+        "Кадры передаются в одном запросе в порядке 20% · 50% · 80%. "
+          + "Другой видеокружок автора можно выбрать из его карточки.",
+      ));
+    }
     const pageLimit = Number(preview.limit || 25);
     const pages = new Map([[Number(preview.offset || 0), preview]]);
     const photoIds = {};
+    const imageIds = {};
     const photoSnapshots = {};
+    const imageSnapshots = {};
+    const videoIds = {};
     let current = preview;
     let photoInputs = [];
     function ingest(page) {
       (page.items || []).forEach((item) => {
-        if (!validProfileId(item.author_id) || !(item.selected_photo_ids || []).length) return;
+        if (!validProfileId(item.author_id)) return;
         const key = String(item.author_id);
-        if (!photoIds[key]) photoIds[key] = [...item.selected_photo_ids].map(String);
-        if (item.photo_snapshot && !photoSnapshots[key]) {
-          photoSnapshots[key] = String(item.photo_snapshot);
+        const selected = (item[selectedKey] || []).map(String);
+        if (!selected.length) return;
+        if (imageMode === "photos") photoIds[key] = [...selected];
+        imageIds[key] = [...selected];
+        const snapshot = String(item.image_snapshot || item.photo_snapshot || "");
+        if (snapshot) {
+          imageSnapshots[key] = snapshot;
+          if (imageMode === "photos") photoSnapshots[key] = snapshot;
         }
+        if (item.video_id && imageMode !== "photos") videoIds[key] = String(item.video_id);
       });
     }
     ingest(preview);
@@ -381,7 +406,8 @@
     async function loadPage(offset) {
       if (!pages.has(offset)) {
         const result = await api("/api/ai/preview", {
-          method: "POST", body: {...selector, limit: pageLimit, offset},
+          method: "POST",
+          body: {...selector, image_mode: imageMode, limit: pageLimit, offset},
         });
         pages.set(offset, result.preview);
         ingest(result.preview);
@@ -398,8 +424,11 @@
         row.append(element(
           "strong", "", clean(item.display_name || item.username, `ID ${item.author_id}`),
         ));
-        row.append(element("span", "muted", `ID ${item.author_id} · ${item.photo_count} фото`));
-        if (preview.selected_count === 1) {
+        const countLabel = imageMode === "photos"
+          ? `${item.photo_count} фото`
+          : `${item.frame_count || 0} кадров${imageMode === "combined" ? " + фото" : ""}`;
+        row.append(element("span", "muted", `ID ${item.author_id} · ${countLabel}`));
+        if (imageMode === "photos" && preview.selected_count === 1) {
           const photos = element("div", "photo-choices");
           const defaults = new Set(photoIds[String(item.author_id)] || []);
           (item.photos || []).filter((photo) => photo.available).forEach((photo) => {
@@ -414,12 +443,21 @@
           });
           row.append(photos);
         }
+        if (imageMode !== "photos" && item.video_id) {
+          const frames = (item.selected_images || [])
+            .filter((image) => image.kind === "frame")
+            .map((image) => `${Number(image.timestamp_seconds || 0).toFixed(2)} с`);
+          row.append(element(
+            "span", "muted",
+            `видео ${item.video_id}` + (frames.length ? ` · ${frames.join(" · ")}` : ""),
+          ));
+        }
         const previous = item.previous;
         if (previous) row.append(element(
           "span", "muted",
           `Предыдущий: ${previous.result_status || previous.attempt_state || "—"}`,
         ));
-        if (!(item.selected_photo_ids || []).length) {
+        if (!(item[selectedKey] || []).length) {
           const reason = item.reason || "Будет пропущен";
           reasons.set(reason, (reasons.get(reason) || 0) + 1);
         }
@@ -446,28 +484,33 @@
     body.append(element(
       "p", "muted",
       "Возрастной допуск 18+ применяется автоматически. Будут отправлены только выбранные "
-        + "локальные фото; запрос DeepSeek может быть платным, автоматического повтора нет.",
+        + "локальные изображения; запрос DeepSeek может быть платным, автоматического повтора нет.",
     ));
     const feedback = element("p", "notice-inline");
-    const count = Number(preview.selected_photo_count || 0);
+    const count = Number(
+      imageMode === "photos" ? preview.selected_photo_count : preview.selected_image_count
+    );
+    const noun = imageMode === "photos" ? "фото" : "изображений";
     const start = element(
-      "button", "primary-action", `Отправить ${count} фото в DeepSeek и запустить анализ`,
+      "button", "primary-action", `Отправить ${count} ${noun} в DeepSeek и запустить анализ`,
     );
     start.type = "button";
     start.addEventListener("click", async () => {
-      if (preview.selected_count === 1) {
+      if (imageMode === "photos" && preview.selected_count === 1) {
         const selected = photoInputs.filter((input) => input.checked).map((input) => input.value);
         if (selected.length < 1 || selected.length > 4) {
           feedback.textContent = "Выбери от одной до четырёх фотографий.";
           return;
         }
         photoIds[String(preview.items[0].author_id)] = selected;
+        imageIds[String(preview.items[0].author_id)] = selected;
         if (JSON.stringify(selected) !== JSON.stringify(preview.items[0].selected_photo_ids || [])) {
           delete photoSnapshots[String(preview.items[0].author_id)];
+          delete imageSnapshots[String(preview.items[0].author_id)];
         }
       }
-      if (!Object.keys(photoIds).length) {
-        feedback.textContent = "Нет подходящих пользовательских профилей с локальными фото.";
+      if (!Object.keys(imageIds).length) {
+        feedback.textContent = "Нет подходящих локальных профилей с изображениями.";
         return;
       }
       start.disabled = true;
@@ -475,13 +518,22 @@
         for (let offset = 0; offset < preview.selected_count; offset += pageLimit) {
           await loadPage(offset);
         }
-        const storageKey = operationStorageKey(selector, photoIds);
+        const storageKey = operationStorageKey(
+          selector,
+          imageMode === "photos" ? photoIds : imageIds,
+          imageMode,
+          videoIds,
+        );
         const result = await api("/api/ai/start", {
           method: "POST",
           body: {
             ...selector,
-            photo_ids: photoIds,
+            image_mode: imageMode,
+            photo_ids: imageMode === "photos" ? photoIds : {},
             photo_snapshots: photoSnapshots,
+            image_ids: imageIds,
+            image_snapshots: imageSnapshots,
+            video_ids: videoIds,
             operation_id: savedOperation(storageKey),
             external_confirmed: true,
           },
@@ -501,19 +553,19 @@
     body.append(feedback, start);
   }
 
-  async function loadAnalysis(selector) {
+  async function loadAnalysis(selector, imageMode = "photos") {
     try {
       const result = await api("/api/ai/preview", {
-        method: "POST", body: {...selector, limit: 25, offset: 0},
+        method: "POST", body: {...selector, image_mode: imageMode, limit: 25, offset: 0},
       });
-      analysisPreview(result.preview, selector);
+      analysisPreview(result.preview, {...selector, image_mode: imageMode});
     } catch (error) {
       showNotice(error.message, true);
     }
   }
 
-  function beginAnalysis(selector) {
-    ensureAI(() => loadAnalysis(selector));
+  function beginAnalysis(selector, imageMode = "photos") {
+    ensureAI(() => loadAnalysis(selector, imageMode));
   }
 
   async function restoreActiveBatch() {
@@ -1210,6 +1262,44 @@
   function videoCard(video, gallery, index) {
     const card = element("div", "media-card");
     card.append(mediaNode(video, "video", "Видеокружок", gallery, index));
+    const frames = (video.frames || []).filter((frame) => frame && frame.available);
+    const frameStatus = clean(video.frame_status, "missing");
+    if (frames.length) {
+      const strip = element("div", "frame-strip");
+      frames.forEach((frame, frameIndex) => {
+        const image = element("img", "frame-thumb");
+        image.loading = "lazy";
+        image.decoding = "async";
+        image.alt = `Кадр ${frame.position}`;
+        image.src = localMediaURL(frame.url);
+        image.title = `Кадр ${frame.position} · ${Number(frame.timestamp_seconds || 0).toFixed(2)} с`;
+        image.addEventListener("click", () => openViewer(frames, frameIndex, `Кадр ${frame.position}`));
+        strip.append(image);
+      });
+      card.append(strip);
+      card.append(element("span", "muted", "3 кадра одного видео: 20% · 50% · 80%"));
+    } else if (frameStatus === "failed" || frameStatus === "stale") {
+      card.append(element(
+        "span", "workflow-reason",
+        frameStatus === "stale"
+          ? "Кадры изменились или неполные; нужно повторное извлечение"
+          : (video.frame_error || "Кадры не извлечены"),
+      ));
+    } else if (frameStatus === "pending" || frameStatus === "running") {
+      card.append(element("span", "muted", "Кадры извлекаются локально…"));
+    }
+    if (interactiveEnabled && validProfileId(video.author_id)) {
+      const actions = element("div", "detail-actions");
+      const analyze = element("button", "secondary", "AI по кадрам");
+      analyze.type = "button";
+      analyze.disabled = frames.length !== 3;
+      analyze.addEventListener("click", () => beginAnalysis(
+        {author_ids: [Number(video.author_id)], video_ids: {[String(video.author_id)]: video.video_id}},
+        "frames",
+      ));
+      actions.append(analyze);
+      card.append(actions);
+    }
     card.append(meta([`комментарий ${video.message_id}`, dateText(video.message_date)]));
     card.append(originalLink(video.comment_url, "Исходный комментарий"));
     return card;
@@ -1321,6 +1411,10 @@
       item.actual_model ? `модель: ${item.actual_model}` : "модель не сохранена",
       item.prompt_version_id ? `prompt: ${item.prompt_version_id}` : "",
       item.schema_version ? `schema v${item.schema_version}` : "",
+      item.image_mode === "frames" || item.image_mode === "combined"
+        ? `кадры видео ${item.video_message_id || "—"}`
+        : "фото профиля",
+      item.image_mode === "combined" ? "3 кадра + фото" : "",
       item.attempt_id ? `attempt: ${item.attempt_id}` : "",
     ]));
     if (item.status === "completed") row.append(pslMetrics(item));
@@ -1359,10 +1453,26 @@
     root.append(heading);
     if (interactiveEnabled && validProfileId(authorId)) {
       const actions = element("div", "detail-actions");
-      const analyze = element("button", "primary-action", "Анализировать профиль");
+      const analyze = element("button", "primary-action", "Анализировать фото профиля");
       analyze.type = "button";
       analyze.addEventListener("click", () => beginAnalysis({author_ids: [Number(authorId)]}));
       actions.append(analyze);
+      if ((profile.video_ids || []).length) {
+        const frameAnalyze = element("button", "secondary", "Анализировать по кадрам");
+        frameAnalyze.type = "button";
+        frameAnalyze.addEventListener(
+          "click", () => beginAnalysis({author_ids: [Number(authorId)]}, "frames")
+        );
+        actions.append(frameAnalyze);
+        if (profilePhotos(profile).length) {
+          const combined = element("button", "secondary", "3 кадра + фото");
+          combined.type = "button";
+          combined.addEventListener(
+            "click", () => beginAnalysis({author_ids: [Number(authorId)]}, "combined")
+          );
+          actions.append(combined);
+        }
+      }
       root.append(actions);
     }
 

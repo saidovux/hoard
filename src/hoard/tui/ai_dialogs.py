@@ -3,15 +3,27 @@
 from __future__ import annotations
 
 import json
+import webbrowser
 from collections import Counter
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 from typing import Any
 
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
-from textual.widgets import Button, Input, Label, Select, SelectionList, Static, TextArea
+from textual.widgets import (
+    Button,
+    Input,
+    Label,
+    OptionList,
+    Select,
+    SelectionList,
+    Static,
+    TextArea,
+)
+from textual.widgets.option_list import Option
 
 from ..ai.config import DEFAULT_DEEPSEEK_MODEL
 
@@ -344,6 +356,100 @@ class TelegramAIDialog(ModalScreen[dict[str, Any] | None]):
         self.dismiss(None)
 
 
+class VideoFramesDialog(ModalScreen[dict[str, Any] | None]):
+    """Inspect one local frame set without starting an external request."""
+
+    BINDINGS = [Binding("escape", "cancel", "Отмена")]
+
+    def __init__(self, details: dict[str, Any] | None, *, video_id: str = "") -> None:
+        super().__init__()
+        self.details = details or {}
+        self.video_id = video_id or str(self.details.get("video_id") or "")
+
+    def compose(self) -> ComposeResult:
+        status = str(self.details.get("status") or "missing")
+        labels = {
+            "missing": "кадры ещё не извлекались",
+            "pending": "ожидает обработки",
+            "running": "извлекаются",
+            "saved": "готовы",
+            "failed": "ошибка обработки",
+            "stale": "требуется повторная обработка",
+        }
+        with VerticalScroll(classes="dialog telegram-frames-dialog"):
+            yield Static(f"Кадры видеокружка {self.video_id or '—'}", classes="dialog-title")
+            yield Static(
+                f"Состояние: {labels.get(status, status)}. "
+                "Извлечение выполняется локально, без AI-запроса.",
+                classes="dialog-message",
+            )
+            if self.details.get("error"):
+                yield Static(str(self.details["error"]), classes="dialog-error")
+            frames = self.details.get("frames") or []
+            if frames:
+                yield Static(
+                    "\n".join(
+                        f"Кадр {item.get('position')} · "
+                        f"{float(item.get('timestamp_seconds') or 0):.2f} с · "
+                        f"{int(item.get('size') or 0)} байт · "
+                        f"{'доступен' if item.get('available') else 'недоступен'}"
+                        for item in frames
+                    ),
+                    classes="table-help",
+                )
+            else:
+                yield Static("Готовых кадров пока нет.", classes="table-help")
+            with Horizontal(classes="dialog-actions"):
+                for item in frames:
+                    yield Button(
+                        f"Открыть кадр {item.get('position')}",
+                        id=f"frames-open-{int(item.get('position') or 0)}",
+                    )
+                yield Button(
+                    "Анализировать кадры",
+                    id="frames-analyze",
+                    variant="primary",
+                    disabled=not bool(self.details.get("valid")),
+                )
+                yield Button("Закрыть", id="frames-close")
+            yield Static(id="frames-error", classes="dialog-error")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        identifier = str(event.button.id)
+        if identifier == "frames-close":
+            self.dismiss(None)
+            return
+        if identifier == "frames-analyze":
+            self.dismiss(
+                {
+                    "analyze": True,
+                    "video_id": self.video_id,
+                    "author_id": self.details.get("author_id"),
+                    "image_snapshot": "",
+                }
+            )
+            return
+        if identifier.startswith("frames-open-"):
+            try:
+                position = int(identifier.rsplit("-", 1)[-1])
+                frame = next(
+                    item
+                    for item in self.details.get("frames") or []
+                    if int(item.get("position") or 0) == position
+                )
+                path = Path(str(frame["file_path"])).resolve(strict=True)
+                opened = webbrowser.open(path.as_uri(), new=2)
+            except (OSError, ValueError, StopIteration):
+                opened = False
+            if not opened:
+                self.query_one("#frames-error", Static).update(
+                    "Не удалось открыть кадр во внешнем просмотрщике"
+                )
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class AIKeyDialog(ModalScreen[str | None]):
     """One-field first-run onboarding; advanced settings stay in the AI workspace."""
 
@@ -396,20 +502,29 @@ class TelegramAnalysisDialog(ModalScreen[dict[str, Any] | None]):
         self.page_limit = max(1, int(preview.get("limit") or 20))
         self.page_offset = max(0, int(preview.get("offset") or 0))
         self.pages: dict[int, dict[str, Any]] = {self.page_offset: preview}
+        self.image_mode = str(preview.get("image_mode") or "photos")
         self.photo_ids: dict[str, list[str]] = {}
         self.photo_snapshots: dict[str, str] = {}
+        self.video_ids: dict[str, str] = {}
+        self.image_snapshots: dict[str, str] = {}
         self._ingest(preview)
 
     def _ingest(self, page: dict[str, Any]) -> None:
         for item in page.get("items") or []:
             author_id = int(item.get("author_id") or 0)
+            if author_id <= 0:
+                continue
+            key = str(author_id)
             selected = [str(value) for value in item.get("selected_photo_ids") or []]
-            if author_id > 0 and selected:
-                key = str(author_id)
+            if selected:
                 self.photo_ids.setdefault(key, selected)
-                snapshot = str(item.get("photo_snapshot") or "")
-                if snapshot:
-                    self.photo_snapshots.setdefault(key, snapshot)
+            snapshot = str(item.get("image_snapshot") or item.get("photo_snapshot") or "")
+            if selected and snapshot:
+                self.photo_snapshots.setdefault(key, snapshot)
+            if snapshot:
+                self.image_snapshots.setdefault(key, snapshot)
+            if item.get("video_id"):
+                self.video_ids.setdefault(key, str(item["video_id"]))
 
     def compose(self) -> ComposeResult:
         source = self.preview.get("source") or {}
@@ -437,7 +552,43 @@ class TelegramAnalysisDialog(ModalScreen[dict[str, Any] | None]):
                     )
                 yield Static(id="analysis-page-label", classes="table-help")
                 yield Static(id="analysis-page-items")
-                if self.single and (self.preview.get("items") or []):
+                if (
+                    self.single
+                    and (self.preview.get("items") or [])
+                    and self.image_mode != "photos"
+                ):
+                    item = self.preview["items"][0]
+                    choices = item.get("videos") or []
+                    if choices:
+                        options = [
+                            (
+                                f"сообщение {choice.get('message_id')} · "
+                                f"{choice.get('message_date') or '—'} · "
+                                f"{choice.get('frame_count') or 3} кадра",
+                                str(choice["video_id"]),
+                            )
+                            for choice in choices
+                        ]
+                        yield Label("Видеокружок (один набор кадров)", classes="field-label")
+                        option_nodes = [
+                            Option(label, id=str(value)) for label, value in options
+                        ]
+                        yield OptionList(*option_nodes, id="analysis-video")
+                    else:
+                        yield Static(
+                            "Нет готовых наборов кадров; профиль будет пропущен.",
+                            classes="dialog-error",
+                        )
+                    yield Static(
+                        "В один запрос будут переданы три кадра одного видео"
+                        + (" и одна фотография профиля." if self.image_mode == "combined" else "."),
+                        classes="table-help",
+                    )
+                if (
+                    self.single
+                    and (self.preview.get("items") or [])
+                    and self.image_mode == "photos"
+                ):
                     item = self.preview["items"][0]
                     yield Label("Фотографии (до четырёх)", classes="field-label")
                     selected = set(item.get("selected_photo_ids") or [])
@@ -470,11 +621,13 @@ class TelegramAnalysisDialog(ModalScreen[dict[str, Any] | None]):
                 yield Button("Страница →", id="analysis-next")
             with Horizontal(classes="dialog-actions"):
                 count = int(
-                    self.preview.get("selected_photo_count")
-                    or sum(len(value) for value in self.photo_ids.values())
-                )
+                    self.preview.get("selected_image_count")
+                    if self.image_mode != "photos"
+                    else self.preview.get("selected_photo_count")
+                ) or sum(len(value) for value in self.photo_ids.values())
+                noun = "изображение" if count == 1 else "изображения"
                 yield Button(
-                    f"Отправить {count} фото в DeepSeek и запустить анализ",
+                    f"Отправить {count} {noun} в DeepSeek и запустить анализ",
                     id="analysis-submit",
                     variant="primary",
                 )
@@ -482,13 +635,25 @@ class TelegramAnalysisDialog(ModalScreen[dict[str, Any] | None]):
 
     def on_mount(self) -> None:
         self._render_page()
+        if self.single and self.query("#analysis-video"):
+            item = (self.preview.get("items") or [None])[0]
+            if item:
+                selected = str(item.get("video_id") or "")
+                chooser = self.query_one("#analysis-video", OptionList)
+                if selected:
+                    index = chooser.get_option_index(selected)
+                    if index is not None:
+                        chooser.highlighted = index
 
-    @staticmethod
-    def _profile_line(item: dict[str, Any]) -> str:
+    def _profile_line(self, item: dict[str, Any]) -> str:
         name = item.get("display_name") or item.get("username") or f"ID {item['author_id']}"
         previous = item.get("previous") or {}
         previous_status = previous.get("result_status") or previous.get("attempt_state")
         suffix = f" · предыдущий: {previous_status}" if previous_status else ""
+        if self.image_mode != "photos":
+            video = f" · видео {item.get('video_id')}" if item.get("video_id") else ""
+            frames = int(item.get("frame_count") or 0)
+            return f"{name} · ID {item['author_id']} · кадры: {frames}{video}{suffix}"
         return f"{name} · ID {item['author_id']} · {item.get('photo_count', 0)} фото{suffix}"
 
     def _render_page(self) -> None:
@@ -499,12 +664,15 @@ class TelegramAnalysisDialog(ModalScreen[dict[str, Any] | None]):
         self.query_one("#analysis-page-label", Static).update(
             f"Профили {start}–{end} из {page.get('selected_count', 0)}"
         )
-        lines = [self._profile_line(item) for item in items if item.get("selected_photo_ids")]
+        selected_key = (
+            "selected_image_ids" if self.image_mode != "photos" else "selected_photo_ids"
+        )
+        lines = [self._profile_line(item) for item in items if item.get(selected_key)]
         self.query_one("#analysis-page-items", Static).update("\n".join(lines))
         reasons = Counter(
             str(item.get("reason") or "будет пропущен")
             for item in items
-            if not item.get("selected_photo_ids")
+            if not item.get(selected_key)
         )
         reason_text = " · ".join(f"{reason}: {count}" for reason, count in reasons.items())
         skipped = int(page.get("skipped_count") or 0)
@@ -515,6 +683,15 @@ class TelegramAnalysisDialog(ModalScreen[dict[str, Any] | None]):
         self.query_one("#analysis-next", Button).disabled = not bool(page.get("has_more"))
 
     def _save_single_selection(self) -> bool:
+        if self.image_mode != "photos":
+            if self.single and self.query("#analysis-video"):
+                chooser = self.query_one("#analysis-video", OptionList)
+                item = (self.preview.get("items") or [None])[0]
+                if item and chooser.highlighted is not None:
+                    selected = chooser.get_option_at_index(chooser.highlighted)
+                    if selected.id:
+                        self.video_ids[str(item["author_id"])] = str(selected.id)
+            return True
         if not self.single or not self.query("#analysis-photos"):
             return True
         item = (self.preview.get("items") or [None])[0]
@@ -555,15 +732,18 @@ class TelegramAnalysisDialog(ModalScreen[dict[str, Any] | None]):
                 await self._load_page(offset)
                 if offset not in self.pages:
                     return
-        if not self.photo_ids:
+        if not self.photo_ids and not self.video_ids:
             self.query_one("#analysis-error", Static).update(
-                "Нет подходящих локальных пользовательских профилей с фотографиями."
+                "Нет подходящих локальных профилей с изображениями."
             )
             return
         self.dismiss(
             {
                 "photo_ids": self.photo_ids,
                 "photo_snapshots": self.photo_snapshots,
+                "image_mode": self.image_mode,
+                "video_ids": self.video_ids,
+                "image_snapshots": self.image_snapshots,
             }
         )
 

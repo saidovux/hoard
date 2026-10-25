@@ -195,7 +195,7 @@ class AIChatService:
         self,
         *,
         author_id: Any,
-        photo_ids: list[Any],
+        photo_ids: list[Any] | None = None,
         content: Any,
         operation_id: Any,
         adult_confirmed: Any,
@@ -203,8 +203,11 @@ class AIChatService:
         prompt_version_id: Any = None,
         provider: Any = None,
         model: Any = None,
+        image_mode: Any = "photos",
+        video_id: Any = None,
+        image_ids: Any = None,
     ) -> dict:
-        """Freeze local Telegram photos and queue one explicitly confirmed paid request."""
+        """Freeze local Telegram images and queue one explicitly confirmed paid request."""
         if self.telegram_storage is None:
             raise ValueError("Telegram-хранилище недоступно")
         try:
@@ -224,13 +227,43 @@ class AIChatService:
             return existing
 
         text = bounded_text(content, field="Запрос")
-        photos = self.telegram_storage.selected_profile_photos(selected_author, photo_ids)
-        if sum(int(item.get("size") or 0) for item in photos) > MAX_MESSAGE_ATTACHMENT_BYTES:
-            raise ValueError("Общий размер выбранных фото превышает 24 MiB")
-        fingerprints, _snapshot = self._photo_fingerprints(photos)
+        mode = self._image_mode(image_mode)
+        selected_video, images, _choices = self._select_images(
+            selected_author,
+            mode,
+            video_id=video_id,
+            photo_ids=photo_ids,
+            image_ids=image_ids,
+        )
+        if not images:
+            raise ValueError("Нет доступных локальных изображений")
+        if sum(int(item.get("size") or 0) for item in images) > MAX_MESSAGE_ATTACHMENT_BYTES:
+            raise ValueError("Общий размер выбранных изображений превышает 24 MiB")
+        fingerprints, image_snapshot = self._image_fingerprints(images)
         inflight = self.storage.inflight_telegram_analysis(selected_author, fingerprints)
         if inflight is not None:
             return inflight
+        if mode != "photos":
+            frame_parts = [
+                f"{int(item['position'])}: {float(item.get('timestamp_seconds') or 0):.2f} с"
+                for item in images
+                if item.get("kind") == "frame"
+            ]
+            if mode == "frames":
+                intro = (
+                    "Изображения 1–3 — кадры одного видеокружка (20%, 50%, 80% "
+                    "длительности), разные моменты одной видеозаписи "
+                    f"({', '.join(frame_parts)}). Не считай их разными людьми или "
+                    "отдельными видео."
+                )
+            else:
+                intro = (
+                    "Изображения 1–3 — кадры одного видеокружка (20%, 50%, 80% "
+                    "длительности), разные моменты одной видеозаписи "
+                    f"({', '.join(frame_parts)}); изображение 4 — сохранённая фотография "
+                    "профиля того же автора. Не смешивай источники."
+                )
+            text = intro + "\n\n" + text
 
         version_id = str(prompt_version_id or "").strip()
         if version_id:
@@ -253,6 +286,12 @@ class AIChatService:
         ).strip()
         if not selected_provider or not selected_model:
             raise ValueError("Укажи провайдера и модель")
+        if mode != "photos":
+            unsupported = ("reasoner", "coder", "text-only", "embedding")
+            if any(token in selected_model.casefold() for token in unsupported):
+                raise ValueError("Выбранная модель не поддерживает изображения")
+            if not self.core.is_configured(selected_provider):
+                raise ValueError("AI-провайдер не подключён; сначала добавь API-ключ")
         config = {
             "provider": selected_provider,
             "model": selected_model,
@@ -269,13 +308,13 @@ class AIChatService:
 
         imported: list[tuple[dict, dict]] = []
         try:
-            for photo in photos:
-                attachment = self.storage.import_attachment(str(photo["file_path"]))
-                imported.append((photo, attachment))
-            if sum(int(attachment["size"]) for _photo, attachment in imported) > (
+            for image in images:
+                attachment = self.storage.import_attachment(str(image["file_path"]))
+                imported.append((image, attachment))
+            if sum(int(attachment["size"]) for _image, attachment in imported) > (
                 MAX_MESSAGE_ATTACHMENT_BYTES
             ):
-                raise ValueError("Общий размер выбранных фото превышает 24 MiB")
+                raise ValueError("Общий размер выбранных изображений превышает 24 MiB")
             timestamp = now_utc()
             analysis_id = new_id()
             attempt_id = new_id()
@@ -286,6 +325,24 @@ class AIChatService:
                 "schema_version": PSL_SCHEMA_VERSION,
                 "author_id": selected_author,
                 "photo_count": len(imported),
+                "image_count": len(imported),
+                "image_mode": mode,
+                "video_id": str(selected_video["video_id"]) if selected_video else "",
+                "video_source_id": (
+                    int(selected_video["source_id"]) if selected_video else None
+                ),
+                "video_message_id": (
+                    int(selected_video["message_id"]) if selected_video else None
+                ),
+                "frame_set_id": (
+                    str(selected_video.get("frame_set_id") or "") if selected_video else ""
+                ),
+                "frame_set_version": (
+                    int(selected_video.get("frame_set_version") or 0)
+                    if selected_video
+                    else 0
+                ),
+                "frame_snapshot": image_snapshot if mode != "photos" else "",
                 "subjective_not_scientific": True,
                 "adult_confirmed": True,
             }
@@ -337,8 +394,10 @@ class AIChatService:
                 )
                 self.storage.db.execute(
                     """INSERT INTO ai_telegram_analyses(id,operation_key,author_id,attempt_id,
-                    prompt_version_id,schema_version,adult_confirmed,created_at)
-                    VALUES(?,?,?,?,?,?,1,?)""",
+                    prompt_version_id,schema_version,adult_confirmed,image_mode,
+                    video_source_id,video_message_id,video_author_id,frame_set_id,
+                    frame_set_version,frame_snapshot,created_at)
+                    VALUES(?,?,?,?,?,?,1,?,?,?,?,?,?,?,?)""",
                     (
                         analysis_id,
                         operation_key,
@@ -346,22 +405,45 @@ class AIChatService:
                         attempt_id,
                         prompt["id"],
                         PSL_SCHEMA_VERSION,
+                        mode,
+                        int(selected_video["source_id"]) if selected_video else None,
+                        int(selected_video["message_id"]) if selected_video else None,
+                        selected_author if selected_video else None,
+                        (
+                            str(selected_video.get("frame_set_id") or "")
+                            if selected_video
+                            else ""
+                        ),
+                        (
+                            int(selected_video.get("frame_set_version") or 0)
+                            if selected_video
+                            else 0
+                        ),
+                        image_snapshot if mode != "photos" else "",
                         timestamp,
                     ),
                 )
-                for position, (photo, attachment) in enumerate(imported):
+                for position, (image, attachment) in enumerate(imported):
                     self.storage.db.execute(
                         """INSERT INTO ai_telegram_analysis_photos(analysis_id,photo_id,
-                        attachment_id,position,source_path,source_sha256,size)
-                        VALUES(?,?,?,?,?,?,?)""",
+                        attachment_id,position,source_path,source_sha256,size,source_kind,
+                        source_id,message_id,frame_position,timestamp_seconds,frame_set_id,
+                        frame_set_version) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                         (
                             analysis_id,
-                            str(photo["photo_id"]),
+                            str(image["image_id"]),
                             attachment["id"],
                             position,
-                            str(photo["file_path"]),
+                            str(image["file_path"]),
                             attachment["sha256"],
                             int(attachment["size"]),
+                            str(image["kind"]),
+                            image.get("source_id"),
+                            image.get("message_id"),
+                            image.get("frame_position"),
+                            image.get("timestamp_seconds"),
+                            str(image.get("frame_set_id") or ""),
+                            int(image.get("frame_set_version") or 0),
                         ),
                     )
                 self.storage.db.execute(
@@ -436,6 +518,204 @@ class AIChatService:
             selection.update(b"\0")
         return fingerprints, selection.hexdigest()
 
+    @staticmethod
+    def _image_mode(value: Any) -> str:
+        mode = str(value or "photos").strip().lower()
+        if mode not in {"photos", "frames", "combined"}:
+            raise ValueError("Источник изображений должен быть photos, frames или combined")
+        return mode
+
+    @staticmethod
+    def _image_fingerprints(
+        images: list[dict[str, Any]],
+    ) -> tuple[list[tuple[str, int]], str]:
+        selection = hashlib.sha256()
+        fingerprints: list[tuple[str, int]] = []
+        for image in images:
+            path = str(image.get("file_path") or "")
+            if not path:
+                raise ValueError("Локальное изображение недоступно")
+            digest = hashlib.sha256()
+            try:
+                with open(path, "rb") as stream:
+                    for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                        digest.update(chunk)
+            except OSError as exc:
+                raise ValueError("Локальное изображение недоступно") from exc
+            value = digest.hexdigest()
+            size = int(image.get("size") or 0)
+            if size <= 0:
+                raise ValueError("Локальное изображение пустое")
+            fingerprints.append((value, size))
+            selection.update(str(image.get("kind") or "").encode("utf-8"))
+            selection.update(str(image.get("image_id") or "").encode("utf-8"))
+            selection.update(str(image.get("position") or "").encode("ascii"))
+            selection.update(str(size).encode("ascii"))
+            selection.update(value.encode("ascii"))
+            selection.update(b"\0")
+        return fingerprints, selection.hexdigest()
+
+    @staticmethod
+    def _public_video_choice(details: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "video_id": str(details["video_id"]),
+            "source_id": int(details["source_id"]),
+            "message_id": int(details["message_id"]),
+            "author_id": int(details.get("author_id") or 0),
+            "message_date": str(details.get("message_date") or ""),
+            "duration": float(details.get("duration") or 0),
+            "frame_set_id": str(details.get("frame_set_id") or ""),
+            "frame_set_version": int(details.get("frame_set_version") or 0),
+            "frames": [
+                {
+                    "position": int(frame.get("position") or 0),
+                    "timestamp_seconds": float(frame.get("timestamp_seconds") or 0),
+                    "size": int(frame.get("size") or 0),
+                }
+                for frame in details.get("frames") or []
+            ],
+        }
+
+    def _select_images(
+        self,
+        author_id: int,
+        image_mode: Any,
+        *,
+        video_id: Any = None,
+        photo_ids: Any = None,
+        image_ids: Any = None,
+    ) -> tuple[dict[str, Any] | None, list[dict[str, Any]], list[dict[str, Any]]]:
+        """Resolve only local images; never substitutes another person's files."""
+        if self.telegram_storage is None:
+            raise ValueError("Telegram-хранилище недоступно")
+        mode = self._image_mode(image_mode)
+        author = int(author_id)
+        if mode == "photos":
+            requested = (
+                [str(value) for value in photo_ids]
+                if isinstance(photo_ids, list)
+                else ([str(value) for value in image_ids] if isinstance(image_ids, list) else None)
+            )
+            if requested is not None:
+                selected = self.telegram_storage.selected_profile_photos(author, requested)
+            else:
+                selected = [
+                    item
+                    for item in self.telegram_storage.profile_photos(
+                        author, include_path=True
+                    )
+                    if item.get("available")
+                ][:4]
+            if not selected:
+                raise ValueError("Нет доступных локальных фотографий профиля")
+            return (
+                None,
+                [
+                    {
+                        "image_id": str(photo["photo_id"]),
+                        "kind": "profile_photo",
+                        "photo_id": str(photo["photo_id"]),
+                        "file_path": str(photo["file_path"]),
+                        "size": int(photo.get("size") or 0),
+                        "position": position,
+                    }
+                    for position, photo in enumerate(selected, start=1)
+                ],
+                [],
+            )
+
+        options = self.telegram_storage.video_frame_options(author)
+        if not options:
+            raise ValueError("Нет готового набора кадров этого профиля")
+        selected_video = options[0]
+        requested_video = str(video_id or "").strip()
+        if requested_video:
+            selected_video = next(
+                (item for item in options if str(item["video_id"]) == requested_video),
+                None,
+            )
+            if selected_video is None:
+                raise ValueError(
+                    "Выбранный видеокружок не принадлежит профилю или кадры не готовы"
+                )
+        raw_ids = (
+            [str(value) for value in image_ids] if isinstance(image_ids, list) else []
+        )
+        frame_ids = [value for value in raw_ids if value.startswith("frame:")]
+        photo_selected_ids = [value for value in raw_ids if not value.startswith("frame:")]
+        if mode == "frames":
+            details = self.telegram_storage.selected_video_frames(
+                author,
+                str(selected_video["video_id"]),
+                frame_ids or None,
+            )
+            selected_photos: list[dict[str, Any]] = []
+        else:
+            details = self.telegram_storage.selected_video_frames(
+                author,
+                str(selected_video["video_id"]),
+                frame_ids or None,
+            )
+            available_photos = [
+                item
+                for item in self.telegram_storage.profile_photos(author, include_path=True)
+                if item.get("available")
+            ]
+            if not available_photos:
+                raise ValueError("Для комбинированного режима нет фотографии профиля")
+            if photo_selected_ids:
+                if len(photo_selected_ids) != 1:
+                    raise ValueError("В комбинированном режиме допускается одно фото профиля")
+                selected_photos = self.telegram_storage.selected_profile_photos(
+                    author, photo_selected_ids
+                )
+            elif isinstance(photo_ids, list) and photo_ids:
+                selected_photos = self.telegram_storage.selected_profile_photos(
+                    author, [str(photo_ids[0])]
+                )
+            else:
+                selected_photos = [available_photos[0]]
+        images: list[dict[str, Any]] = []
+        for position, frame in enumerate(details["frames"], start=1):
+            if not frame.get("file_path"):
+                raise ValueError("Файл кадра недоступен")
+            images.append(
+                {
+                    "image_id": str(frame["image_id"]),
+                    "kind": "frame",
+                    "file_path": str(frame["file_path"]),
+                    "size": int(frame.get("size") or 0),
+                    "sha256": str(frame.get("sha256") or ""),
+                    "position": position,
+                    "source_id": int(details["source_id"]),
+                    "message_id": int(details["message_id"]),
+                    "frame_position": int(frame["position"]),
+                    "timestamp_seconds": float(frame.get("timestamp_seconds") or 0),
+                    "frame_set_id": str(details.get("frame_set_id") or ""),
+                    "frame_set_version": int(details.get("frame_set_version") or 0),
+                    "video_id": str(details["video_id"]),
+                }
+            )
+        for photo in selected_photos:
+            images.append(
+                {
+                    "image_id": str(photo["photo_id"]),
+                    "kind": "profile_photo",
+                    "photo_id": str(photo["photo_id"]),
+                    "file_path": str(photo["file_path"]),
+                    "size": int(photo.get("size") or 0),
+                    "position": len(images) + 1,
+                    "source_id": int(details["source_id"]),
+                    "message_id": int(details["message_id"]),
+                    "video_id": str(details["video_id"]),
+                }
+            )
+        if len(images) not in {3, 4}:
+            raise ValueError("Для анализа нужны три кадра или три кадра и одно фото")
+        public_video = self._public_video_choice(details)
+        choices = [self._public_video_choice(item) for item in options]
+        return public_video, images, choices
+
     def _telegram_psl_candidates(
         self,
         *,
@@ -445,6 +725,10 @@ class AIChatService:
         photo_ids: Any = None,
         photo_snapshots: Any = None,
         confirmed_author_ids: Any = None,
+        image_mode: Any = "photos",
+        video_ids: Any = None,
+        image_ids: Any = None,
+        image_snapshots: Any = None,
     ) -> tuple[list[dict[str, Any]], int | None]:
         """Resolve and validate an entirely local selection without provider calls."""
         if self.telegram_storage is None:
@@ -462,97 +746,132 @@ class AIChatService:
             identifiers = self._author_ids(author_ids)
         previous_by_author = self.storage.latest_telegram_analyses(identifiers)
         include_photo_details = len(identifiers) == 1
+        mode = self._image_mode(image_mode)
         raw_photo_map = photo_ids if isinstance(photo_ids, dict) else {}
-        raw_snapshot_map = photo_snapshots if isinstance(photo_snapshots, dict) else {}
+        raw_video_map = video_ids if isinstance(video_ids, dict) else {}
+        raw_image_map = image_ids if isinstance(image_ids, dict) else {}
+        raw_snapshot_map = image_snapshots if isinstance(image_snapshots, dict) else {}
+        legacy_snapshot_map = photo_snapshots if isinstance(photo_snapshots, dict) else {}
         candidates: list[dict[str, Any]] = []
         for author_id in identifiers:
+            stored_photos: list[dict[str, Any]] = []
+            if author_id > 0:
+                try:
+                    stored_photos = self.telegram_storage.profile_photos(
+                        author_id, include_path=True
+                    )
+                except ValueError:
+                    stored_photos = []
+            available = [item for item in stored_photos if item.get("available")]
+            base = {
+                "author_id": author_id,
+                "display_name": "",
+                "username": "",
+                "photos": [],
+                "videos": [],
+                "selected_photo_ids": [],
+                "selected_image_ids": [],
+                "selected_images": [],
+                "photo_snapshot": "",
+                "image_snapshot": "",
+                "photo_count": len(available),
+                "image_count": 0,
+                "frame_count": 0,
+                "video_count": 0,
+                "image_mode": mode,
+                "video_id": "",
+                "adult_confirmed": author_id > 0,
+                "ready": False,
+                "reason": "",
+                "previous": previous_by_author.get(author_id),
+            }
             if author_id <= 0:
-                candidates.append(
-                    {
-                        "author_id": author_id,
-                        "display_name": "",
-                        "username": "",
-                        "photos": [],
-                        "selected_photo_ids": [],
-                        "photo_snapshot": "",
-                        "photo_count": 0,
-                        "adult_confirmed": False,
-                        "ready": False,
-                        "reason": "Это канал или чат, а не профиль человека",
-                        "previous": None,
-                    }
-                )
+                base["adult_confirmed"] = False
+                base["reason"] = "Это канал или чат, а не профиль человека"
+                candidates.append(base)
                 continue
             try:
                 profile = self.telegram_storage.get_profile_identity(author_id)
             except ValueError:
-                # Explicit IDs are never expanded or replaced by usernames.
-                candidates.append(
-                    {
-                        "author_id": author_id,
-                        "display_name": "",
-                        "username": "",
-                        "photos": [],
-                        "selected_photo_ids": [],
-                        "photo_count": 0,
-                        "photo_snapshot": "",
-                        "adult_confirmed": True,
-                        "ready": False,
-                        "reason": "Профиль не найден в локальном архиве",
-                        "previous": None,
-                    }
-                )
+                base["reason"] = "Профиль не найден в локальном архиве"
+                candidates.append(base)
                 continue
-            stored_photos = self.telegram_storage.profile_photos(
-                author_id, include_path=True
-            )
-            available = [item for item in stored_photos if item.get("available")]
+            base["display_name"] = str(profile.get("display_name") or "")
+            base["username"] = str(profile.get("current_username") or "")
             requested = raw_photo_map.get(str(author_id), raw_photo_map.get(author_id))
+            requested_video = raw_video_map.get(str(author_id), raw_video_map.get(author_id))
+            requested_images = raw_image_map.get(str(author_id), raw_image_map.get(author_id))
             expected_snapshot = str(
-                raw_snapshot_map.get(str(author_id), raw_snapshot_map.get(author_id, "")) or ""
+                raw_snapshot_map.get(
+                    str(author_id),
+                    raw_snapshot_map.get(author_id, legacy_snapshot_map.get(str(author_id), "")),
+                )
+                or ""
             )
             reason = ""
-            selected: list[dict[str, Any]] = []
-            if requested is not None:
-                if not isinstance(requested, list):
-                    reason = "Список фотографий профиля имеет неверный формат"
-                else:
-                    try:
-                        selected = self.telegram_storage.selected_profile_photos(
-                            author_id, requested
-                        )
-                    except ValueError as exc:
-                        reason = (
-                            "Фото изменились после предпросмотра"
-                            if expected_snapshot
-                            else str(exc)
-                        )
-            else:
-                selected = available[:MAX_MESSAGE_ATTACHMENTS]
-            if not selected and not reason:
-                reason = "Нет доступных локальных фотографий"
-            if selected and sum(int(item.get("size") or 0) for item in selected) > (
+            mismatch_message = (
+                "Фото изменились после предпросмотра"
+                if mode == "photos"
+                else "Изображения изменились после предпросмотра"
+            )
+            video: dict[str, Any] | None = None
+            images: list[dict[str, Any]] = []
+            choices: list[dict[str, Any]] = []
+            try:
+                video, images, choices = self._select_images(
+                    author_id,
+                    mode,
+                    video_id=requested_video,
+                    photo_ids=requested,
+                    image_ids=requested_images,
+                )
+                _fingerprints, snapshot = self._image_fingerprints(images)
+                if expected_snapshot and snapshot != expected_snapshot:
+                    raise ValueError(mismatch_message)
+            except (OSError, ValueError) as exc:
+                reason = (
+                    mismatch_message
+                    if expected_snapshot and not str(exc).startswith(mismatch_message)
+                    else str(exc) or "Локальные изображения недоступны"
+                )
+                video = None
+                images = []
+                choices = []
+            if not images and not reason:
+                reason = "Нет доступных локальных изображений"
+            if images and sum(int(item.get("size") or 0) for item in images) > (
                 MAX_MESSAGE_ATTACHMENT_BYTES
             ):
-                selected = []
-                reason = "Фотографии превышают лимит 24 MiB на запрос"
+                images = []
+                reason = "Изображения превышают лимит 24 MiB на запрос"
+            if len(images) > MAX_MESSAGE_ATTACHMENTS:
+                images = []
+                reason = "В одном запросе допускается не более четырёх изображений"
             snapshot = ""
-            if selected and not reason:
+            if images and not reason:
                 try:
-                    _fingerprints, snapshot = self._photo_fingerprints(selected)
-                except OSError:
-                    selected = []
+                    _fingerprints, snapshot = self._image_fingerprints(images)
+                except (OSError, ValueError):
+                    images = []
                     reason = (
-                        "Фото изменились после предпросмотра"
+                        mismatch_message
                         if expected_snapshot
-                        else "Локальные фотографии недоступны"
+                        else "Локальные изображения недоступны"
                     )
-                if expected_snapshot and snapshot != expected_snapshot:
-                    selected = []
-                    snapshot = ""
-                    reason = "Фото изменились после предпросмотра"
-            adult_confirmed = True
-            photos = (
+            frames = [item for item in images if item.get("kind") == "frame"]
+            selected_ids = [str(item["image_id"]) for item in images]
+            public_images = [
+                {
+                    "image_id": str(item["image_id"]),
+                    "kind": str(item["kind"]),
+                    "position": int(item.get("position") or 0),
+                    "size": int(item.get("size") or 0),
+                    "timestamp_seconds": item.get("timestamp_seconds"),
+                    "video_id": str(item.get("video_id") or ""),
+                }
+                for item in images
+            ]
+            photo_details = (
                 [
                     {
                         "photo_id": str(item["photo_id"]),
@@ -565,21 +884,28 @@ class AIChatService:
                 if include_photo_details
                 else []
             )
-            candidates.append(
+            base.update(
                 {
-                    "author_id": author_id,
-                    "display_name": str(profile.get("display_name") or ""),
-                    "username": str(profile.get("current_username") or ""),
-                    "photos": photos,
-                    "selected_photo_ids": [str(item["photo_id"]) for item in selected],
-                    "photo_snapshot": snapshot,
-                    "photo_count": len(available),
-                    "adult_confirmed": adult_confirmed,
-                    "ready": bool(selected and adult_confirmed and not reason),
+                    "photos": photo_details,
+                    "videos": choices if include_photo_details else [],
+                    "selected_photo_ids": (
+                        selected_ids if mode == "photos" else []
+                    ),
+                    "selected_image_ids": (
+                        selected_ids if mode != "photos" else []
+                    ),
+                    "selected_images": public_images if include_photo_details else [],
+                    "photo_snapshot": snapshot if mode == "photos" else "",
+                    "image_snapshot": snapshot if mode != "photos" else "",
+                    "image_count": len(images),
+                    "frame_count": len(frames),
+                    "video_count": len(choices),
+                    "video_id": str(video["video_id"]) if video else "",
+                    "ready": bool(images and not reason),
                     "reason": reason,
-                    "previous": previous_by_author.get(author_id),
                 }
             )
+            candidates.append(base)
         return candidates, selected_source
 
     def preview_telegram_psl_batch(self, values: dict[str, Any]) -> dict[str, Any]:
@@ -590,6 +916,10 @@ class AIChatService:
             photo_ids=values.get("photo_ids"),
             photo_snapshots=values.get("photo_snapshots"),
             confirmed_author_ids=values.get("confirmed_author_ids"),
+            image_mode=values.get("image_mode", "photos"),
+            video_ids=values.get("video_ids"),
+            image_ids=values.get("image_ids"),
+            image_snapshots=values.get("image_snapshots"),
         )
         if not candidates:
             raise ValueError("В выбранной публикации нет сохранённых локальных профилей")
@@ -607,10 +937,18 @@ class AIChatService:
         return {
             "source": source,
             "selected_count": len(candidates),
+            "image_mode": self._image_mode(values.get("image_mode", "photos")),
             "photo_count": sum(int(item["photo_count"]) for item in candidates),
             "selected_photo_count": sum(
                 len(item["selected_photo_ids"]) for item in candidates
             ),
+            "image_count": sum(int(item["image_count"]) for item in candidates),
+            "selected_image_count": sum(
+                len(item["selected_image_ids"]) or len(item["selected_photo_ids"])
+                for item in candidates
+            ),
+            "frame_count": sum(int(item["frame_count"]) for item in candidates),
+            "video_count": sum(int(item["video_count"]) for item in candidates),
             "ready_count": sum(1 for item in candidates if item["ready"]),
             "skipped_count": sum(1 for item in candidates if not item["ready"]),
             "items": page,
@@ -636,17 +974,36 @@ class AIChatService:
             photo_ids=values.get("photo_ids"),
             photo_snapshots=values.get("photo_snapshots"),
             confirmed_author_ids=values.get("confirmed_author_ids"),
+            image_mode=values.get("image_mode", "photos"),
+            video_ids=values.get("video_ids"),
+            image_ids=values.get("image_ids"),
+            image_snapshots=values.get("image_snapshots"),
         )
         if not candidates:
             raise ValueError("В выбранной публикации нет сохранённых локальных профилей")
+        mode = self._image_mode(values.get("image_mode", "photos"))
         items = [
             {
                 "author_id": item["author_id"],
                 "state": "pending" if item["ready"] else "skipped",
                 "reason": "" if item["ready"] else item["reason"],
-                "photo_count": len(item["selected_photo_ids"]),
-                "photo_ids": item["selected_photo_ids"],
-                "photo_snapshot": item["photo_snapshot"],
+                "photo_count": len(
+                    item["selected_photo_ids"]
+                    if mode == "photos"
+                    else item["selected_image_ids"]
+                ),
+                "photo_ids": (
+                    item["selected_photo_ids"]
+                    if mode == "photos"
+                    else item["selected_image_ids"]
+                ),
+                "photo_snapshot": (
+                    item["photo_snapshot"]
+                    if mode == "photos"
+                    else item["image_snapshot"]
+                ),
+                "image_mode": item["image_mode"],
+                "video_id": item.get("video_id") or "",
             }
             for item in candidates
         ]
@@ -662,6 +1019,7 @@ class AIChatService:
                 "prompt_version_id": values.get("prompt_version_id"),
                 "provider": values.get("provider"),
                 "model": values.get("model"),
+                "image_mode": mode,
             },
         )
         await self.resume_telegram_psl_batch(str(batch["id"]))
@@ -678,14 +1036,24 @@ class AIChatService:
         content = str(request.get("content") or "").strip() or (
             "Analyze these explicitly selected local images using the PSL contract."
         )
+        mode = self._image_mode(request.get("image_mode", "photos"))
         for item in self.storage.pending_telegram_batch_items(batch_id):
             await asyncio.sleep(0)
-            photo_ids = list(item.get("photo_ids") or [])
+            item_mode = self._image_mode(item.get("image_mode") or mode)
+            image_ids = list(item.get("photo_ids") or [])
             candidate_args: dict[str, Any] = {
                 "author_ids": [int(item["author_id"])],
+                "image_mode": item_mode,
+                "video_ids": {
+                    str(item["author_id"]): str(item.get("video_id") or "")
+                },
+                "image_ids": {str(item["author_id"]): image_ids},
+                "image_snapshots": {
+                    str(item["author_id"]): str(item.get("photo_snapshot") or "")
+                },
             }
-            if photo_ids:
-                candidate_args["photo_ids"] = {str(item["author_id"]): photo_ids}
+            if item_mode == "photos":
+                candidate_args["photo_ids"] = {str(item["author_id"]): image_ids}
                 candidate_args["photo_snapshots"] = {
                     str(item["author_id"]): str(item.get("photo_snapshot") or "")
                 }
@@ -696,11 +1064,18 @@ class AIChatService:
                     batch_id, int(item["author_id"]), str(candidate["reason"])
                 )
                 continue
-            photo_ids = list(candidate["selected_photo_ids"])
+            selected_ids = list(
+                candidate["selected_photo_ids"]
+                if item_mode == "photos"
+                else candidate["selected_image_ids"]
+            )
             try:
                 analysis = self.queue_telegram_psl(
                     author_id=item["author_id"],
-                    photo_ids=photo_ids,
+                    photo_ids=None,
+                    image_ids=selected_ids,
+                    image_mode=item_mode,
+                    video_id=item.get("video_id") or None,
                     content=content,
                     operation_id=f"batch:{operation}:{item['author_id']}",
                     adult_confirmed=True,
@@ -1100,7 +1475,9 @@ class AIChatService:
                     self.storage.db.execute(
                         """INSERT INTO ai_telegram_analyses(id,operation_key,root_analysis_id,
                         author_id,attempt_id,prompt_version_id,schema_version,adult_confirmed,
-                        created_at) VALUES(?,?,?,?,?,?,?,1,?)""",
+                        image_mode,video_source_id,video_message_id,video_author_id,
+                        frame_set_id,frame_set_version,frame_snapshot,created_at)
+                        VALUES(?,?,?,?,?,?,?,1,?,?,?,?,?,?,?,?)""",
                         (
                             new_analysis_id,
                             operation_key,
@@ -1109,13 +1486,24 @@ class AIChatService:
                             new_attempt,
                             original_analysis["prompt_version_id"],
                             original_analysis["schema_version"],
+                            str(original_analysis.get("image_mode") or "photos"),
+                            original_analysis.get("video_source_id"),
+                            original_analysis.get("video_message_id"),
+                            original_analysis.get("video_author_id"),
+                            str(original_analysis.get("frame_set_id") or ""),
+                            int(original_analysis.get("frame_set_version") or 0),
+                            str(original_analysis.get("frame_snapshot") or ""),
                             timestamp,
                         ),
                     )
                     self.storage.db.execute(
                         """INSERT INTO ai_telegram_analysis_photos(
-                        analysis_id,photo_id,attachment_id,position,source_path,source_sha256,size)
-                        SELECT ?,photo_id,attachment_id,position,source_path,source_sha256,size
+                        analysis_id,photo_id,attachment_id,position,source_path,source_sha256,size,
+                        source_kind,source_id,message_id,frame_position,timestamp_seconds,
+                        frame_set_id,frame_set_version)
+                        SELECT ?,photo_id,attachment_id,position,source_path,source_sha256,size,
+                        source_kind,source_id,message_id,frame_position,timestamp_seconds,
+                        frame_set_id,frame_set_version
                         FROM ai_telegram_analysis_photos WHERE analysis_id=?""",
                         (new_analysis_id, original_analysis["id"]),
                     )

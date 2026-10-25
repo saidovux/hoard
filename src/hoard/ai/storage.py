@@ -15,7 +15,7 @@ from .models import AIImage, AIUsage
 from .pricing import CostEstimate, decimal_text
 from .psl import DEFAULT_PSL_INSTRUCTIONS, PSL_JSON_SCHEMA, psl_failure_category
 
-AI_SCHEMA_VERSION = 4
+AI_SCHEMA_VERSION = 5
 MAX_TEXT_BYTES = 32 * 1024
 MAX_NAME_BYTES = 300
 MAX_PAGE = 100
@@ -255,6 +255,13 @@ class AIStorage:
                 prompt_version_id TEXT NOT NULL REFERENCES ai_prompt_versions(id),
                 schema_version INTEGER NOT NULL,
                 adult_confirmed INTEGER NOT NULL CHECK(adult_confirmed=1),
+                image_mode TEXT NOT NULL DEFAULT 'photos',
+                video_source_id INTEGER,
+                video_message_id INTEGER,
+                video_author_id INTEGER,
+                frame_set_id TEXT NOT NULL DEFAULT '',
+                frame_set_version INTEGER NOT NULL DEFAULT 0,
+                frame_snapshot TEXT NOT NULL DEFAULT '',
                 result_status TEXT CHECK(result_status IS NULL OR result_status IN
                     ('completed','insufficient_data','ineligible','invalid_result')),
                 presentation TEXT CHECK(presentation IS NULL OR presentation IN
@@ -275,6 +282,13 @@ class AIStorage:
                 source_path TEXT NOT NULL,
                 source_sha256 TEXT NOT NULL,
                 size INTEGER NOT NULL,
+                source_kind TEXT NOT NULL DEFAULT 'profile_photo',
+                source_id INTEGER,
+                message_id INTEGER,
+                frame_position INTEGER,
+                timestamp_seconds REAL,
+                frame_set_id TEXT NOT NULL DEFAULT '',
+                frame_set_version INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY(analysis_id, photo_id),
                 UNIQUE(analysis_id, position)
             );
@@ -295,6 +309,8 @@ class AIStorage:
                 photo_count INTEGER NOT NULL DEFAULT 0,
                 photo_ids TEXT NOT NULL DEFAULT '[]',
                 photo_snapshot TEXT NOT NULL DEFAULT '',
+                image_mode TEXT NOT NULL DEFAULT 'photos',
+                video_id TEXT NOT NULL DEFAULT '',
                 technical_failed INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY(batch_id, author_id)
             );
@@ -360,6 +376,52 @@ class AIStorage:
                 """ALTER TABLE ai_telegram_batch_items
                 ADD COLUMN technical_failed INTEGER NOT NULL DEFAULT 0"""
             )
+        if "image_mode" not in item_columns:
+            self.db.execute(
+                """ALTER TABLE ai_telegram_batch_items
+                ADD COLUMN image_mode TEXT NOT NULL DEFAULT 'photos'"""
+            )
+        if "video_id" not in item_columns:
+            self.db.execute(
+                """ALTER TABLE ai_telegram_batch_items
+                ADD COLUMN video_id TEXT NOT NULL DEFAULT ''"""
+            )
+        analysis_columns = {
+            str(row["name"])
+            for row in self.db.execute("PRAGMA table_info(ai_telegram_analyses)")
+        }
+        analysis_additions = {
+            "image_mode": "TEXT NOT NULL DEFAULT 'photos'",
+            "video_source_id": "INTEGER",
+            "video_message_id": "INTEGER",
+            "video_author_id": "INTEGER",
+            "frame_set_id": "TEXT NOT NULL DEFAULT ''",
+            "frame_set_version": "INTEGER NOT NULL DEFAULT 0",
+            "frame_snapshot": "TEXT NOT NULL DEFAULT ''",
+        }
+        for name, declaration in analysis_additions.items():
+            if name not in analysis_columns:
+                self.db.execute(
+                    f"ALTER TABLE ai_telegram_analyses ADD COLUMN {name} {declaration}"
+                )
+        photo_columns = {
+            str(row["name"])
+            for row in self.db.execute("PRAGMA table_info(ai_telegram_analysis_photos)")
+        }
+        photo_additions = {
+            "source_kind": "TEXT NOT NULL DEFAULT 'profile_photo'",
+            "source_id": "INTEGER",
+            "message_id": "INTEGER",
+            "frame_position": "INTEGER",
+            "timestamp_seconds": "REAL",
+            "frame_set_id": "TEXT NOT NULL DEFAULT ''",
+            "frame_set_version": "INTEGER NOT NULL DEFAULT 0",
+        }
+        for name, declaration in photo_additions.items():
+            if name not in photo_columns:
+                self.db.execute(
+                    f"ALTER TABLE ai_telegram_analysis_photos ADD COLUMN {name} {declaration}"
+                )
         self.db.execute(
             """INSERT INTO schema_versions(module,version) VALUES('ai',?)
             ON CONFLICT(module) DO UPDATE SET
@@ -1127,7 +1189,9 @@ class AIStorage:
         result["photos"] = [
             dict(photo)
             for photo in self.db.execute(
-                """SELECT photo_id,attachment_id,position,source_sha256,size
+                """SELECT photo_id,attachment_id,position,source_sha256,size,
+                source_kind,source_id,message_id,frame_position,timestamp_seconds,
+                frame_set_id,frame_set_version
                 FROM ai_telegram_analysis_photos WHERE analysis_id=? ORDER BY position""",
                 (str(analysis_id),),
             )
@@ -1196,8 +1260,9 @@ class AIStorage:
             for item in items:
                 self.db.execute(
                     """INSERT INTO ai_telegram_batch_items(
-                    batch_id,author_id,state,reason,photo_count,photo_ids,photo_snapshot)
-                    VALUES(?,?,?,?,?,?,?)""",
+                    batch_id,author_id,state,reason,photo_count,photo_ids,photo_snapshot,
+                    image_mode,video_id)
+                    VALUES(?,?,?,?,?,?,?,?,?)""",
                     (
                         batch_id,
                         int(item["author_id"]),
@@ -1206,6 +1271,8 @@ class AIStorage:
                         int(item.get("photo_count") or 0),
                         self._json(item.get("photo_ids") or []),
                         str(item.get("photo_snapshot") or ""),
+                        str(item.get("image_mode") or "photos"),
+                        str(item.get("video_id") or ""),
                     ),
                 )
         return self.telegram_batch(batch_id)
@@ -1254,7 +1321,8 @@ class AIStorage:
     def pending_telegram_batch_items(self, batch_id: str) -> list[dict[str, Any]]:
         rows = []
         for row in self.db.execute(
-            """SELECT author_id,photo_ids,photo_snapshot FROM ai_telegram_batch_items
+            """SELECT author_id,photo_ids,photo_snapshot,image_mode,video_id
+            FROM ai_telegram_batch_items
             WHERE batch_id=? AND state='pending' AND technical_failed=0 ORDER BY author_id""",
             (str(batch_id),),
         ):
@@ -1316,7 +1384,8 @@ class AIStorage:
             for item in self.db.execute(
                 """SELECT i.batch_id,i.author_id,i.analysis_id,
                 CASE WHEN i.technical_failed=1 THEN 'failed' ELSE i.state END AS item_state,
-                i.reason,i.photo_count,p.display_name,p.current_username,
+                i.reason,i.photo_count,i.image_mode,i.video_id,
+                p.display_name,p.current_username,
                 a.result_status,a.presentation,a.estimated_age,a.raw_psl_min,a.raw_psl_max,
                 a.boosted_psl,t.id AS attempt_id,t.state AS attempt_state,t.error_code,
                 t.estimated_cost,t.cost_currency,t.cost_status,t.requested_model,t.actual_model
@@ -1348,7 +1417,12 @@ class AIStorage:
             else None
         )
         result = dict(row)
-        result.pop("request_payload", None)
+        raw_request = self._decode(str(result.pop("request_payload", "") or "{}"))
+        result["image_mode"] = (
+            str(raw_request.get("image_mode") or "photos")
+            if isinstance(raw_request, dict)
+            else "photos"
+        )
         result.update(
             {
                 "items": page,
@@ -1470,7 +1544,9 @@ class AIStorage:
             dict(row)
             for row in self.db.execute(
                 """SELECT a.id,a.author_id,a.attempt_id,a.prompt_version_id,
-                a.schema_version,a.result_status,a.presentation,a.estimated_age,
+                a.schema_version,a.image_mode,a.video_source_id,a.video_message_id,
+                a.video_author_id,a.frame_set_id,a.frame_set_version,
+                a.result_status,a.presentation,a.estimated_age,
                 a.raw_psl_min,a.raw_psl_max,a.boosted_psl,
                 COALESCE(a.actual_model,t.actual_model) AS actual_model,
                 a.analyzed_at,a.created_at,t.state AS attempt_state,t.error_code,

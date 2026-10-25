@@ -754,7 +754,7 @@ def test_ai_schema_is_idempotent_and_preserves_existing_telegram_rows(tmp_path):
     ] == "value"
     assert second.db.execute(
         "SELECT version FROM schema_versions WHERE module='ai'"
-    ).fetchone()[0] == 4
+    ).fetchone()[0] == 5
     second.close()
 
 

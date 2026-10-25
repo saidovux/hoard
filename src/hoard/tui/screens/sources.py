@@ -35,6 +35,8 @@ class SourcesScreen(WorkspaceScreen):
             yield Button("Проверить выбранный", id="source-scan")
             yield Button("Проверить все", id="source-scan-all")
             yield Button("Анализировать профили", id="source-ai")
+            yield Button("AI: кадры", id="source-ai-frames")
+            yield Button("AI: кадры + фото", id="source-ai-combined")
         yield Static(
             "Enter — изменить · a — добавить · e — изменить · s — проверить выбранный",
             classes="table-help",
@@ -107,17 +109,22 @@ class SourcesScreen(WorkspaceScreen):
             "source-scan": self.action_scan_source,
             "source-scan-all": self._scan_all,
             "source-ai": self._analyze_profiles,
+            "source-ai-frames": lambda: self._analyze_profiles("frames"),
+            "source-ai-combined": lambda: self._analyze_profiles("combined"),
         }
         action = actions.get(str(event.button.id))
         if action:
             action()
 
-    def _analyze_profiles(self) -> None:
+    def _analyze_profiles(self, image_mode: str = "photos") -> None:
         source_id = self.selected_source_id
         if source_id is None:
             self.hoard_app.set_notice("Сначала выбери публикацию.", error=True)
             return
-        self.hoard_app.open_telegram_analysis({"source_id": source_id})
+        selector: dict[str, Any] = {"source_id": source_id}
+        if image_mode != "photos":
+            selector["image_mode"] = image_mode
+        self.hoard_app.open_telegram_analysis(selector)
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         if event.data_table.id == "sources-table" and self.selected_source_id is not None:

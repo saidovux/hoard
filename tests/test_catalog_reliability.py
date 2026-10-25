@@ -528,3 +528,41 @@ async def test_explicit_report_retry_bypasses_backoff(tmp_path):
         "SELECT state FROM jobs WHERE id=?", (job_id,)
     ).fetchone()[0] == "queued"
     store.close()
+
+
+async def test_ai_catalog_change_is_scheduled_after_existing_cooldown(tmp_path, monkeypatch):
+    store = Store(tmp_path / "cooldown.sqlite", migrate_legacy=False)
+    archive = tmp_path / "cooldown-archive"
+    store.telegram.archive_root(archive, persist=True)
+    store.telegram.set_catalog_dirty(False)
+    store.telegram.record_catalog_report_success()
+    service = Service(store=store, engine=FakeEngine())
+    built = threading.Event()
+
+    async def finish_analysis(_attempt_id: str) -> str:
+        store.telegram.observe_profile(
+            author_id=702,
+            username="cooldown_result",
+            display_name="Cooldown Result",
+        )
+        return "completed"
+
+    def observed_build(database: Path, *, archive_root=None):
+        report = build_catalog_from_db(database, archive_root=archive_root)
+        built.set()
+        return report
+
+    monkeypatch.setattr(service.ai_service, "execute_attempt", finish_analysis)
+    monkeypatch.setattr("hoard.service.build_catalog_from_db", observed_build)
+
+    assert await service._ai_chat({"attempt_id": "cooldown"}) == "completed"
+    assert store.telegram.catalog_dirty() is True
+    task = service._catalog_task
+    assert task is not None
+    await asyncio.wait_for(task, timeout=5)
+    await wait_until(lambda: not store.telegram.catalog_dirty())
+    assert built.is_set() is True
+    html = (archive / "telegram_archive.html").read_text(encoding="utf-8")
+    assert '"author_id":702' in html
+    await service.stop_background()
+    store.close()

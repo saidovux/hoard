@@ -18,6 +18,16 @@ Local-first Telegram archive and extensible small-tool core, Python >=3.11. Keep
   tokens are short-lived, one-use and issued through the authenticated control channel.
 - Web updates use the existing `catalog_dirty`/atomic HTML publication. Do not treat a database
   revision as published readiness and do not rebuild the catalog from the version-check endpoint.
+- Video-note frame extraction is local and automatic after a successful download, but never on the
+  Telegram event loop. Keep the dedicated media runner at one FFmpeg process unless measured evidence
+  justifies more. Store frames under the archive next to the MP4, never in profile-photo rows, and
+  never fabricate a third image from a duplicate frame. FFmpeg/FFprobe are optional runtime tools;
+  their absence must not break installation, downloads, TUI, Web or photo-only AI.
+- Frames enter AI only after an explicit user action. Send the three frames of one video in one
+  request (and at most one same-author profile photo in combined mode); never mix authors, never send
+  separate paid requests per frame, and keep preview fingerprints and operation-key idempotency.
+- Existing MP4s are not mass-processed on upgrade. The explicit old-archive action must remain
+  resumable, bounded and independent of new Telegram jobs.
 - Keep unimplemented integrations hidden from UI. Do not expand personal data gathering without explicit consent.
 - Recheck Python syntax, tests, CLI, IPC and `pytest -q` after changes. Live Telegram tests require user's authorization and should be run against permitted content.
 - Every completed and locally verified Hoard round must be published automatically to

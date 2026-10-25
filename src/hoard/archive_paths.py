@@ -64,6 +64,17 @@ def video_note_path(
     )
 
 
+def video_note_frames_dir(
+    archive_root: Path,
+    source_id: int,
+    author_id: int | None,
+    message_id: int,
+) -> Path:
+    """Directory next to one MP4 holding its three extracted JPEG frames."""
+    video = video_note_path(archive_root, source_id, author_id, message_id)
+    return video.with_name(f"{video.stem}_frames")
+
+
 def profile_photo_path(archive_root: Path, author_id: int, photo_id: int | str) -> Path:
     return object_path(
         archive_root,

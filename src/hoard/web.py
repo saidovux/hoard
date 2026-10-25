@@ -166,7 +166,12 @@ class WebState:
             raise RuntimeError("Не удалось прочитать снимок HTML-каталога") from exc
         if not isinstance(payload, dict):
             raise RuntimeError("Снимок HTML-каталога имеет неверный формат")
-        media: list[dict[str, Any]] = list(payload.get("videos") or [])
+        media: list[dict[str, Any]] = []
+        for video in payload.get("videos") or []:
+            if not isinstance(video, dict):
+                continue
+            media.append(video)
+            media.extend(video.get("frames") or [])
         for post in payload.get("posts") or []:
             media.extend(post.get("media") or [])
         for profile in payload.get("profiles") or []:

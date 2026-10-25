@@ -14,11 +14,12 @@ background service.
   `request()` boundary. Dialogs, screens, status formatting, reusable widgets and TCSS remain
   separate. The package imports neither storage nor Telethon, and never creates a Telegram client.
 - `ipc.py` starts the daemon detached when required and sends one JSON request per private
-  Unix-socket connection. Client and daemon must both report Hoard 0.7.1.11 and IPC protocol `1`.
+  Unix-socket connection. Client and daemon must both report Hoard 0.7.2.0 and IPC protocol `1`.
   A held instance lock with no ready socket means initialization is in progress, so the client
   waits for that owner instead of spawning a second daemon.
-- `service.py` owns the database, two independently limited job runners and the sole
-  `TelegramEngine`. An asyncio lock
+- `service.py` owns the database, three independently limited job runners and the sole
+  `TelegramEngine`: the Telegram/collector runner, the paid-AI runner and a one-slot media runner
+  for local FFmpeg frame extraction. An asyncio lock
   serializes login, validation, scans and enrichment so one Telethon session is never opened by
   competing clients.
 - `ai/` is provider-neutral and has no Telegram dependency. It defines requests, responses,
@@ -121,6 +122,8 @@ idempotently-created tables:
 - `tg_profile_sources`, linking one profile to any number of source posts;
 - `tg_profile_photos`, storing photo IDs, status, size and local paths;
 - `tg_post_metadata` and `tg_post_media` for the parent posts;
+- `tg_video_frame_sets` and `tg_video_frames` for one versioned local frame set per video note,
+  including actual timestamps, frame sizes, SHA-256 values and source-file fingerprint;
 - `tg_settings`, `tg_archive_roots` and `schema_versions` for archive configuration, safe access to
   earlier roots and migrations.
 
@@ -132,7 +135,10 @@ AI storage uses the same daemon-owned connection but a separate additive schema:
 - `ai_attempts`, `ai_attempt_messages` and `ai_attempt_memory` as frozen execution journals;
 - `ai_prices` as user-owned effective-period tariffs whose rows are snapshotted into attempts.
 - `ai_telegram_analyses` and `ai_telegram_analysis_photos`, atomically linking a Telegram ID,
-  prompt/schema version, immutable selected-photo snapshot, paid attempt and validated result.
+  prompt/schema version, immutable selected-image snapshot, paid attempt and validated result.
+  The image journal records whether each input was a profile photo or video frame, its source
+  message/frame position and timestamp; the analysis row records the image mode and frame-set
+  identity.
 - `ai_telegram_batches` and `ai_telegram_batch_items`, a minimal durable grouping of existing PSL
   attempts with per-`author_id` skip reasons and idempotent operation keys.
 
@@ -147,6 +153,23 @@ safe JSON sidecars inside configured archive roots, backfills profile links and 
 leaves files and `sources.last_id` untouched. Unique constraints make the operation repeatable.
 Old media may stay outside `telegram/`; the report emits a relative path or a `file:` URI when
 Windows drives differ. It never creates an implicit second media archive.
+
+Every successful video-note checkpoint writes a `tg_video_frame_sets` row and one
+`telegram.video_frames` job in the same SQLite transaction. The one-slot media runner is started
+with the daemon independently of the Telegram collector. It uses FFprobe to read the real
+duration and runs at most one FFmpeg process; three frames at 20/50/80 percent are written to a
+temporary directory beside the MP4, checked for unique decodable JPEG content, then atomically
+installed as `<message>_frames/frame_01.jpg`...`frame_03.jpg`. The source MP4 is never modified.
+Temporary files are removed on failure; a cancelled job is returned to the durable queue. FFmpeg
+absence is a terminal per-set diagnostic, not an installation or daemon failure.
+
+Previously saved MP4s are intentionally not discovered as automatic jobs. The explicit old-archive
+action starts a durable cursor and the media scheduler keeps at most eight frame jobs waiting while
+one runs; paused backfill stops new scheduling but does not cancel already queued work. Successful
+sets are skipped on resume. Failed and stale sets require the explicit retry action. Catalog
+changes made by frame completion use the same catalog dirty/revision and atomic publication path;
+if the Telegram runner is stopped, a bounded deferred task performs the existing report through
+the report lock.
 
 Enabled sources become unique `telegram.scan` jobs when due. Telegram jobs remain serialized by
 the global session lock, while one scan uses the same authorized client for a bounded set of video
@@ -375,6 +398,14 @@ roots before importing private copies. Jobs contain only an attempt ID. The orig
 photo IDs, source path/digest snapshot and private attachment links are frozen transactionally;
 opening an existing analysis performs only a read. No new Telegram download is triggered.
 
+Telegram AI can select three modes without creating a second provider workflow: saved profile
+photos; three frames from one saved video note; or those three frames plus one profile photo of
+the same author. Frame handles are resolved from the local frame set, never by arbitrary path or
+another person's files. The three frames are attached in timestamp order to one user message and
+one `ai_attempts` row; preview fingerprints are rechecked before queueing. The request asks the
+model to treat them as moments of one video and keeps the same PSL output contract. No download
+or frame-extraction completion queues an AI attempt.
+
 `psl.py` defines schema version 2. Its five metrics are visual `presentation`, approximate
 `estimated_age`, `raw_psl_min`, `raw_psl_max` and `boosted_psl`; numeric scores are bounded to
 0–8. The workflow also stores `completed`, `insufficient_data`, `ineligible` or `invalid_result`.
@@ -407,9 +438,10 @@ only the current batch ID in `sessionStorage` to resume polling without reloadin
 
 ## Current scope
 
-The product includes the Telegram archive, autonomous static catalog, an explicit short-lived
-loopback browser client, AI chats and manually initiated Telegram-photo PSL for one, selected or
-publication-linked local profiles. Optional media/rclone adapters remain dormant code paths and
+The product includes the Telegram archive, autonomous static catalog, automatic local frame
+extraction for new video notes, an explicit resumable old-frame backfill, an explicit short-lived
+loopback browser client, AI chats and manually initiated Telegram PSL from profile photos or one
+video-note frame set for one, selected or publication-linked local profiles. Optional media/rclone adapters remain dormant code paths and
 are not presented as user-facing tools. There is no persistent browser service, remote access,
 PSL automation, multi-user infrastructure or collection beyond source posts, video-note authors
 and the visible profile photos explicitly requested for this module. AI does not expand Telegram

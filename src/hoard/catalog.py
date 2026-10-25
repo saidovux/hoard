@@ -26,7 +26,7 @@ from .archive_paths import (
 from .paths import ensure_private
 from .storage import Store
 
-CATALOG_SCHEMA_VERSION = 2
+CATALOG_SCHEMA_VERSION = 3
 STYLE_TOKEN = "/*__HOARD_STYLE__*/"
 DATA_TOKEN = "/*__HOARD_DATA__*/"
 APP_TOKEN = "/*__HOARD_APP__*/"
@@ -332,6 +332,11 @@ def _analysis_item(row: dict[str, Any]) -> tuple[dict[str, Any], bool]:
         "prompt_version_id": _text(row.get("prompt_version_id")),
         "schema_version": int(row.get("schema_version") or 0),
         "attempt_id": _text(row.get("attempt_id")),
+        "image_mode": _text(row.get("image_mode") or "photos"),
+        "video_source_id": row.get("video_source_id"),
+        "video_message_id": row.get("video_message_id"),
+        "frame_set_id": _text(row.get("frame_set_id")),
+        "frame_set_version": int(row.get("frame_set_version") or 0),
         "failure_category": _text(row.get("failure_category")) or None,
         "presentation": normalized["presentation"] if valid and normalized else None,
         "estimated_age": normalized["estimated_age"] if valid and normalized else None,
@@ -352,6 +357,15 @@ def _build_payload(
 ) -> dict[str, Any]:
     catalog_dir = archive_root.expanduser().resolve()
     metadata = {int(row["source_id"]): row for row in rows["post_metadata"]}
+    frame_sets = {
+        (int(row["source_id"]), int(row["message_id"])): row
+        for row in rows.get("video_frame_sets", [])
+    }
+    frame_rows: dict[tuple[int, int], list[dict[str, Any]]] = {}
+    for raw in rows.get("video_frames", []):
+        frame_rows.setdefault(
+            (int(raw["source_id"]), int(raw["message_id"])), []
+        ).append(dict(raw))
     post_media: dict[int, list[dict[str, Any]]] = {}
     for raw in rows["post_media"]:
         item = _media_item(raw, catalog_dir=catalog_dir, allowed_roots=allowed_roots)
@@ -457,6 +471,38 @@ def _build_payload(
         item = _media_item(raw, catalog_dir=catalog_dir, allowed_roots=allowed_roots)
         author_id = raw.get("author_id")
         author_id = int(author_id) if author_id is not None else None
+        frame_set = frame_sets.get((source_id, message_id))
+        frame_status = _text(frame_set.get("status")) if frame_set else "missing"
+        frame_error = _text(frame_set.get("error")) if frame_set else ""
+        frames: list[dict[str, Any]] = []
+        for frame in (
+            sorted(
+                frame_rows.get((source_id, message_id), []),
+                key=lambda value: int(value["position"]),
+            )
+            if frame_status == "saved"
+            else []
+        ):
+            frame_item = _media_item(
+                frame, catalog_dir=catalog_dir, allowed_roots=allowed_roots
+            )
+            frame_item.update(
+                {
+                    "image_id": (
+                        f"frame:{source_id}:{message_id}:{int(frame['position'])}"
+                    ),
+                    "position": int(frame["position"]),
+                    "timestamp_seconds": float(frame.get("timestamp_seconds") or 0),
+                    "sha256": _text(frame.get("sha256")),
+                }
+            )
+            frames.append(frame_item)
+        if frame_status == "saved" and (
+            len(frames) != 3 or any(not frame["available"] for frame in frames)
+        ):
+            frame_status = "stale"
+            frame_error = "Кадры неполные или изменились; требуется повторное извлечение"
+            frames = []
         item.update(
             {
                 "video_id": video_id,
@@ -466,6 +512,22 @@ def _build_payload(
                 "message_date": _text(raw["date"]),
                 "observed_at": _text(raw.get("observed_at")),
                 "comment_url": _text(raw["media_url"]),
+                "frame_status": frame_status,
+                "frame_count": len(frames),
+                "frame_error": frame_error,
+                "frame_error_code": (
+                    _text(frame_set.get("error_code")) if frame_set else ""
+                ),
+                "frame_set_id": (
+                    _text(frame_set.get("frame_set_id")) if frame_set else ""
+                ),
+                "frame_set_version": (
+                    int(frame_set.get("algorithm_version") or 0) if frame_set else 0
+                ),
+                "frame_duration": (
+                    float(frame_set.get("duration") or 0) if frame_set else 0.0
+                ),
+                "frames": frames,
             }
         )
         videos.append(item)

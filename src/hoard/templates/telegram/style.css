@@ -245,6 +245,8 @@ input, select { width: 100%; min-height: 2.45rem; padding: .46rem .65rem; }
   background: var(--surface);
 }
 video.media { height: auto; max-height: 360px; aspect-ratio: 1; }
+.frame-strip { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: .3rem; margin-top: .45rem; }
+.frame-thumb { width: 100%; aspect-ratio: 1; object-fit: cover; cursor: zoom-in; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); }
 .media-actions { display: flex; justify-content: space-between; gap: .4rem; margin-top: .4rem; }
 .media-actions button { min-height: 2rem; padding: .32rem .55rem; font-size: .76rem; }
 .missing {

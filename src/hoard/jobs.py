@@ -19,6 +19,7 @@ class JobRunner:
         name: str = "jobs",
         include_job_id: bool = False,
         redact_errors: bool = False,
+        scheduler: Callable[[], None] | None = None,
     ):
         if not 1 <= parallel <= 100:
             raise ValueError("Допустимо 1–100 параллельных задач; по умолчанию 3")
@@ -29,6 +30,7 @@ class JobRunner:
         self.name = name
         self.include_job_id = include_job_id
         self.redact_errors = redact_errors
+        self.scheduler = scheduler
         self._loop: asyncio.Task | None = None
         self._active: dict[int, asyncio.Task] = {}
         self._wakeup = asyncio.Event()
@@ -139,6 +141,8 @@ class JobRunner:
                     {"author_id": author_id},
                     unique_key=f"telegram-profile-photos:{author_id}",
                 )
+        if self.scheduler is not None:
+            self.scheduler()
 
     async def _run(self) -> None:
         try:

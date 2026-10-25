@@ -11,9 +11,21 @@ from typing import TYPE_CHECKING, Any
 import pytest
 
 if TYPE_CHECKING:
-    from textual.widgets import Button, DataTable, Input, OptionList, SelectionList, Static
+    from textual.widgets import (
+        Button,
+        DataTable,
+        Input,
+        OptionList,
+        SelectionList,
+        Static,
+    )
 
-    from hoard.tui.ai_dialogs import AIRecordDialog, TelegramAIDialog, TelegramAnalysisDialog
+    from hoard.tui.ai_dialogs import (
+        AIRecordDialog,
+        TelegramAIDialog,
+        TelegramAnalysisDialog,
+        VideoFramesDialog,
+    )
     from hoard.tui.app import HelpScreen, HoardApp
     from hoard.tui.dialogs import AuthDialog, ConfirmDialog, SourceDialog
     from hoard.tui.screens import (
@@ -40,6 +52,7 @@ def load_textual_after_existing_async_tests():
     from hoard.tui.ai_dialogs import AIRecordDialog as AIRecordDialogClass
     from hoard.tui.ai_dialogs import TelegramAIDialog as TelegramAIDialogClass
     from hoard.tui.ai_dialogs import TelegramAnalysisDialog as TelegramAnalysisDialogClass
+    from hoard.tui.ai_dialogs import VideoFramesDialog as VideoFramesDialogClass
     from hoard.tui.app import HelpScreen as HelpScreenClass
     from hoard.tui.app import HoardApp as HoardAppClass
     from hoard.tui.dialogs import AuthDialog as AuthDialogClass
@@ -81,6 +94,7 @@ def load_textual_after_existing_async_tests():
         TelegramScreen=TelegramScreenClass,
         TelegramAIDialog=TelegramAIDialogClass,
         TelegramAnalysisDialog=TelegramAnalysisDialogClass,
+        VideoFramesDialog=VideoFramesDialogClass,
     )
 
 
@@ -1542,3 +1556,184 @@ print("STORAGE", "hoard.storage" in sys.modules)
     assert result.returncode == 0, result.stderr
     assert "TELETHON False" in result.stdout
     assert "STORAGE False" in result.stdout
+
+
+@pytest.mark.asyncio
+async def test_archive_frame_controls_open_local_set_and_start_backfill():
+    status = status_fixture()
+    status["video_frames"] = {
+        "total": 1,
+        "saved": 1,
+        "failed": 0,
+        "pending": 0,
+        "missing": 0,
+        "backfill_active": False,
+        "backfill_complete": False,
+    }
+    status["downloads"] = [
+        {
+            "source_id": 1,
+            "message_id": 10,
+            "author_id": 99,
+            "author_name": "Alice",
+            "source_name": "sample_channel",
+            "post_id": 42,
+            "date": "2026-10-21",
+            "size": 2048,
+            "state": "saved",
+            "frame_status": "saved",
+            "frame_count": 3,
+        }
+    ]
+    details = {
+        "video_id": "1:10",
+        "source_id": 1,
+        "message_id": 10,
+        "author_id": 99,
+        "status": "saved",
+        "valid": True,
+        "frame_count": 3,
+        "frames": [
+            {
+                "image_id": f"frame:1:10:{position}",
+                "position": position,
+                "timestamp_seconds": position * 1.0,
+                "file_path": f"/tmp/frame-{position}.jpg",
+                "size": 100,
+                "available": True,
+            }
+            for position in (1, 2, 3)
+        ],
+    }
+    api = FakeAPI(status)
+    api.queue("telegram_frames_get", {"frames": details, "stats": status["video_frames"]})
+    app = HoardApp(api)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await wait_for_startup(app, pilot)
+        app.open_section("archive")
+        await pilot.pause()
+        screen = app.screen
+        assert isinstance(screen, ArchiveScreen)
+        assert screen.query_one("#frames-view", Button).display is True
+        assert screen.query_one("#telegram-ai-frames", Button).display is False
+        assert "1 готовы" in str(screen.query_one("#archive-summary", Static).content)
+
+        screen.query_one("#frames-view").press()
+        await wait_for_condition(
+            pilot, lambda: isinstance(app.screen, VideoFramesDialog)
+        )
+        dialog = app.screen
+        await wait_for_condition(
+            pilot, lambda: bool(dialog.query("#frames-analyze"))
+        )
+        assert "Кадры видеокружка 1:10" in str(
+            dialog.query_one(".dialog-title", Static).content
+        )
+        assert dialog.query_one("#frames-analyze", Button).disabled is False
+        await pilot.press("escape")
+        await pilot.pause()
+
+        screen.query_one("#frames-backfill").press()
+        await wait_for_condition(
+            pilot,
+            lambda: any(
+                name == "telegram_frames_backfill_start" for name, _ in api.calls
+            ),
+        )
+
+        await pilot.click("#mode-profiles")
+        assert screen.mode == "profiles"
+        assert screen.query_one("#frames-view", Button).display is False
+        assert screen.query_one("#telegram-ai-frames", Button).display is True
+        assert screen.query_one("#telegram-ai-combined", Button).display is True
+
+
+@pytest.mark.asyncio
+async def test_profile_frame_ai_preview_shows_video_and_frame_choice():
+    status = status_fixture()
+    status["profiles"] = [
+        {
+            "display_name": "Alice",
+            "current_username": "alice",
+            "author_id": 99,
+            "source_count": 1,
+            "photo_count": 1,
+            "last_seen": "2026-10-21",
+            "photo_error": "",
+        }
+    ]
+    api = FakeAPI(status)
+    api.queue(
+        "ai_config_get",
+        {"provider": "deepseek", "model": "deepseek-flash", "configured": True},
+    )
+    preview = {
+        "selected_count": 1,
+        "ready_count": 1,
+        "skipped_count": 0,
+        "selected_image_count": 3,
+        "selected_photo_count": 0,
+        "image_mode": "frames",
+        "photo_count": 1,
+        "limit": 20,
+        "offset": 0,
+        "has_more": False,
+        "items": [
+            {
+                "author_id": 99,
+                "display_name": "Alice",
+                "username": "alice",
+                "ready": True,
+                "reason": "",
+                "photo_count": 1,
+                "image_count": 3,
+                "frame_count": 3,
+                "video_count": 1,
+                "image_mode": "frames",
+                "video_id": "1:10",
+                "selected_photo_ids": [],
+                "selected_image_ids": ["frame:1:10:1", "frame:1:10:2", "frame:1:10:3"],
+                "selected_images": [
+                    {"image_id": f"frame:1:10:{position}", "kind": "frame", "position": position}
+                    for position in (1, 2, 3)
+                ],
+                "videos": [
+                    {
+                        "video_id": "1:10",
+                        "message_id": 10,
+                        "message_date": "2026-10-21",
+                    }
+                ],
+                "image_snapshot": "snapshot",
+                "photo_snapshot": "",
+                "photos": [],
+                "adult_confirmed": True,
+                "previous": None,
+            }
+        ],
+    }
+    api.queue("ai_telegram_batch_preview", {"preview": preview})
+    app = HoardApp(api)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await wait_for_startup(app, pilot)
+        app.open_section("archive")
+        await pilot.pause()
+        await pilot.click("#mode-profiles")
+        await wait_for_condition(
+            pilot,
+            lambda: bool(getattr(app.screen, "_profile_ids", [])),
+        )
+        app.screen.query_one("#telegram-ai-frames").press()
+        await wait_for_condition(
+            pilot, lambda: isinstance(app.screen, TelegramAnalysisDialog)
+        )
+        dialog = app.screen
+        await wait_for_condition(
+            pilot,
+            lambda: "кадры: 3"
+            in str(dialog.query_one("#analysis-page-items", Static).content),
+        )
+        chooser = dialog.query_one("#analysis-video", OptionList)
+        assert chooser.highlighted == 0
+        assert chooser.get_option_at_index(0).id == "1:10"
+        assert any(name == "ai_telegram_batch_preview" for name, _ in api.calls)

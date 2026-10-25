@@ -1,6 +1,7 @@
 """Telegram-specific SQLite schema and non-destructive legacy migration."""
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 from datetime import UTC, datetime
@@ -10,7 +11,7 @@ from typing import Any
 from .archive_paths import default_archive_root, path_is_within
 from .models import parse_post_url
 
-TELEGRAM_SCHEMA_VERSION = 3
+TELEGRAM_SCHEMA_VERSION = 4
 
 MEDIA_RETRY_DELAYS = (60, 300, 1800, 7200, 21600, 86400)
 CATALOG_REPORT_RETRY_DELAYS = (30, 120, 600, 1800, 3600)
@@ -110,6 +111,39 @@ class TelegramStorage:
                 updated_at TEXT NOT NULL DEFAULT '',
                 PRIMARY KEY(source_id, message_id)
             );
+            CREATE TABLE IF NOT EXISTS tg_video_frame_sets (
+                source_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                author_id INTEGER,
+                video_path TEXT NOT NULL,
+                video_size INTEGER NOT NULL DEFAULT 0,
+                video_mtime_ns INTEGER NOT NULL DEFAULT 0,
+                frame_set_id TEXT NOT NULL DEFAULT '',
+                algorithm_version INTEGER NOT NULL DEFAULT 1,
+                status TEXT NOT NULL DEFAULT 'pending',
+                duration REAL NOT NULL DEFAULT 0,
+                frame_count INTEGER NOT NULL DEFAULT 0,
+                error TEXT NOT NULL DEFAULT '',
+                error_code TEXT NOT NULL DEFAULT '',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                retry_at REAL NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY(source_id, message_id)
+            );
+            CREATE TABLE IF NOT EXISTS tg_video_frames (
+                source_id INTEGER NOT NULL,
+                message_id INTEGER NOT NULL,
+                position INTEGER NOT NULL,
+                timestamp_seconds REAL NOT NULL DEFAULT 0,
+                file_path TEXT NOT NULL,
+                size INTEGER NOT NULL DEFAULT 0,
+                sha256 TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY(source_id, message_id, position)
+            );
+            CREATE INDEX IF NOT EXISTS tg_video_frame_sets_author_idx
+                ON tg_video_frame_sets(author_id, message_id DESC);
+            CREATE INDEX IF NOT EXISTS tg_video_frame_sets_status_idx
+                ON tg_video_frame_sets(status, source_id, message_id);
             CREATE INDEX IF NOT EXISTS tg_profiles_username_idx
                 ON tg_profiles(current_username COLLATE NOCASE);
             CREATE INDEX IF NOT EXISTS tg_profiles_name_idx
@@ -149,6 +183,15 @@ class TelegramStorage:
         self.db.execute(
             "INSERT OR IGNORE INTO tg_settings(key,value) VALUES('catalog_revision','0')"
         )
+        for key, value in (
+            ("frames_backfill_active", "0"),
+            ("frames_backfill_complete", "0"),
+            ("frames_backfill_cursor", "0"),
+            ("frames_backfill_updated_at", ""),
+        ):
+            self.db.execute(
+                "INSERT OR IGNORE INTO tg_settings(key,value) VALUES(?,?)", (key, value)
+            )
         self.db.execute(
             """INSERT INTO schema_versions(module,version) VALUES('telegram',?)
             ON CONFLICT(module) DO UPDATE SET
@@ -275,6 +318,516 @@ class TelegramStorage:
         """Let an explicit user retry bypass the automatic failure backoff."""
         with self.db:
             self._set_setting_sql("catalog_report_retry_at", "0")
+
+    # -- video-note frame sets -------------------------------------------------
+    # One latest immutable set is kept per source/message.  Frames are never
+    # mixed with profile photos in the filesystem or in the AI selection layer.
+
+    def frame_set(self, source_id: int, message_id: int) -> dict[str, Any] | None:
+        row = self.db.execute(
+            """SELECT sets.*, d.date AS message_date, d.media_url AS comment_url,
+            s.username AS source_username, s.post_id AS source_post_id,
+            s.title AS source_title
+            FROM tg_video_frame_sets sets
+            LEFT JOIN downloads d ON d.source_id=sets.source_id
+              AND d.message_id=sets.message_id
+            LEFT JOIN sources s ON s.id=sets.source_id
+            WHERE sets.source_id=? AND sets.message_id=?""",
+            (int(source_id), int(message_id)),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def frame_rows(self, source_id: int, message_id: int) -> list[dict[str, Any]]:
+        return [
+            dict(row)
+            for row in self.db.execute(
+                """SELECT * FROM tg_video_frames WHERE source_id=? AND message_id=?
+                ORDER BY position""",
+                (int(source_id), int(message_id)),
+            )
+        ]
+
+    @staticmethod
+    def _file_sha256(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def register_frame_set_sql(
+        self,
+        *,
+        source_id: int,
+        message_id: int,
+        author_id: int | None,
+        file_path: str,
+        size: int,
+        mtime_ns: int,
+        mark_dirty: bool = True,
+    ) -> bool:
+        """Create/reset a pending set inside the caller's download transaction.
+
+        Returns True when a frame job should be enqueued.  An unchanged ready
+        set is never regenerated just because a scan was repeated.
+        """
+        source_id = int(source_id)
+        message_id = int(message_id)
+        current = self.db.execute(
+            """SELECT status,video_path,video_size,video_mtime_ns
+            FROM tg_video_frame_sets WHERE source_id=? AND message_id=?""",
+            (source_id, message_id),
+        ).fetchone()
+        same_source = bool(
+            current is not None
+            and str(current["video_path"]) == str(file_path)
+            and int(current["video_size"] or 0) == int(size)
+            and int(current["video_mtime_ns"] or 0) == int(mtime_ns)
+        )
+        if current is not None and same_source and current["status"] in {
+            "saved",
+            "pending",
+            "running",
+            "failed",
+        }:
+            return False
+        if current is None:
+            self.db.execute(
+                """INSERT INTO tg_video_frame_sets(
+                source_id,message_id,author_id,video_path,video_size,video_mtime_ns,
+                status,updated_at) VALUES(?,?,?,?,?,?,'pending',?)""",
+                (
+                    source_id,
+                    message_id,
+                    int(author_id) if author_id is not None else None,
+                    str(file_path),
+                    int(size),
+                    int(mtime_ns),
+                    utc_now(),
+                ),
+            )
+        else:
+            self.db.execute(
+                """UPDATE tg_video_frame_sets SET author_id=?,video_path=?,video_size=?,
+                video_mtime_ns=?,frame_set_id='',status='pending',duration=0,frame_count=0,
+                error='',error_code='',attempts=0,retry_at=0,updated_at=?
+                WHERE source_id=? AND message_id=?""",
+                (
+                    int(author_id) if author_id is not None else None,
+                    str(file_path),
+                    int(size),
+                    int(mtime_ns),
+                    utc_now(),
+                    source_id,
+                    message_id,
+                ),
+            )
+            self.db.execute(
+                "DELETE FROM tg_video_frames WHERE source_id=? AND message_id=?",
+                (source_id, message_id),
+            )
+        if mark_dirty:
+            self._set_dirty_sql()
+        return True
+
+    @staticmethod
+    def _frame_job_payload(source_id: int, message_id: int) -> str:
+        return json.dumps(
+            {"source_id": int(source_id), "message_id": int(message_id)},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+    def _enqueue_frame_job_sql(self, source_id: int, message_id: int) -> int | None:
+        unique_key = f"video-frames:{int(source_id)}:{int(message_id)}"
+        active = self.db.execute(
+            """SELECT id FROM jobs WHERE unique_key=? AND state IN ('queued','running')
+            LIMIT 1""",
+            (unique_key,),
+        ).fetchone()
+        if active is not None:
+            return int(active["id"])
+        cursor = self.db.execute(
+            """INSERT OR IGNORE INTO jobs(kind,payload,unique_key)
+            VALUES('telegram.video_frames',?,?)""",
+            (
+                self._frame_job_payload(source_id, message_id),
+                unique_key,
+            ),
+        )
+        return int(cursor.lastrowid) if cursor.rowcount else None
+
+    def queue_frame_job(
+        self,
+        source_id: int,
+        message_id: int,
+        *,
+        reset_failed: bool = False,
+    ) -> int | None:
+        """Durably enqueue extraction for one existing download."""
+        row = self.db.execute(
+            """SELECT d.source_id,d.message_id,d.author_id,d.file_path,d.size,
+            sets.status AS frame_status
+            FROM downloads d LEFT JOIN tg_video_frame_sets sets
+            ON sets.source_id=d.source_id AND sets.message_id=d.message_id
+            WHERE d.source_id=? AND d.message_id=?""",
+            (int(source_id), int(message_id)),
+        ).fetchone()
+        if row is None:
+            raise ValueError("Сохранённый видеокружок не найден")
+        path = Path(str(row["file_path"]))
+        try:
+            stat = path.stat()
+            if not path.is_file() or stat.st_size <= 0:
+                raise OSError
+        except OSError as exc:
+            raise ValueError("Исходный MP4 недоступен локально") from exc
+        with self.db:
+            if reset_failed and str(row["frame_status"] or "") == "failed":
+                self.db.execute(
+                    """UPDATE tg_video_frame_sets SET status='pending',error='',error_code='',
+                    retry_at=0,updated_at=? WHERE source_id=? AND message_id=?""",
+                    (utc_now(), int(source_id), int(message_id)),
+                )
+            needs = self.register_frame_set_sql(
+                source_id=int(source_id),
+                message_id=int(message_id),
+                author_id=(
+                    int(row["author_id"]) if row["author_id"] is not None else None
+                ),
+                file_path=str(path.resolve(strict=False)),
+                size=stat.st_size,
+                mtime_ns=stat.st_mtime_ns,
+            )
+            if not needs and not reset_failed:
+                return None
+            return self._enqueue_frame_job_sql(int(source_id), int(message_id))
+
+    def mark_frame_running(self, source_id: int, message_id: int) -> None:
+        with self.db:
+            self.db.execute(
+                """UPDATE tg_video_frame_sets SET status='running',attempts=attempts+1,
+                error='',error_code='',updated_at=? WHERE source_id=? AND message_id=?""",
+                (utc_now(), int(source_id), int(message_id)),
+            )
+            self._set_dirty_sql()
+
+    def mark_frame_failed(
+        self,
+        source_id: int,
+        message_id: int,
+        *,
+        error: str,
+        error_code: str,
+        retry_after: float = 0,
+    ) -> None:
+        with self.db:
+            self.db.execute(
+                """UPDATE tg_video_frame_sets SET status='failed',error=?,error_code=?,
+                retry_at=?,updated_at=? WHERE source_id=? AND message_id=?""",
+                (
+                    str(error)[:500],
+                    str(error_code)[:80],
+                    time.time() + max(0.0, float(retry_after)),
+                    utc_now(),
+                    int(source_id),
+                    int(message_id),
+                ),
+            )
+            self._set_dirty_sql()
+
+    def mark_frame_pending(self, source_id: int, message_id: int, *, error: str = "") -> None:
+        with self.db:
+            self.db.execute(
+                """UPDATE tg_video_frame_sets SET status='pending',error=?,error_code='',
+                updated_at=? WHERE source_id=? AND message_id=?""",
+                (str(error)[:500], utc_now(), int(source_id), int(message_id)),
+            )
+            self._set_dirty_sql()
+
+    def save_frame_set(
+        self,
+        source_id: int,
+        message_id: int,
+        *,
+        frame_set_id: str,
+        algorithm_version: int,
+        duration: float,
+        video_size: int,
+        video_mtime_ns: int,
+        frames: list[dict[str, Any]],
+    ) -> None:
+        if len(frames) != 3:
+            raise ValueError("Набор кадров должен содержать ровно три изображения")
+        positions = [int(item["position"]) for item in frames]
+        if positions != [1, 2, 3]:
+            raise ValueError("Кадры должны иметь позиции 1, 2 и 3")
+        with self.db:
+            self.db.execute(
+                """UPDATE tg_video_frame_sets SET frame_set_id=?,algorithm_version=?,
+                status='saved',duration=?,frame_count=3,error='',error_code='',retry_at=0,
+                video_size=?,video_mtime_ns=?,updated_at=?
+                WHERE source_id=? AND message_id=?""",
+                (
+                    str(frame_set_id),
+                    int(algorithm_version),
+                    float(duration),
+                    int(video_size),
+                    int(video_mtime_ns),
+                    utc_now(),
+                    int(source_id),
+                    int(message_id),
+                ),
+            )
+            self.db.execute(
+                "DELETE FROM tg_video_frames WHERE source_id=? AND message_id=?",
+                (int(source_id), int(message_id)),
+            )
+            for item in frames:
+                self.db.execute(
+                    """INSERT INTO tg_video_frames(
+                    source_id,message_id,position,timestamp_seconds,file_path,size,sha256)
+                    VALUES(?,?,?,?,?,?,?)""",
+                    (
+                        int(source_id),
+                        int(message_id),
+                        int(item["position"]),
+                        float(item["timestamp_seconds"]),
+                        str(item["file_path"]),
+                        int(item["size"]),
+                        str(item["sha256"]),
+                    ),
+                )
+            self._set_dirty_sql()
+
+    def _frame_set_is_valid(
+        self, row: dict[str, Any], frames: list[dict[str, Any]]
+    ) -> tuple[bool, str]:
+        if str(row.get("status")) != "saved" or not str(row.get("frame_set_id") or ""):
+            return False, "Кадры ещё не готовы"
+        if int(row.get("frame_count") or 0) != 3 or len(frames) != 3:
+            return False, "Набор кадров неполный"
+        if [int(item["position"]) for item in frames] != [1, 2, 3]:
+            return False, "Порядок кадров повреждён"
+        try:
+            video = Path(str(row["video_path"])).expanduser().resolve(strict=True)
+            video_stat = video.stat()
+            if (
+                not video.is_file()
+                or video_stat.st_size != int(row.get("video_size") or 0)
+                or video_stat.st_mtime_ns != int(row.get("video_mtime_ns") or 0)
+            ):
+                return False, "Исходный MP4 изменился после извлечения кадров"
+        except (OSError, RuntimeError, ValueError):
+            return False, "Исходный MP4 недоступен"
+        for item in frames:
+            try:
+                path = Path(str(item["file_path"])).expanduser().resolve(strict=True)
+                stat = path.stat()
+                if not path.is_file() or stat.st_size != int(item["size"] or 0):
+                    return False, "Файл кадра отсутствует или изменился"
+                if self._file_sha256(path) != str(item["sha256"]):
+                    return False, "Содержимое кадра изменилось"
+            except (OSError, RuntimeError, ValueError):
+                return False, "Файл кадра недоступен"
+        return True, ""
+
+    def _mark_frame_stale(self, source_id: int, message_id: int, reason: str) -> None:
+        with self.db:
+            self.db.execute(
+                """UPDATE tg_video_frame_sets SET status='stale',error=?,error_code='stale',
+                updated_at=? WHERE source_id=? AND message_id=? AND status='saved'""",
+                (str(reason)[:500], utc_now(), int(source_id), int(message_id)),
+            )
+            self._set_dirty_sql()
+
+    def frame_details(self, source_id: int, message_id: int) -> dict[str, Any] | None:
+        row = self.frame_set(source_id, message_id)
+        if row is None:
+            return None
+        frames = self.frame_rows(source_id, message_id)
+        valid, reason = self._frame_set_is_valid(row, frames) if row["status"] == "saved" else (
+            False,
+            str(row.get("error") or ""),
+        )
+        if row["status"] == "saved" and not valid:
+            self._mark_frame_stale(source_id, message_id, reason)
+            row = self.frame_set(source_id, message_id) or row
+        result = dict(row)
+        result["video_id"] = f"{int(source_id)}:{int(message_id)}"
+        result["valid"] = bool(valid)
+        result["frames"] = [
+            {
+                **item,
+                "image_id": f"frame:{int(source_id)}:{int(message_id)}:{int(item['position'])}",
+                "available": valid,
+            }
+            for item in frames
+        ]
+        return result
+
+    def video_frame_options(self, author_id: int) -> list[dict[str, Any]]:
+        rows = list(
+            self.db.execute(
+                """SELECT sets.source_id,sets.message_id FROM tg_video_frame_sets sets
+                LEFT JOIN downloads d ON d.source_id=sets.source_id
+                  AND d.message_id=sets.message_id
+                WHERE sets.author_id=? AND sets.status='saved'
+                ORDER BY COALESCE(d.date,'') DESC,sets.message_id DESC""",
+                (int(author_id),),
+            )
+        )
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            details = self.frame_details(int(row["source_id"]), int(row["message_id"]))
+            if details is not None and details["valid"]:
+                result.append(details)
+        return result
+
+    def selected_video_frames(
+        self,
+        author_id: int,
+        video_id: str | None = None,
+        image_ids: list[Any] | None = None,
+    ) -> dict[str, Any]:
+        options = self.video_frame_options(author_id)
+        if not options:
+            raise ValueError("Нет готового набора кадров этого профиля")
+        selected = None
+        if video_id:
+            value = str(video_id).strip()
+            selected = next((item for item in options if item["video_id"] == value), None)
+            if selected is None:
+                raise ValueError("Выбранный видеокружок не принадлежит профилю или кадры не готовы")
+        else:
+            selected = options[0]
+        frames = list(selected["frames"])
+        if image_ids is not None:
+            identifiers = [str(value) for value in image_ids]
+            by_id = {str(item["image_id"]): item for item in frames}
+            if len(identifiers) != 3 or len(set(identifiers)) != 3:
+                raise ValueError("Для анализа нужны ровно три разных кадра")
+            ordered = [by_id.get(identifier) for identifier in identifiers]
+            if any(item is None for item in ordered):
+                raise ValueError("Кадры изменились после предпросмотра")
+            positions = [int(item["position"]) for item in ordered]
+            if positions != [1, 2, 3]:
+                raise ValueError("Кадры изменились после предпросмотра")
+            frames = ordered
+        return {**selected, "frames": frames}
+
+    def frame_for_image_id(
+        self, author_id: int, image_id: str
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        parts = str(image_id).split(":")
+        if len(parts) != 4 or parts[0] != "frame":
+            raise ValueError("Некорректный идентификатор кадра")
+        try:
+            source_id, message_id, position = (int(parts[1]), int(parts[2]), int(parts[3]))
+        except ValueError as exc:
+            raise ValueError("Некорректный идентификатор кадра") from exc
+        details = self.frame_details(source_id, message_id)
+        if details is None or not details["valid"] or int(details.get("author_id") or 0) != int(
+            author_id
+        ):
+            raise ValueError("Кадры не принадлежат выбранному профилю или недоступны")
+        frame = next(
+            (item for item in details["frames"] if int(item["position"]) == position),
+            None,
+        )
+        if frame is None:
+            raise ValueError("Кадр не найден")
+        return details, frame
+
+    def frame_stats(self) -> dict[str, Any]:
+        counts = {
+            str(row["status"]): int(row["amount"])
+            for row in self.db.execute(
+                "SELECT status,COUNT(*) AS amount FROM tg_video_frame_sets GROUP BY status"
+            )
+        }
+        total = int(self.db.execute("SELECT COUNT(*) FROM downloads").fetchone()[0])
+        missing = int(
+            self.db.execute(
+                """SELECT COUNT(*) FROM downloads d LEFT JOIN tg_video_frame_sets s
+                ON s.source_id=d.source_id AND s.message_id=d.message_id
+                WHERE s.source_id IS NULL"""
+            ).fetchone()[0]
+        )
+        queued = int(
+            self.db.execute(
+                """SELECT COUNT(*) FROM jobs WHERE kind='telegram.video_frames'
+                AND state IN ('queued','running')"""
+            ).fetchone()[0]
+        )
+        return {
+            "total": total,
+            "saved": counts.get("saved", 0),
+            "failed": counts.get("failed", 0) + counts.get("stale", 0),
+            "pending": counts.get("pending", 0) + counts.get("running", 0),
+            "missing": missing,
+            "queued": queued,
+            "statuses": counts,
+            "backfill_active": self.get_setting("frames_backfill_active", "0") == "1",
+            "backfill_complete": self.get_setting("frames_backfill_complete", "0") == "1",
+            "backfill_cursor": int(self.get_setting("frames_backfill_cursor", "0") or 0),
+        }
+
+    def start_frame_backfill(self) -> dict[str, Any]:
+        complete = self.get_setting("frames_backfill_complete", "0") == "1"
+        with self.db:
+            if complete:
+                self._set_setting_sql("frames_backfill_cursor", "0")
+            self._set_setting_sql("frames_backfill_active", "1")
+            self._set_setting_sql("frames_backfill_complete", "0")
+            self._set_setting_sql("frames_backfill_updated_at", utc_now())
+        return self.frame_stats()
+
+    def pause_frame_backfill(self) -> dict[str, Any]:
+        with self.db:
+            self._set_setting_sql("frames_backfill_active", "0")
+            self._set_setting_sql("frames_backfill_updated_at", utc_now())
+        return self.frame_stats()
+
+    def next_frame_backfill_downloads(self, cursor: int, limit: int) -> list[dict[str, Any]]:
+        return [
+            dict(row)
+            for row in self.db.execute(
+                """SELECT d.rowid AS cursor_rowid,d.source_id,d.message_id,d.author_id,
+                d.file_path,d.size,sets.status AS frame_status
+                FROM downloads d LEFT JOIN tg_video_frame_sets sets
+                ON sets.source_id=d.source_id AND sets.message_id=d.message_id
+                WHERE d.rowid>? ORDER BY d.rowid LIMIT ?""",
+                (int(cursor), max(1, int(limit))),
+            )
+        ]
+
+    def set_frame_backfill_cursor(self, cursor: int, *, complete: bool = False) -> None:
+        with self.db:
+            self._set_setting_sql("frames_backfill_cursor", str(max(0, int(cursor))))
+            self._set_setting_sql("frames_backfill_updated_at", utc_now())
+            if complete:
+                self._set_setting_sql("frames_backfill_active", "0")
+                self._set_setting_sql("frames_backfill_complete", "1")
+
+    def retry_failed_frames(self, *, limit: int = 100) -> dict[str, Any]:
+        rows = list(
+            self.db.execute(
+                """SELECT source_id,message_id FROM tg_video_frame_sets
+                WHERE status IN ('failed','stale') ORDER BY source_id,message_id LIMIT ?""",
+                (max(1, min(1000, int(limit))),),
+            )
+        )
+        queued = 0
+        for row in rows:
+            try:
+                if self.queue_frame_job(
+                    int(row["source_id"]), int(row["message_id"]), reset_failed=True
+                ) is not None:
+                    queued += 1
+            except ValueError:
+                continue
+        return {"queued": queued, **self.frame_stats()}
 
     def archive_root(self, preferred: str | Path | None = None, *, persist: bool = False) -> Path:
         if preferred is not None:
@@ -840,9 +1393,17 @@ class TelegramStorage:
                 profiles.photo_error,profiles.photo_error_code,
                 COUNT(DISTINCT CASE WHEN photos.status='saved' THEN photos.photo_id END)
                     AS photo_count,
+                COUNT(DISTINCT downloads.message_id) AS video_count,
+                COUNT(DISTINCT CASE WHEN frames.status='saved'
+                    THEN frames.source_id || ':' || frames.message_id END)
+                    AS frame_set_count,
                 COUNT(DISTINCT links.source_id) AS source_count
                 FROM tg_profiles profiles {join}
                 LEFT JOIN tg_profile_photos photos ON photos.author_id=profiles.author_id
+                LEFT JOIN downloads ON downloads.author_id=profiles.author_id
+                LEFT JOIN tg_video_frame_sets frames
+                  ON frames.source_id=downloads.source_id
+                 AND frames.message_id=downloads.message_id
                 LEFT JOIN tg_profile_sources links ON links.author_id=profiles.author_id
                 WHERE {where} GROUP BY profiles.author_id
                 ORDER BY profiles.last_seen DESC,profiles.author_id LIMIT ? OFFSET ?""",
@@ -945,6 +1506,12 @@ class TelegramStorage:
             ),
             "post_metadata": "SELECT * FROM tg_post_metadata ORDER BY source_id",
             "post_media": "SELECT * FROM tg_post_media ORDER BY source_id,media_id",
+            "video_frame_sets": (
+                "SELECT * FROM tg_video_frame_sets ORDER BY source_id,message_id"
+            ),
+            "video_frames": (
+                "SELECT * FROM tg_video_frames ORDER BY source_id,message_id,position"
+            ),
         }
         return {
             name: [dict(row) for row in self.db.execute(query)]

@@ -256,6 +256,34 @@ class Store:
                         observed_at=str(payload["observed_at"]),
                         source_id=source_id,
                     )
+                video_path = Path(str(payload["file_path"]))
+                try:
+                    video_stat = video_path.stat()
+                    video_size = int(video_stat.st_size)
+                    video_mtime_ns = int(video_stat.st_mtime_ns)
+                    video_exists = video_path.is_file() and video_size > 0
+                except OSError:
+                    video_size = int(payload.get("size") or 0)
+                    video_mtime_ns = 0
+                    video_exists = False
+                if video_exists:
+                    needs_frames = self.telegram.register_frame_set_sql(
+                        source_id=int(payload["source_id"]),
+                        message_id=int(payload["message_id"]),
+                        author_id=(
+                            int(payload["author_id"])
+                            if payload.get("author_id") is not None
+                            else None
+                        ),
+                        file_path=str(video_path.resolve(strict=False)),
+                        size=video_size,
+                        mtime_ns=video_mtime_ns,
+                        mark_dirty=False,
+                    )
+                    if needs_frames:
+                        self.telegram._enqueue_frame_job_sql(
+                            int(payload["source_id"]), int(payload["message_id"])
+                        )
                 self.telegram._set_dirty_sql()
             if advance:
                 self.db.execute(
@@ -265,8 +293,13 @@ class Store:
 
     def recent_downloads(self, count: int = 40) -> list[dict]:
         return [dict(r) for r in self.db.execute("""SELECT downloads.*,
-            sources.username AS source_name, sources.post_id
+            sources.username AS source_name, sources.post_id,
+            frames.status AS frame_status, frames.frame_count AS frame_count,
+            frames.error AS frame_error, frames.error_code AS frame_error_code
             FROM downloads LEFT JOIN sources ON downloads.source_id=sources.id
+            LEFT JOIN tg_video_frame_sets frames
+              ON frames.source_id=downloads.source_id
+             AND frames.message_id=downloads.message_id
             ORDER BY downloads.rowid DESC LIMIT ?""", (count,))]
 
     def recent_events(self, count: int = 30) -> list[dict]:

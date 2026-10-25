@@ -8,7 +8,10 @@ import os
 import secrets
 import shutil
 import signal
+import tempfile
+import uuid
 from functools import partial
+from pathlib import Path
 
 from . import __version__
 from .ai import AICore, AIRequest, create_default_core, read_ai_config, write_ai_config
@@ -28,6 +31,12 @@ from .paths import db_path, endpoint_path, ensure_private, socket_path, state_di
 from .platform_support import is_windows, remove_endpoint_if_owned, single_instance, write_endpoint
 from .storage import Store
 from .telegram import AuthFlowError, AuthState, TelegramEngine
+from .video_frames import (
+    FRAME_ALGORITHM_VERSION,
+    ExtractedFrames,
+    FrameExtractionError,
+    extract_frames,
+)
 
 AUTH_OPERATION_TIMEOUT = 80
 
@@ -83,6 +92,15 @@ class Service:
         self.ai_ipc = AIIPC(
             self.store.ai, self.ai_service, self.ai_runner, self.store.telegram
         )
+        self.media_runner = JobRunner(
+            self.store,
+            {"telegram.video_frames": self._telegram_video_frames},
+            parallel=1,
+            retry_interrupted=True,
+            name="media",
+            scheduler=self._enqueue_frame_backfill,
+        )
+        self._catalog_task: asyncio.Task | None = None
         self.stop_requested = asyncio.Event()
         self.collector_state = "stopped"
 
@@ -124,6 +142,51 @@ class Service:
         self.ai_runner.wakeup()
         return jid
 
+    def _schedule_catalog_publish(self) -> None:
+        """Coalesce an eventual publication without blocking the caller."""
+        if not self.store.telegram.catalog_dirty():
+            return
+        if self.runner.running:
+            self._queue_report()
+            return
+        if self._catalog_task is not None and not self._catalog_task.done():
+            return
+        self._catalog_task = asyncio.create_task(
+            self._publish_catalog_when_due(), name="hoard-catalog-deferred"
+        )
+
+    async def _publish_catalog_when_due(self) -> None:
+        """Honour the existing cooldown/backoff and publish if no runner is active."""
+        try:
+            for attempt in range(3):
+                while self.store.telegram.catalog_dirty():
+                    if self.store.telegram.catalog_report_due():
+                        break
+                    await asyncio.sleep(0.25)
+                if not self.store.telegram.catalog_dirty():
+                    return
+                if self.runner.running:
+                    self._queue_report()
+                    return
+                try:
+                    await self._telegram_report({})
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    if attempt >= 2:
+                        return
+                    continue
+                return
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # A closing store or a transient local error must not surface as an
+            # unhandled background-task exception.  The durable dirty marker
+            # remains for the normal startup/report retry path.
+            return
+        finally:
+            self._catalog_task = None
+
     async def _publish_ai_catalog(self) -> None:
         """Publish AI-visible changes even when the Telegram collector is stopped."""
         if not self.store.telegram.catalog_dirty():
@@ -132,13 +195,164 @@ class Service:
             self._queue_report()
             return
         if not self.store.telegram.catalog_report_due():
+            # A recent cooldown or a previous failure must not swallow the dirty
+            # marker.  A bounded deferred task publishes when it is due.
+            self._schedule_catalog_publish()
             return
         try:
             await self._telegram_report({})
         except Exception:
-            # The AI result remains saved; the existing durable dirty marker
-            # and report diagnostics allow a later retry.
-            pass
+            # The AI result remains saved; keep the existing dirty marker and
+            # schedule the normal cooldown-aware retry instead of dropping it.
+            self._schedule_catalog_publish()
+
+    def _enqueue_frame_backfill(self) -> None:
+        """Feed a bounded old-archive backfill without touching the Telegram path."""
+        telegram = self.store.telegram
+        if not telegram.frame_stats()["backfill_active"]:
+            return
+        queued = self.store.db.execute(
+            """SELECT COUNT(*) FROM jobs WHERE kind='telegram.video_frames'
+            AND state IN ('queued','running')"""
+        ).fetchone()[0]
+        if int(queued) >= 8:
+            return
+        cursor = int(telegram.get_setting("frames_backfill_cursor", "0") or 0)
+        rows = telegram.next_frame_backfill_downloads(cursor, 50)
+        if not rows:
+            telegram.set_frame_backfill_cursor(cursor, complete=True)
+            return
+        for row in rows:
+            status = str(row.get("frame_status") or "")
+            if status in {"saved", "pending", "running", "failed", "stale"}:
+                continue
+            try:
+                telegram.queue_frame_job(
+                    int(row["source_id"]), int(row["message_id"])
+                )
+            except ValueError:
+                continue
+        telegram.set_frame_backfill_cursor(
+            int(rows[-1]["cursor_rowid"]), complete=len(rows) < 50
+        )
+
+    async def _telegram_video_frames(self, payload: dict) -> str:
+        source_id = int(payload.get("source_id") or 0)
+        message_id = int(payload.get("message_id") or 0)
+        details = self.store.telegram.frame_set(source_id, message_id)
+        if details is None:
+            raise ValueError("Набор кадров для видеокружка не найден")
+        if str(details.get("status")) == "saved":
+            valid, _reason = self.store.telegram._frame_set_is_valid(
+                details, self.store.telegram.frame_rows(source_id, message_id)
+            )
+            if valid:
+                return "Кадры уже извлечены"
+        video_path = Path(str(details["video_path"]))
+        try:
+            before = video_path.stat()
+            if not video_path.is_file() or before.st_size <= 0:
+                raise OSError
+        except OSError as exc:
+            self.store.telegram.mark_frame_failed(
+                source_id,
+                message_id,
+                error="Исходный MP4 недоступен локально",
+                error_code="source_missing",
+            )
+            raise RuntimeError("Исходный MP4 недоступен локально") from exc
+        self.store.telegram.mark_frame_running(source_id, message_id)
+        final_dir = video_path.with_name(f"{video_path.stem}_frames")
+        parent = final_dir.parent
+        ensure_private(parent)
+        temp_dir = Path(
+            tempfile.mkdtemp(prefix=f".{final_dir.name}-", suffix=".tmp", dir=parent)
+        )
+        backup: Path | None = None
+        try:
+            extracted: ExtractedFrames = await extract_frames(video_path, temp_dir)
+            after = video_path.stat()
+            if (
+                after.st_size != before.st_size
+                or after.st_mtime_ns != before.st_mtime_ns
+            ):
+                raise FrameExtractionError(
+                    "source_changed",
+                    "Исходный MP4 изменился во время обработки",
+                    retryable=True,
+                )
+            backup = final_dir.with_name(f".{final_dir.name}.old-{uuid.uuid4().hex}")
+            if final_dir.exists():
+                os.replace(final_dir, backup)
+            try:
+                os.replace(temp_dir, final_dir)
+            except BaseException:
+                if backup.exists() and not final_dir.exists():
+                    os.replace(backup, final_dir)
+                raise
+            frames: list[dict[str, object]] = []
+            for item in extracted.frames:
+                installed = final_dir / item.path.name
+                installed.chmod(0o600)
+                frames.append(
+                    {
+                        "position": item.position,
+                        "timestamp_seconds": item.timestamp_seconds,
+                        "file_path": str(installed.resolve(strict=False)),
+                        "size": installed.stat().st_size,
+                        "sha256": item.sha256,
+                    }
+                )
+            self.store.telegram.save_frame_set(
+                source_id,
+                message_id,
+                frame_set_id=uuid.uuid4().hex,
+                algorithm_version=FRAME_ALGORITHM_VERSION,
+                duration=extracted.duration,
+                video_size=after.st_size,
+                video_mtime_ns=after.st_mtime_ns,
+                frames=frames,
+            )
+            shutil.rmtree(backup, ignore_errors=True)
+            self.store.event(
+                "ok",
+                f"Кадры видеокружка {source_id}:{message_id} готовы",
+            )
+            self._schedule_catalog_publish()
+            return "Извлечено три кадра"
+        except asyncio.CancelledError:
+            self.store.telegram.mark_frame_pending(
+                source_id, message_id, error="Обработка прервана; повторится после запуска"
+            )
+            raise
+        except FrameExtractionError as exc:
+            self.store.telegram.mark_frame_failed(
+                source_id,
+                message_id,
+                error=str(exc) or "Не удалось извлечь кадры",
+                error_code=exc.code,
+                retry_after=0,
+            )
+            self.store.event(
+                "error",
+                f"Кадры видеокружка {source_id}:{message_id} не созданы: {exc}",
+            )
+            self._schedule_catalog_publish()
+            raise RuntimeError(f"Не удалось извлечь кадры: {exc}") from exc
+        except Exception as exc:
+            self.store.telegram.mark_frame_failed(
+                source_id,
+                message_id,
+                error=f"{type(exc).__name__}: {exc}",
+                error_code="internal_error",
+                retry_after=0,
+            )
+            self._schedule_catalog_publish()
+            raise
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            if backup is not None and backup.exists():
+                shutil.rmtree(backup, ignore_errors=True)
 
     async def _ai_request(self, payload: dict) -> str:
         try:
@@ -354,14 +568,21 @@ class Service:
             return "Сборщик продолжил работу" if was_paused else "Сборщик запущен"
 
     async def start_background(self) -> None:
-        """Start non-Telegram work owned by the single Hoard daemon."""
+        """Start local AI and bounded media work owned by the daemon."""
         if not self.ai_runner.running:
             self.ai_service.register_interrupted_legacy_attempts()
             self.store.ai.recover_interrupted_attempts()
             await self.ai_service.resume_pending_telegram_batches()
         await self.ai_runner.start()
+        await self.media_runner.start()
 
     async def stop_background(self) -> None:
+        task = self._catalog_task
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        self._catalog_task = None
+        await self.media_runner.stop()
         await self.ai_runner.stop()
 
     async def stop(self, *, paused: bool = False) -> str:
@@ -463,6 +684,8 @@ class Service:
                 "sources": self.store.sources(),
                 "downloads": self.store.recent_downloads(),
                 "profiles": self.store.telegram.recent_profiles(),
+                "video_frames": self.store.telegram.frame_stats(),
+                "media_running": self.media_runner.running,
                 "jobs": self.store.recent_jobs(),
                 "events": self.store.recent_events(),
                 "archive_root": str(archive_root),
@@ -471,6 +694,10 @@ class Service:
                     "telegram": True,
                     "rclone": shutil.which("rclone") is not None,
                     "yt_dlp": shutil.which("yt-dlp") is not None,
+                    "ffmpeg": (
+                        shutil.which("ffmpeg") is not None
+                        and shutil.which("ffprobe") is not None
+                    ),
                     "browser": False,
                     "ai": self.ai_core.is_configured(),
                 },
@@ -549,6 +776,61 @@ class Service:
                     str(path) for path in self.store.telegram.allowed_media_roots(root)
                 ],
             }
+        if method in {
+            "telegram_frames_get",
+            "telegram_frames_process",
+        }:
+            source_id = int(args.get("source_id") or 0)
+            message_id = int(args.get("message_id") or 0)
+            video_id = str(args.get("video_id") or "").strip()
+            if video_id and (not source_id or not message_id):
+                try:
+                    source_id, message_id = (int(part) for part in video_id.split(":", 1))
+                except (TypeError, ValueError) as exc:
+                    raise ValueError("video_id должен иметь вид source_id:message_id") from exc
+            if not source_id or not message_id:
+                raise ValueError("Нужны source_id и message_id видеокружка")
+            if method == "telegram_frames_process":
+                job_id = self.store.telegram.queue_frame_job(
+                    source_id, message_id, reset_failed=True
+                )
+                self.media_runner.wakeup()
+                return {
+                    "message": (
+                        f"Извлечение кадров поставлено в очередь: #{job_id}"
+                        if job_id is not None
+                        else "Кадры уже готовы или обработка уже выполняется"
+                    ),
+                    "job_id": job_id,
+                    "frames": self.store.telegram.frame_details(source_id, message_id),
+                    "stats": self.store.telegram.frame_stats(),
+                }
+            return {
+                "frames": self.store.telegram.frame_details(source_id, message_id),
+                "stats": self.store.telegram.frame_stats(),
+            }
+        if method in {
+            "telegram_frames_backfill_start",
+            "telegram_frames_backfill_pause",
+            "telegram_frames_backfill_status",
+            "telegram_frames_retry_failed",
+        }:
+            if method == "telegram_frames_backfill_start":
+                stats = self.store.telegram.start_frame_backfill()
+                self.media_runner.wakeup()
+                return {"message": "Обработка сохранённых видеокружков запущена", "stats": stats}
+            if method == "telegram_frames_backfill_pause":
+                return {
+                    "message": "Постановка новых заданий остановлена",
+                    "stats": self.store.telegram.pause_frame_backfill(),
+                }
+            if method == "telegram_frames_retry_failed":
+                result = self.store.telegram.retry_failed_frames(
+                    limit=int(args.get("limit", 100))
+                )
+                self.media_runner.wakeup()
+                return {"message": f"Повторно поставлено: {result['queued']}", "stats": result}
+            return {"stats": self.store.telegram.frame_stats()}
         if method == "telegram_enrich":
             jobs = 0
             for source in self.store.sources():

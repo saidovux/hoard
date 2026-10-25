@@ -211,11 +211,19 @@ class AIIPC:
             if args.get("external_confirmed") is not True:
                 raise ValueError("Подтверди отправку выбранных фото внешнему AI-провайдеру")
             raw_photos = args.get("photo_ids")
+            if raw_photos is None and str(args.get("image_mode") or "photos") != "photos":
+                raw_photos = []
             if not isinstance(raw_photos, list):
                 raise ValueError("photo_ids должен быть списком")
+            raw_images = args.get("image_ids")
+            if raw_images is not None and not isinstance(raw_images, list):
+                raise ValueError("image_ids должен быть списком")
             analysis = self.chats.queue_telegram_psl(
                 author_id=args.get("author_id"),
                 photo_ids=raw_photos,
+                image_ids=raw_images,
+                image_mode=args.get("image_mode", "photos"),
+                video_id=args.get("video_id"),
                 content=args.get("content"),
                 operation_id=args.get("operation_id"),
                 adult_confirmed=True,
