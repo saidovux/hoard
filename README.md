@@ -1,4 +1,4 @@
-# Hoard 0.7.2.1
+# Hoard 0.7.2.2
 
 Hoard is a local-first Linux and Windows archive for Telegram posts, profiles and video notes
 found in a channel post's comments. It uses Telethon, SQLite, an autonomous offline HTML catalog
@@ -93,6 +93,16 @@ and fetches a new normalized snapshot only after a complete HTML publication; da
 counters and media allowlists are replaced without a full page reload, while search, filters,
 pagination, selection, scroll and active media playback are preserved.
 
+The 0.7.2.2 release ports the Hoard TUI to the Noir v2 terminal-native design while preserving
+all current 0.7.2.1 functionality. The six former pages become four: **Главная** merges Overview
+and Activity, and **Telegram** now owns both the account/collector and Sources. The old
+`overview`, `activity` and `sources` navigation keys still resolve as aliases. Every page is built
+from framed panels whose titles sit in the border, focus lights the active frame, and the footer
+shows screen shortcuts as key chips. A command palette (`:` or Ctrl+K), digit page shortcuts,
+responsive tables and the large/small HOARD wordmark are included. Web lifecycle controls retain
+their own panel on Telegram; Archive keeps frame inspection, frame AI and bounded backfill actions
+integrated into the same visual language, with no functional regression.
+
 The 0.7.2.1 patch tightens two frame-processing boundaries. When AI analysis starts from
 one saved publication, frame selection is restricted to video notes from that same source in
 preview, queueing and durable batch resume; an explicit foreign `video_id` is rejected and no
@@ -134,22 +144,25 @@ screen also retains a direct “Открыть HTML” action for an existing lo
 hoard
 ```
 
-Its implemented sections are **Обзор**, **Telegram**, **Источники**, **Активность**, **Архив** and
-**AI**.
-They cover login including 2FA, collector start/pause/stop, source validation and editing,
-selected-source or global scans, downloads, profile summaries, video-frame processing, jobs,
-errors, enrichment, manual HTML generation, AI chats and AI settings. **Telegram → Web** enables, opens and stops the
-separate local Web process; closing the TUI does not stop a running Web. All daemon operations use
-the private IPC layer; the TUI never opens
-SQLite or creates a Telegram client. Only the visible Activity screen polls, with one status
-request in flight at a time.
+It has four pages: **Главная** (HOARD wordmark, current task, progress, queue, archive figures,
+one line per tool and latest events), **Архив**, and, in the **ИНСТРУМЕНТЫ** group, **Telegram**
+(account, collector, separate Web process and watched sources) and **AI**. Former pages remain
+compatible aliases: `overview`/`activity` open **Главная**, `sources` opens **Telegram**. The
+Archive page keeps downloads, profiles, jobs, catalog actions and the video-frame workflow.
+Telegram keeps login including 2FA, collector start/pause/stop, source validation and editing,
+selected-source or global scans, and Web start/open/stop. All operations use the private daemon
+IPC layer; the TUI never opens SQLite or creates a Telegram client. Only the visible Home screen
+polls, with one status request in flight at a time. See `docs/TUI.md` for the design contract.
 
-The entire Textual surface, including navigation, focus, hover and help modal states, uses
-`#000000`; text is white, secondary text is `#888888`, separators are `#262626` and the accent is
-`#F79646`. Use `j`/`k` or arrows to move, `l`, Right or Enter to open, `h`, Left or Esc to return,
-`?` for help, `b` to toggle the sidebar and `q` to close only the UI. `[` and `]` switch sections
-even when the sidebar is hidden. Tables, buttons and inputs retain their native keyboard behavior.
-On terminals narrower than 60 columns the sidebar hides automatically.
+The interface keeps the entire Textual surface, including navigation, focus, hover, palette and
+help modal states, on `#000000`. Text is white, secondary text `#888888`, frames `#7B4B23`,
+hairlines `#262626` and the accent `#F79646`. Pages are framed panels with titles in the border;
+the focused panel lights up, the footer shows key chips, tables and buttons use an orange selection
+block. Use `j`/`k` or arrows to move, `l`, Right or Enter to open, `h`, Left or Esc to return,
+`1`–`9` to jump to a page, `:` or Ctrl+K for the command palette, `?` for help, `b` to toggle the
+sidebar and `q` to close only the UI. `[` and `]` switch pages even when the sidebar is hidden.
+On terminals narrower than 60 columns the sidebar hides automatically; dense tables drop less
+important columns instead of scrolling sideways.
 
 `hoard ui` and `hoard tui` are compatibility aliases for the same Textual application.
 Scripts and all existing non-interactive commands are unchanged, do not require a TTY and do not
@@ -175,7 +188,7 @@ For development, install the test tools with `python -m pip install -e '.[dev]'`
 
 An upgrade keeps the existing XDG configuration, database, Telegram session and archive.
 If an older daemon is still running, execute `hoard shutdown` before starting the upgraded
-installation. The 0.7.2.1 client accepts only a daemon reporting the same application version and
+installation. The 0.7.2.2 client accepts only a daemon reporting the same application version and
 IPC protocol `1`; it reports the mismatch instead of starting a competing service. If a matching
 daemon already owns the service lock but is still initializing, clients wait for it and show a
 specific startup diagnostic.
@@ -222,7 +235,7 @@ Telegram client.
 
 ## Add a post and archive video notes
 
-Open **Источники** → **Добавить**. The wizard:
+Open **Telegram → Источники** → **Добавить**. The wizard:
 
 1. accepts a public post URL such as `https://t.me/examplechannel/123`;
 2. connects Telegram if needed and verifies that the account can access the post;
@@ -489,7 +502,7 @@ paid DeepSeek requests.
 ## Telegram AI and subjective PSL
 
 In **Архив → Профили**, analyze one saved profile or mark several and choose **Анализировать
-выбранные**. In **Источники**, choose **Анализировать профили** for a saved publication. The same
+выбранные**. In **Telegram → Источники**, choose **Анализ профилей** for a saved publication. The same
 actions are available in `hoard web`. Hoard resolves stable `author_id` values from SQLite, uses
 the complete `tg_profile_sources` relation and defaults to the four newest available local photos
 per profile; it never downloads a new photo or expands Telegram collection for AI. A single
@@ -537,7 +550,7 @@ down.
 - Reopening `hoard` reconnects to the existing daemon.
 
 The Textual TUI is intentionally full-screen and restores the original terminal on exit. Its
-Overview and management screens are idle; only the visible Activity screen refreshes status.
+Home and management screens are idle; only the visible **Главная** screen refreshes status.
 Lists support arrow keys and Vim navigation: `j`/`k` move, `l` or Enter selects, and `h` returns.
 The daemon and its Telegram and AI queues keep running after exit.
 

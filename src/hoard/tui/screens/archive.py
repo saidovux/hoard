@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import webbrowser
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 from rich.text import Text
 from textual.app import ComposeResult
@@ -12,15 +12,21 @@ from textual.containers import Horizontal
 from textual.widgets import Button, DataTable, Select, Static
 
 from ..ai_dialogs import VideoFramesDialog
+from ..colors import ACCENT, MUTED, TEXT
 from ..dialogs import ConfirmDialog
 from ..state import format_bytes
+from ..widgets import Panel
+from ..widgets.chrome import Hint
 from .base import WorkspaceScreen
 
 
 class ArchiveScreen(WorkspaceScreen):
     section = "archive"
-    screen_title = "Архив"
-    screen_subtitle = "Кружки, профили, очередь и переносимый HTML-каталог"
+    HINTS: ClassVar[tuple[Hint, ...]] = (
+        ("j k", "выбор"),
+        ("tab", "действия"),
+        ("[ ]", "раздел"),
+    )
 
     def __init__(self) -> None:
         super().__init__()
@@ -37,73 +43,82 @@ class ArchiveScreen(WorkspaceScreen):
         self._downloads: list[dict] = []
 
     def compose_workspace(self) -> ComposeResult:
-        yield Static(id="archive-summary")
-        with Horizontal(classes="action-row", id="archive-modes"):
-            yield Button("Кружки", id="mode-downloads", variant="primary")
-            yield Button("Профили", id="mode-profiles")
-            yield Button("Задания", id="mode-jobs")
-        with Horizontal(classes="action-row", id="archive-actions"):
-            yield Button("Обновить HTML", id="catalog-build")
-            yield Button("Открыть HTML", id="catalog-open")
-            yield Button("Обновить профили", id="telegram-enrich")
-            yield Button("Повторить ошибку", id="job-retry")
-            yield Button("Анализировать профиль", id="telegram-ai")
-            yield Button("AI: кадры", id="telegram-ai-frames")
-            yield Button("AI: кадры + фото", id="telegram-ai-combined")
-            yield Button("Выбрать / снять", id="profile-select")
-            yield Button("Анализировать выбранные", id="profiles-ai")
-            yield Button("Выбранные: кадры", id="profiles-ai-frames")
-            yield Button("Выбранные: кадры + фото", id="profiles-ai-combined")
-            yield Button("Открыть активную AI-группу", id="batch-reopen")
-        with Horizontal(classes="action-row", id="frame-actions"):
-            yield Button("Кадры кружка", id="frames-view")
-            yield Button("AI по кадрам", id="frames-ai")
-            yield Button("Обработать старые кружки", id="frames-backfill")
-            yield Button("Пауза очереди кадров", id="frames-backfill-pause")
-            yield Button("Повторить ошибки кадров", id="frames-retry")
-        yield Select(
-            [("Все публикации", "")],
-            value="",
-            allow_blank=False,
-            id="profile-source-filter",
-        )
-        with Horizontal(classes="action-row", id="profile-pages"):
-            yield Button("← Профили", id="profiles-previous")
-            yield Static(id="profiles-page-label")
-            yield Button("Профили →", id="profiles-next")
-        yield DataTable(id="archive-table", cursor_type="row")
+        with Panel(title="Архив", id="archive-main"):
+            yield Static(id="archive-summary")
+            with Horizontal(classes="mode-row", id="archive-modes"):
+                yield Button("Кружки", id="mode-downloads", variant="primary")
+                yield Button("Профили", id="mode-profiles")
+                yield Button("Задания", id="mode-jobs")
+            with Horizontal(classes="action-row", id="archive-actions"):
+                yield Button("Обновить HTML", id="catalog-build")
+                yield Button("Открыть HTML", id="catalog-open")
+                yield Button("Обновить профили", id="telegram-enrich")
+                yield Button("Повторить ошибку", id="job-retry")
+                yield Button("Анализировать профиль", id="telegram-ai")
+                yield Button("AI: кадры", id="telegram-ai-frames")
+                yield Button("AI: кадры + фото", id="telegram-ai-combined")
+                yield Button("Выбрать / снять", id="profile-select")
+                yield Button("Анализировать выбранные", id="profiles-ai")
+                yield Button("Выбранные: кадры", id="profiles-ai-frames")
+                yield Button("Выбранные: кадры + фото", id="profiles-ai-combined")
+                yield Button("Открыть активную AI-группу", id="batch-reopen")
+            with Horizontal(classes="action-row", id="frame-actions"):
+                yield Button("Кадры кружка", id="frames-view")
+                yield Button("AI по кадрам", id="frames-ai")
+                yield Button("Обработать старые кружки", id="frames-backfill")
+                yield Button("Пауза очереди кадров", id="frames-backfill-pause")
+                yield Button("Повторить ошибки кадров", id="frames-retry")
+            yield Select(
+                [("Все публикации", "")],
+                value="",
+                allow_blank=False,
+                id="profile-source-filter",
+            )
+            with Horizontal(classes="mode-row", id="profile-pages"):
+                yield Button("← Профили", id="profiles-previous")
+                yield Static(id="profiles-page-label")
+                yield Button("Профили →", id="profiles-next")
+            yield DataTable(id="archive-table", cursor_type="row")
+
+    def on_mount(self) -> None:
+        super().on_mount()
+        self.query_one("#archive-table", DataTable).focus()
 
     def render_data(self, status: dict) -> None:
         stats = status.get("stats") or {}
         text = Text()
-        text.append(f"Кружки {stats.get('downloads', 0)}", style="#FFFFFF")
-        text.append("  ·  ", style="#888888")
-        text.append(f"Профили {stats.get('authors', 0)}", style="#FFFFFF")
-        text.append("  ·  ", style="#888888")
-        text.append(f"Фото профилей {stats.get('profile_photos', 0)}\n", style="#FFFFFF")
+        for position, (label, key) in enumerate(
+            (("Кружки", "downloads"), ("Профили", "authors"), ("Фото профилей", "profile_photos"))
+        ):
+            if position:
+                text.append("   ·   ", style=MUTED)
+            text.append(f"{label} ", style=MUTED)
+            text.append(str(stats.get(key, 0)), style=f"bold {TEXT}")
         frame_stats = status.get("video_frames") or {}
-        text.append("Кадры     ", style="#888888")
+        text.append("\nКадры ", style=MUTED)
         text.append(
             f"{frame_stats.get('saved', 0)} готовы · "
             f"{frame_stats.get('pending', 0)} в работе · "
             f"{frame_stats.get('failed', 0)} ошибок · "
             f"{frame_stats.get('missing', 0)} без набора",
-            style="#FFFFFF",
+            style=TEXT,
         )
         backfill = " · сбор старых: " + (
-            "идёт" if frame_stats.get("backfill_active") else
-            ("завершён" if frame_stats.get("backfill_complete") else "выключен")
+            "идёт"
+            if frame_stats.get("backfill_active")
+            else ("завершён" if frame_stats.get("backfill_complete") else "выключен")
         )
-        text.append(backfill + "\n", style="#888888")
+        text.append(backfill, style=MUTED)
         if not (status.get("integrations") or {}).get("ffmpeg", True):
             text.append(
-                "FFmpeg не найден; новые кадры не будут извлечены. "
-                "Установи FFmpeg и нажми «Повторить ошибки кадров».\n",
-                style="#F79646",
+                "\nFFmpeg не найден; новые кадры не будут извлечены. "
+                "Установи FFmpeg и нажми «Повторить ошибки кадров».",
+                style=ACCENT,
             )
-        text.append("HTML  ", style="#888888")
-        text.append(str(status.get("catalog") or "путь недоступен"), style="#FFFFFF")
+        text.append("\nHTML  ", style=MUTED)
+        text.append(str(status.get("catalog") or "путь недоступен"), style=TEXT)
         self.query_one("#archive-summary", Static).update(text)
+        self._downloads = list(status.get("downloads") or [])
         options = [("Все публикации", "")]
         options.extend(
             (
@@ -116,7 +131,6 @@ class ArchiveScreen(WorkspaceScreen):
         selector = self.query_one("#profile-source-filter", Select)
         selector.set_options(options)
         selector.value = self._profile_source
-        self._downloads = list(status.get("downloads") or [])
         self._render_table(status)
 
     def _render_table(self, status: dict) -> None:
@@ -130,7 +144,6 @@ class ArchiveScreen(WorkspaceScreen):
             for row in rows:
                 author = str(row.get("author_name") or row.get("author_username") or "—")
                 source = f"@{row.get('source_name', '—')}/{row.get('post_id', '—')}"
-                status_value = str(row.get("frame_status") or "")
                 frame_label = {
                     "saved": f"{row.get('frame_count', 3)}/готовы",
                     "pending": "ожидают",
@@ -138,7 +151,7 @@ class ArchiveScreen(WorkspaceScreen):
                     "failed": "ошибка",
                     "stale": "устарели",
                     "missing": "—",
-                }.get(status_value, "—")
+                }.get(str(row.get("frame_status") or ""), "—")
                 table.add_row(
                     str(row.get("date") or "—"),
                     author,
@@ -191,24 +204,21 @@ class ArchiveScreen(WorkspaceScreen):
             if not rows:
                 table.add_row("—", "Заданий пока нет", "—", "0", "—", "—")
         self.query_one("#job-retry", Button).display = self.mode == "jobs"
-        self.query_one("#telegram-ai", Button).display = self.mode == "profiles"
-        self.query_one("#telegram-ai-frames", Button).display = self.mode == "profiles"
-        self.query_one("#telegram-ai-combined", Button).display = self.mode == "profiles"
-        self.query_one("#profile-select", Button).display = self.mode == "profiles"
-        self.query_one("#profiles-ai", Button).display = self.mode == "profiles"
-        self.query_one("#profiles-ai-frames", Button).display = self.mode == "profiles"
-        self.query_one("#profiles-ai-combined", Button).display = self.mode == "profiles"
+        for identifier in ("telegram-ai", "profile-select", "profiles-ai"):
+            self.query_one(f"#{identifier}", Button).display = self.mode == "profiles"
         for identifier in (
-            "frames-view",
-            "frames-ai",
-            "frames-backfill",
-            "frames-backfill-pause",
-            "frames-retry",
+            "telegram-ai-frames", "telegram-ai-combined",
+            "profiles-ai-frames", "profiles-ai-combined",
         ):
-            self.query_one(f"#{identifier}", Button).display = self.mode == "downloads"
+            self.query_one(f"#{identifier}", Button).display = self.mode == "profiles"
         self.query_one("#profile-source-filter", Select).display = self.mode == "profiles"
         self.query_one("#batch-reopen", Button).display = self.mode == "profiles"
         self.query_one("#profile-pages", Horizontal).display = self.mode == "profiles"
+        for identifier in (
+            "frames-view", "frames-ai", "frames-backfill",
+            "frames-backfill-pause", "frames-retry",
+        ):
+            self.query_one(f"#{identifier}", Button).display = self.mode == "downloads"
         if self.mode == "profiles":
             start = self._profile_offset + 1 if rows else 0
             end = self._profile_offset + len(rows)
@@ -260,14 +270,14 @@ class ArchiveScreen(WorkspaceScreen):
             self._frames_backfill("telegram_frames_backfill_pause")
         elif button_id == "frames-retry":
             self._frames_backfill("telegram_frames_retry_failed")
-        elif button_id == "profile-select":
-            self._toggle_profile_selection()
-        elif button_id == "profiles-ai":
-            self._analyze_selected_profiles()
         elif button_id == "profiles-ai-frames":
             self._analyze_selected_profiles("frames")
         elif button_id == "profiles-ai-combined":
             self._analyze_selected_profiles("combined")
+        elif button_id == "profile-select":
+            self._toggle_profile_selection()
+        elif button_id == "profiles-ai":
+            self._analyze_selected_profiles()
         elif button_id == "profiles-previous":
             self._profile_offset = max(0, self._profile_offset - self._profile_limit)
             self._load_profile_page()
@@ -423,8 +433,7 @@ class ArchiveScreen(WorkspaceScreen):
         message_id = int(row.get("message_id") or 0)
         try:
             result = await self.hoard_app.api.ai_call(
-                "telegram_frames_get",
-                {"source_id": source_id, "message_id": message_id},
+                "telegram_frames_get", {"source_id": source_id, "message_id": message_id}
             )
         except Exception as exc:
             self.hoard_app.set_notice(str(exc), error=True)
@@ -436,11 +445,8 @@ class ArchiveScreen(WorkspaceScreen):
             )
             return
         self.app.push_screen(
-            VideoFramesDialog(
-                details,
-                video_id=f"{source_id}:{message_id}",
-            ),
-            lambda value: self._frames_dialog_closed(value),
+            VideoFramesDialog(details, video_id=f"{source_id}:{message_id}"),
+            self._frames_dialog_closed,
         )
 
     def _frames_dialog_closed(self, value: dict | None) -> None:
@@ -481,13 +487,13 @@ class ArchiveScreen(WorkspaceScreen):
         if author_id is None:
             return
         if author_id <= 0:
-            self.hoard_app.set_notice("Каналы и чаты нельзя анализировать как профиль.", error=True)
+            self.hoard_app.set_notice(
+                "Каналы и чаты нельзя анализировать как профиль.", error=True
+            )
             return
-        selector = {
-            "author_ids": [author_id],
-            "image_mode": mode,
-        }
-        self.hoard_app.open_telegram_analysis(selector)
+        self.hoard_app.open_telegram_analysis(
+            {"author_ids": [author_id], "image_mode": mode}
+        )
 
     def _frames_backfill(self, method: str) -> None:
         self.run_worker(
@@ -522,9 +528,7 @@ class ArchiveScreen(WorkspaceScreen):
         if not self._selected_profiles:
             self.hoard_app.set_notice("Сначала выбери один или несколько профилей.", error=True)
             return
-        selector: dict[str, Any] = {
-            "author_ids": sorted(self._selected_profiles),
-        }
+        selector: dict[str, Any] = {"author_ids": sorted(self._selected_profiles)}
         if image_mode != "photos":
             selector["image_mode"] = image_mode
         self.hoard_app.open_telegram_analysis(selector)

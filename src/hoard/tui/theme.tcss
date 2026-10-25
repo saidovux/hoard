@@ -1,8 +1,14 @@
-$background: #000000;
-$text: #FFFFFF;
-$text-muted: #888888;
-$accent: #F79646;
-$separator: #262626;
+/* Hoard Noir: black ground, one orange accent, a few quiet greys.
+ *
+ *   #000000  every surface            #F79646  focus, active, live, errors, titles
+ *   #FFFFFF  primary text             #7B4B23  frames and the logo shadow at rest
+ *   #888888  secondary text, labels   #262626  tracks and dividers
+ *
+ * The page is a set of framed panels with their titles set into the border, like the tools it
+ * keeps company with (lazygit, btop, k9s). A frame is dim orange at rest and full orange while
+ * anything inside it has focus; buttons are plain words that turn into an orange block on focus.
+ * Orange is reserved for meaning: where you are, what is alive, what needs you.
+ */
 
 * {
     background: #000000;
@@ -13,9 +19,15 @@ $separator: #262626;
     scrollbar-color: #262626;
     scrollbar-color-hover: #F79646;
     scrollbar-color-active: #F79646;
+    scrollbar-size: 1 1;
 }
 
-App, Screen, ModalScreen, Container, Horizontal, Vertical, VerticalScroll,
+/* Textual lightens focused widgets with a tint; the ground must stay black. */
+*:focus, *:hover {
+    background-tint: transparent;
+}
+
+App, Screen, ModalScreen, Container, Horizontal, Vertical, VerticalScroll, Grid,
 Header, Footer, Static, Label, Input, TextArea, OptionList, ListView, DataTable,
 Select, SelectOverlay, SelectionList, Button {
     background: #000000;
@@ -25,42 +37,96 @@ Screen {
     layout: vertical;
 }
 
+/* ── chrome ─────────────────────────────────────────────────────────────── */
+
 #hoard-header {
-    height: 2;
-    padding: 0 1;
-    content-align: left middle;
-    border-bottom: solid #262626;
+    height: 1;
+    padding: 0 2;
 }
 
 #screen-body {
     height: 1fr;
     min-height: 1;
+    padding: 0 1;
+}
+
+#statusbar {
+    height: 1;
+    padding: 0 2;
+    color: #888888;
+}
+
+#content {
+    width: 1fr;
+    height: 100%;
+}
+
+#workspace {
+    width: 100%;
+    height: 1fr;
+    min-width: 1;
+    padding: 0;
+}
+
+#action-feedback {
+    display: none;
+    height: auto;
+    max-height: 3;
+    padding: 0 2;
+    color: #FFFFFF;
+}
+
+#status-error {
+    display: none;
+    height: auto;
+    min-height: 3;
+    color: #F79646;
+    border-left: solid #F79646;
+    padding-left: 1;
+    margin-bottom: 1;
+}
+
+/* One text axis: a button keeps one blank column inside its label, so every other block
+   starts one column in as well and labels, text and table cells line up. */
+#workspace Static, .dialog Static, .dialog Label {
+    padding-left: 1;
+}
+
+/* ── panels ─────────────────────────────────────────────────────────────── */
+
+.panel {
+    height: auto;
+    padding: 0 1 0 0;
+    border: round #7B4B23;
+    border-title-color: #F79646;
+    border-title-background: #000000;
+    border-title-style: bold;
+    border-title-align: left;
+    border-subtitle-color: #888888;
+    border-subtitle-background: #000000;
+    border-subtitle-align: right;
+}
+
+.panel:focus-within {
+    border: round #F79646;
 }
 
 #sidebar {
-    width: 23;
+    width: 22;
     min-width: 18;
     height: 100%;
-    padding: 1;
-    border-right: solid #262626;
+    margin-right: 1;
+    padding: 0 1;
 }
 
 .sidebar-hidden #sidebar {
     display: none;
 }
 
-.eyebrow, .section-heading {
-    color: #F79646;
-    text-style: bold;
-}
-
-.eyebrow {
-    height: 2;
-}
-
 #navigation {
     height: auto;
-    min-height: 6;
+    max-height: 100%;
+    min-height: 4;
     border: none;
     padding: 0;
     background: #000000;
@@ -75,8 +141,14 @@ OptionList > .option-list--option,
 OptionList > .option-list--option-highlighted,
 OptionList > .option-list--option-hover,
 OptionList > .option-list--option-disabled,
-OptionList > .option-list--separator {
+OptionList > .option-list--separator,
+OptionList:focus > .option-list--option,
+OptionList:focus > .option-list--option-highlighted {
     background: #000000;
+}
+
+OptionList > .option-list--option {
+    color: #FFFFFF;
 }
 
 OptionList > .option-list--option-highlighted,
@@ -85,124 +157,370 @@ OptionList > .option-list--option-hover {
     text-style: bold;
 }
 
-#workspace {
-    width: 1fr;
-    height: 100%;
-    min-width: 1;
-    padding: 1 2;
-    background: #000000;
+/* The selection bar: an orange block while the list has the keyboard. */
+OptionList:focus > .option-list--option-highlighted {
+    color: #F79646;
+    text-style: bold reverse;
 }
 
-.compact #workspace {
-    padding: 0 1;
-}
-
-.screen-title {
-    height: 2;
-    color: #FFFFFF;
-    text-style: bold;
-}
-
-.screen-subtitle {
-    height: 2;
+OptionList > .option-list--option-disabled {
     color: #888888;
 }
 
-#status-error, #action-feedback {
-    display: none;
+OptionList > .option-list--separator {
+    color: #262626;
+}
+
+/* ── masthead: the big wordmark when there is room, the small one otherwise ─ */
+
+.hero {
     height: auto;
+    margin-bottom: 1;
+    text-wrap: nowrap;
+    text-overflow: clip;
+}
+
+.hero-small {
+    display: none;
+}
+
+.short .hero-big, .compact .hero-big {
+    display: none;
+}
+
+.short .hero-small, .compact .hero-small {
+    display: block;
+}
+
+.tiny .hero-small {
+    display: none;
+}
+
+/* ── Home ───────────────────────────────────────────────────────────────── */
+
+#home-grid {
+    layout: grid;
+    grid-size: 2;
+    grid-columns: 1fr 1fr;
+    grid-rows: auto;
+    grid-gutter: 0 1;
+    height: auto;
+}
+
+#home-grid > .panel {
+    height: 100%;
+}
+
+/* What is running takes the whole left side; the figures stack on its right. */
+#now-panel {
+    row-span: 2;
+}
+
+#tools-panel {
+    column-span: 2;
+}
+
+.narrow #home-grid {
+    grid-size: 1;
+    grid-columns: 1fr;
+}
+
+.narrow #now-panel {
+    row-span: 1;
+}
+
+.narrow #tools-panel {
+    column-span: 1;
+}
+
+#events-panel {
+    height: 1fr;
+    min-height: 5;
+}
+
+.tiny #events-panel {
     min-height: 3;
-    color: #F79646;
-    border-left: solid #F79646;
-    padding-left: 1;
+}
+
+#current-action, #progress, #telegram-summary, #tools, #statistics, #queue-stats, #events {
+    height: auto;
+    min-height: 1;
+}
+
+/* A spanning panel is measured at one column's width: wrapped lines would reserve phantom rows. */
+#current-action, #progress, #events, #statistics, #queue-stats, #tools {
+    text-wrap: nowrap;
+    text-overflow: ellipsis;
+}
+
+/* ── Telegram ───────────────────────────────────────────────────────────── */
+
+#sources-panel {
+    height: 1fr;
+    min-height: 9;
+}
+
+#sources-table {
+    height: 1fr;
+    min-height: 3;
+}
+
+/* ── Archive ────────────────────────────────────────────────────────────── */
+
+#archive-main {
+    height: 1fr;
+    min-height: 12;
+}
+
+#archive-table {
+    height: 1fr;
+    min-height: 3;
+}
+
+#archive-summary, #ai-summary, #ai-statistics, #ai-history,
+#telegram-ai-photos, #telegram-ai-previous {
+    height: auto;
+    min-height: 1;
     margin-bottom: 1;
 }
 
-#action-feedback {
-    color: #FFFFFF;
-    border-left: solid #262626;
-}
-
-#overview-grid {
-    height: auto;
-    min-height: 10;
-}
-
-#system-summary, #statistics {
-    width: 1fr;
-    height: auto;
-    min-height: 8;
-}
-
-.compact #overview-grid {
-    layout: vertical;
-    min-height: 16;
-}
-
-.compact #system-summary, .compact #statistics {
-    width: 100%;
-}
-
-.section-heading {
-    height: 2;
-    margin-top: 1;
-    border-bottom: solid #262626;
-}
-
-#events, #progress, #current-action, #activity-queue {
-    height: auto;
-    min-height: 2;
-    padding-top: 1;
-}
-
-#progress {
-    min-height: 4;
-}
-
-#statusbar {
-    height: 2;
-    padding: 0 1;
+.table-help {
     color: #888888;
-    content-align: left middle;
-    border-top: solid #262626;
 }
 
-.compact #statusbar {
-    height: 2;
-}
+/* ── actions: words in a row, never boxes ───────────────────────────────── */
 
-Input, TextArea, DataTable, Select, SelectOverlay, SelectionList,
-Input:focus, TextArea:focus, DataTable:focus, Select:focus,
-Input:hover, TextArea:hover, DataTable:hover, Select:hover,
-Button, Button:hover, Button:focus, Button:disabled,
+Button,
+Button:hover, Button:focus, Button:disabled,
 Button.-primary, Button.-primary:hover, Button.-primary:focus,
-Button.-default, Button.-default:hover, Button.-default:focus {
+Button.-default, Button.-default:hover, Button.-default:focus,
+Button.-active {
     background: #000000;
-    border: solid #262626;
+    background-tint: transparent;
+    tint: transparent;
+    border: none;
 }
 
 Button {
+    width: auto;
+    min-width: 0;
+    height: 1;
+    padding: 0;
     color: #FFFFFF;
-    min-width: 12;
+    text-style: none;
+    text-align: left;
+    content-align: left middle;
 }
 
-Button:hover, Button:focus, Button.-primary, Button.-primary:hover,
-Button.-primary:focus {
+Button:hover {
+    color: #F79646;
+}
+
+Button.-primary {
     color: #F79646;
     text-style: bold;
-    border: solid #F79646;
+}
+
+Button:focus, Button.-primary:focus {
+    color: #F79646;
+    text-style: bold reverse;
 }
 
 Button:disabled {
     color: #888888;
-    border: solid #262626;
-    opacity: 60%;
+    text-style: none;
+    opacity: 70%;
 }
 
-DataTable > .datatable--cursor,
-DataTable > .datatable--hover,
+.action-row {
+    layout: grid;
+    grid-size: 3;
+    grid-columns: auto;
+    grid-rows: 1;
+    grid-gutter: 0 3;
+    width: 100%;
+    height: auto;
+    min-height: 1;
+    margin-bottom: 1;
+}
+
+#telegram-actions {
+    grid-size: 4;
+    margin-bottom: 0;
+}
+
+#source-actions {
+    grid-size: 6;
+}
+
+#web-actions {
+    grid-size: 3;
+}
+
+#source-ai-actions {
+    grid-size: 3;
+}
+
+#archive-actions, #ai-actions {
+    grid-size: 3;
+}
+
+.narrow #telegram-actions {
+    grid-size: 2;
+}
+
+.medium #source-actions {
+    grid-size: 3;
+}
+
+.medium #source-ai-actions {
+    grid-size: 2;
+}
+
+.medium #archive-actions, .medium #ai-actions {
+    grid-size: 2;
+}
+
+.compact #telegram-actions, .compact #source-actions, .compact #source-ai-actions,
+.compact #web-actions {
+    grid-size: 2;
+}
+
+.compact #archive-actions, .compact #ai-actions {
+    grid-size: 1;
+}
+
+/* Modes are tabs: the chosen one is orange and underlined. */
+.mode-row {
+    layout: horizontal;
+    width: 100%;
+    height: 1;
+    margin-bottom: 1;
+}
+
+.mode-row Button {
+    color: #888888;
+    margin-right: 3;
+}
+
+.mode-row Button:hover {
+    color: #FFFFFF;
+}
+
+.mode-row Button.-primary {
+    color: #F79646;
+    text-style: bold underline;
+}
+
+.mode-row Button:focus, .mode-row Button.-primary:focus {
+    color: #F79646;
+    text-style: bold reverse;
+}
+
+#profiles-page-label {
+    width: auto;
+    height: 1;
+    margin-right: 2;
+    color: #888888;
+}
+
+/* ── fields and tables ──────────────────────────────────────────────────── */
+
+Input, Input:focus, Input:hover {
+    background: #000000;
+    border: none;
+    border-bottom: solid #262626;
+    height: 2;
+    padding: 0 1;
+}
+
+Input:focus {
+    border-bottom: solid #F79646;
+}
+
+Input > .input--placeholder {
+    color: #888888;
+}
+
+TextArea, TextArea:focus, TextArea:hover {
+    background: #000000;
+    border: solid #262626;
+}
+
+TextArea:focus {
+    border: solid #F79646;
+}
+
+Select, Select:focus, Select:hover {
+    background: #000000;
+    border: none;
+}
+
+SelectOverlay, SelectionList, SelectionList:focus, SelectionList:hover {
+    background: #000000;
+    border: solid #262626;
+}
+
+SelectionList:focus, SelectOverlay:focus {
+    border: solid #F79646;
+}
+
+SelectCurrent, SelectCurrent:focus, SelectCurrent:hover,
+Select:focus > SelectCurrent, Select.-expanded > SelectCurrent {
+    background: #000000;
+    border: none;
+    border-bottom: solid #262626;
+    padding: 0;
+}
+
+Select:focus > SelectCurrent, Select.-expanded > SelectCurrent {
+    border-bottom: solid #F79646;
+}
+
+DataTable, DataTable:focus, DataTable:hover {
+    background: #000000;
+    border: none;
+    padding: 0;
+}
+
 DataTable > .datatable--header,
 DataTable > .datatable--fixed,
+DataTable:focus > .datatable--header {
+    background: #000000;
+    color: #888888;
+    text-style: bold;
+}
+
+/* The row under the cursor is orange text; while the table has the keyboard it is a block. */
+DataTable > .datatable--cursor {
+    background: #000000;
+    color: #F79646;
+    text-style: bold;
+}
+
+DataTable:focus > .datatable--cursor {
+    background: #000000;
+    color: #F79646;
+    text-style: bold reverse;
+}
+
+DataTable > .datatable--hover {
+    background: #000000;
+    color: #FFFFFF;
+}
+
+DataTable > .datatable--header-cursor,
+DataTable > .datatable--header-hover,
+DataTable > .datatable--fixed-cursor,
+DataTable:focus > .datatable--fixed-cursor {
+    background: #000000;
+    color: #F79646;
+}
+
+DataTable:focus > .datatable--header {
+    background-tint: transparent;
+}
+
 SelectionList > .selection-list--button,
 SelectionList > .selection-list--button-selected,
 SelectOverlay > .option-list--option,
@@ -211,82 +529,33 @@ SelectOverlay > .option-list--option-hover {
     background: #000000;
 }
 
-#help-card {
-    width: 54;
-    max-width: 90%;
-    height: auto;
-    padding: 1 2;
-    background: #000000;
-    color: #FFFFFF;
-    border: solid #F79646;
-}
-
-.action-row {
-    layout: grid;
-    grid-size: 3;
-    grid-columns: 1fr 1fr 1fr;
-    grid-rows: 3;
-    grid-gutter: 0 1;
-    width: 100%;
-    height: auto;
-    min-height: 3;
+#profile-source-filter {
+    width: 48;
+    max-width: 100%;
     margin-bottom: 1;
 }
 
-.action-row Button {
+/* ── AI workspace ───────────────────────────────────────────────────────── */
+
+#ai-main {
+    min-height: 10;
+}
+
+#ai-table {
     width: 100%;
-    margin-right: 0;
-}
-
-.compact .action-row {
-    grid-size: 1;
-    grid-columns: 1fr;
-}
-
-.compact .action-row Button {
-    width: 100%;
-}
-
-#telegram-summary, #collector-help, #archive-summary, #ai-onboarding, .table-help {
-    height: auto;
-    min-height: 3;
-    margin-bottom: 1;
-}
-
-.table-help {
-    color: #888888;
-}
-
-#sources-table, #archive-table, #ai-table {
-    width: 100%;
-    height: 18;
-    min-height: 8;
-    border: solid #262626;
-}
-
-.compact #sources-table, .compact #archive-table, .compact #ai-table {
-    height: 12;
-}
-
-#archive-actions {
-    grid-size: 3;
-    grid-columns: 1fr 1fr 1fr;
-}
-
-.ai-mode-row {
-    grid-size: 5;
-    grid-columns: 1fr 1fr 1fr 1fr 1fr;
-}
-
-#ai-actions {
-    grid-size: 4;
-    grid-columns: 1fr 1fr 1fr 1fr;
+    height: 16;
     min-height: 6;
 }
 
-#ai-summary, #ai-statistics, #ai-history, #telegram-ai-photos, #telegram-ai-previous {
-    height: auto;
-    min-height: 3;
+.short #ai-table {
+    height: 9;
+}
+
+.tiny #ai-table {
+    height: 6;
+}
+
+.ai-mode-row {
     margin-bottom: 1;
 }
 
@@ -294,10 +563,29 @@ SelectOverlay > .option-list--option-hover {
     height: auto;
 }
 
+.section-heading, #ai-chat-title {
+    height: 1;
+    color: #F79646;
+    text-style: bold;
+}
+
 #ai-message, #record-content, #record-schema, #telegram-ai-content {
     height: 7;
     min-height: 4;
     margin-bottom: 1;
+}
+
+#ai-onboarding {
+    width: 100%;
+    max-width: 58;
+    height: auto;
+    padding: 1 2;
+    margin-bottom: 1;
+    border-left: solid #F79646;
+}
+
+#ai-onboarding Button {
+    margin-top: 1;
 }
 
 .ai-record-dialog, .telegram-ai-dialog, .telegram-analysis-dialog {
@@ -324,36 +612,75 @@ SelectOverlay > .option-list--option-hover {
     border: solid #262626;
 }
 
-#ai-onboarding {
-    width: 100%;
-    max-width: 58;
-    padding: 2 1;
-    border-left: solid #F79646;
-}
-
-#ai-onboarding Button {
-    width: 28;
-    margin-top: 1;
-}
-
-.compact #archive-actions, .compact .ai-mode-row, .compact #ai-actions {
-    grid-size: 1;
-    grid-columns: 1fr;
-    min-height: 3;
-}
+/* ── modals: framed in full orange ──────────────────────────────────────── */
 
 ModalScreen {
     align: center middle;
     background: #000000;
 }
 
+#help-card {
+    width: 58;
+    max-width: 94%;
+    height: auto;
+    max-height: 96%;
+    padding: 1 3;
+    background: #000000;
+    color: #FFFFFF;
+    border: round #F79646;
+}
+
+#help-text {
+    height: auto;
+}
+
+PaletteScreen {
+    align: center top;
+}
+
+#palette {
+    width: 66;
+    max-width: 96%;
+    height: auto;
+    max-height: 90%;
+    margin-top: 3;
+    padding: 1 2;
+    border: round #F79646;
+}
+
+.short #palette {
+    margin-top: 1;
+}
+
+.tiny #palette {
+    margin-top: 0;
+}
+
+#palette-input, #palette-input:focus, #palette-input:hover {
+    height: 1;
+    border: none;
+    padding: 0;
+}
+
+#palette-rule {
+    height: 1;
+    margin-top: 1;
+}
+
+#palette-list {
+    height: auto;
+    max-height: 14;
+    border: none;
+    padding: 0;
+}
+
 .dialog {
     width: 72;
     max-width: 94%;
     height: auto;
-    max-height: 90%;
-    padding: 1 2;
-    border: solid #F79646;
+    max-height: 94%;
+    padding: 1 3;
+    border: round #F79646;
     background: #000000;
 }
 
@@ -379,6 +706,7 @@ ModalScreen {
 
 .field-label {
     height: 1;
+    margin-top: 1;
     color: #888888;
 }
 
@@ -388,19 +716,20 @@ ModalScreen {
 }
 
 .dialog-actions {
+    layout: horizontal;
     width: 100%;
     height: auto;
-    min-height: 3;
-    margin-top: 0;
+    min-height: 1;
+    margin-top: 1;
 }
 
 .dialog-actions Button {
     width: auto;
-    margin-right: 1;
+    margin-right: 3;
 }
 
 .compact .dialog {
-    padding: 0 1;
+    padding: 0 2;
 }
 
 .compact .dialog-actions {

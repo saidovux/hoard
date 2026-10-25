@@ -5,6 +5,12 @@ Local-first Telegram archive and extensible small-tool core, Python >=3.11. Keep
 - The only interactive terminal client is the full-screen Textual app in `src/hoard/tui/` with its
   strictly black theme and accent #F79646. `hoard`, `hoard ui` and `hoard tui` all launch it;
   `hoard ui` and `hoard tui` are compatibility aliases. The legacy Rich/InquirerPy UI is gone.
+- Keep the Noir terminal-native visual language: black surfaces, `#FFFFFF` text, `#888888` hints,
+  `#7B4B23` frames at rest, `#262626` hairlines and `#F79646` focus/meaning. Pages are framed
+  `Panel`s with titles in the border, shortcuts as key chips and orange block selection. `Home`,
+  `Archive`, `Telegram` and `AI` are the four registry pages; `overview`/`activity`/`sources`
+  remain navigation aliases. New controls for existing features must fit this language instead of
+  adding a new visual system or unmounted section.
 - Maintain existing XDG session/config/database locations and schema. Never commit sessions, API keys, downloaded media, local archives or real profile data.
 - Preserve `hoard start`, `stop`, `scan`, `status`, `shutdown`, `add`, `retry`, `telegram` and
   `web` and their noninteractive/JSON output. Service commands must not import Textual.

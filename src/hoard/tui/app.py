@@ -7,8 +7,10 @@ import uuid
 from collections.abc import Awaitable, Callable
 from typing import Any, ClassVar
 
+from rich.text import Text
 from textual.app import App
 from textual.binding import Binding
+from textual.containers import VerticalScroll
 from textual.events import Resize
 from textual.screen import ModalScreen
 from textual.theme import Theme
@@ -24,18 +26,15 @@ from textual.widgets import (
     TextArea,
 )
 
+from hoard import __version__
+
 from .ai_dialogs import AIKeyDialog, TelegramAIDialog, TelegramAnalysisDialog
 from .api import HoardAPI, IPCStatusAPI
+from .colors import ACCENT, MUTED, TEXT
 from .dialogs import AuthDialog
-from .navigation import SECTIONS, section_index
-from .screens import (
-    ActivityScreen,
-    AIWorkspaceScreen,
-    ArchiveScreen,
-    OverviewScreen,
-    SourcesScreen,
-    TelegramScreen,
-)
+from .navigation import SECTIONS, breadcrumb, resolve, section_index
+from .palette import Command, PaletteScreen
+from .screens import AIWorkspaceScreen, ArchiveScreen, HomeScreen, TelegramScreen
 from .screens.base import WorkspaceScreen
 from .widgets import Sidebar
 
@@ -64,6 +63,42 @@ BLACK_THEME = Theme(
 )
 
 
+def _help_text() -> Text:
+    sections = (
+        (
+            "Навигация",
+            (
+                ("j k  ↑ ↓", "выбор"),
+                ("l  →  ⏎", "открыть"),
+                ("h  ←  esc", "назад"),
+                ("[ ]", "предыдущий / следующий раздел"),
+                (f"1 – {min(9, len(SECTIONS))}", "перейти к разделу"),
+                ("tab  ⇧tab", "следующий / предыдущий элемент"),
+            ),
+        ),
+        (
+            "Общее",
+            (
+                (":  ctrl+k", "палитра команд"),
+                ("b", "скрыть / показать меню"),
+                ("?", "эта подсказка"),
+                ("q", "выход"),
+            ),
+        ),
+    )
+    text = Text()
+    text.append("hoard", style=f"bold {ACCENT}")
+    text.append(f"  v{__version__}", style=MUTED)
+    for title, rows in sections:
+        text.append(f"\n\n{title.upper()}\n", style=f"bold {MUTED}")
+        for position, (keys, meaning) in enumerate(rows):
+            if position:
+                text.append("\n")
+            text.append(keys.ljust(12), style=f"bold {ACCENT}")
+            text.append(meaning, style=TEXT)
+    return text
+
+
 class HelpScreen(ModalScreen[None]):
     BINDINGS = [
         Binding("escape", "dismiss", "Закрыть"),
@@ -71,20 +106,26 @@ class HelpScreen(ModalScreen[None]):
     ]
 
     def compose(self):
-        yield Static(
-            "КЛАВИАТУРА\n\n"
-            "j / ↓        вниз\n"
-            "k / ↑        вверх\n"
-            "l / → / Enter  открыть\n"
-            "h / ← / Esc    назад\n"
-            "Tab           следующий элемент\n"
-            "Shift+Tab     предыдущий\n"
-            "b             скрыть sidebar\n"
-            "[ / ]         сменить раздел\n"
-            "?             помощь\n"
-            "q             выход",
-            id="help-card",
-        )
+        with VerticalScroll(id="help-card"):
+            yield Static(_help_text(), id="help-text")
+
+
+#: Actions that must never fire while a modal is open or text is being typed.
+GLOBAL_ACTIONS = frozenset(
+    {
+        "quit",
+        "help",
+        "palette",
+        "nav_down",
+        "nav_up",
+        "open",
+        "back",
+        "sidebar",
+        "previous_section",
+        "next_section",
+        "goto_section",
+    }
+)
 
 
 class HoardApp(App[None]):
@@ -94,11 +135,9 @@ class HoardApp(App[None]):
     TITLE = "Hoard"
     ENABLE_COMMAND_PALETTE = False
     SCREENS: ClassVar[dict[str, type[WorkspaceScreen]]] = {
-        "overview": OverviewScreen,
-        "telegram": TelegramScreen,
-        "sources": SourcesScreen,
-        "activity": ActivityScreen,
+        "home": HomeScreen,
         "archive": ArchiveScreen,
+        "telegram": TelegramScreen,
         "ai": AIWorkspaceScreen,
     }
     BINDINGS = [
@@ -113,6 +152,12 @@ class HoardApp(App[None]):
         Binding("b", "sidebar", "Sidebar"),
         Binding("[", "previous_section", "Предыдущий раздел"),
         Binding("]", "next_section", "Следующий раздел"),
+        Binding(":", "palette", "Команды"),
+        Binding("ctrl+k", "palette", "Команды", show=False),
+        *(
+            Binding(str(number), f"goto_section({number - 1})", show=False)
+            for number in range(1, min(9, len(SECTIONS)) + 1)
+        ),
     ]
 
     def __init__(self, api: HoardAPI | None = None) -> None:
@@ -129,7 +174,7 @@ class HoardApp(App[None]):
     def on_mount(self) -> None:
         self.register_theme(BLACK_THEME)
         self.theme = BLACK_THEME.name
-        self.push_screen("overview")
+        self.push_screen("home")
         self.run_worker(self._startup(), name="daemon-startup", exit_on_error=False)
 
     async def _startup(self) -> None:
@@ -196,6 +241,7 @@ class HoardApp(App[None]):
         return result
 
     def open_section(self, section: str) -> None:
+        section = resolve(section)
         if isinstance(self.screen, HelpScreen) or section not in self.SCREENS:
             return
         current = getattr(self.screen, "section", None)
@@ -435,7 +481,7 @@ class HoardApp(App[None]):
         await self._poll_telegram_batch(str(batch["id"]))
 
     def open_web_interface(self) -> None:
-        # Preparation may take as long as the real HTML build.  Keep the TUI
+        # Preparation may take as long as the real HTML build. Keep the TUI
         # responsive and make the waiting state explicit instead of blocking.
         self.set_notice("Подготавливаю локальный веб-интерфейс…")
         self.run_worker(
@@ -463,29 +509,9 @@ class HoardApp(App[None]):
         )
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
-        if isinstance(self.screen, ModalScreen) and action in {
-            "quit",
-            "help",
-            "nav_down",
-            "nav_up",
-            "open",
-            "back",
-            "sidebar",
-            "previous_section",
-            "next_section",
-        }:
+        if isinstance(self.screen, ModalScreen) and action in GLOBAL_ACTIONS:
             return False
-        if self._is_text_entry(self.focused) and action in {
-            "quit",
-            "help",
-            "nav_down",
-            "nav_up",
-            "open",
-            "back",
-            "sidebar",
-            "previous_section",
-            "next_section",
-        }:
+        if self._is_text_entry(self.focused) and action in GLOBAL_ACTIONS:
             return False
         return super().check_action(action, parameters)
 
@@ -534,8 +560,8 @@ class HoardApp(App[None]):
     def action_back(self) -> None:
         if self._is_text_entry(self.focused):
             return
-        if getattr(self.screen, "section", None) != "overview":
-            self.open_section("overview")
+        if getattr(self.screen, "section", None) != "home":
+            self.open_section("home")
 
     def action_help(self) -> None:
         if isinstance(self.screen, HelpScreen):
@@ -543,12 +569,53 @@ class HoardApp(App[None]):
         else:
             self.push_screen(HelpScreen())
 
+    def commands(self) -> list[Command]:
+        """Everything the palette offers: each section, then the app-level commands."""
+        entries = [
+            Command(
+                f"goto:{section.key}",
+                section.label,
+                hint=str(number) if number < 10 else "",
+                keywords=section.keywords,
+                context=breadcrumb(section.key)[0].label if section.parent else "",
+            )
+            for number, section in enumerate(SECTIONS, start=1)
+        ]
+        entries += [
+            Command("web", "Открыть веб-интерфейс", keywords=("браузер", "web", "каталог")),
+            Command("sidebar", "Показать / скрыть меню", "b", keywords=("sidebar", "навигация")),
+            Command("help", "Горячие клавиши", "?", keywords=("помощь", "клавиши", "help")),
+            Command("quit", "Выйти", "q", keywords=("закрыть", "exit", "quit")),
+        ]
+        return entries
+
+    def action_palette(self) -> None:
+        self.push_screen(PaletteScreen(self.commands()), self._run_command)
+
+    def _run_command(self, key: str | None) -> None:
+        if not key:
+            return
+        if key.startswith("goto:"):
+            self.open_section(key.removeprefix("goto:"))
+        elif key == "web":
+            self.open_web_interface()
+        elif key == "sidebar":
+            self.action_sidebar()
+        elif key == "help":
+            self.action_help()
+        elif key == "quit":
+            self.exit()
+
+    def action_goto_section(self, index: int) -> None:
+        if 0 <= index < len(SECTIONS) and not self._is_text_entry(self.focused):
+            self.open_section(SECTIONS[index].key)
+
     def action_sidebar(self) -> None:
         if not self._is_text_entry(self.focused):
             self.toggle_class("sidebar-hidden")
 
     def _move_section(self, offset: int) -> None:
-        current = getattr(self.screen, "section", "overview")
+        current = getattr(self.screen, "section", "home")
         index = (section_index(current) + offset) % len(SECTIONS)
         self.open_section(SECTIONS[index].key)
 
@@ -566,8 +633,14 @@ class HoardApp(App[None]):
             self.set_class(narrow, "sidebar-hidden")
             self._last_narrow = narrow
         self.set_class(event.size.width < 76, "compact")
+        self.set_class(event.size.width < 96, "narrow")
+        self.set_class(event.size.width < 110, "medium")
+        self.set_class(event.size.height < 30, "short")
+        self.set_class(event.size.height < 22, "tiny")
+        if isinstance(self.screen, WorkspaceScreen) and self.screen.is_mounted:
+            self.screen.call_after_refresh(self.screen.on_app_resize)
 
     def on_unmount(self) -> None:
         for screen in self.screen_stack:
-            if isinstance(screen, ActivityScreen):
+            if isinstance(screen, HomeScreen):
                 screen.stop_polling()

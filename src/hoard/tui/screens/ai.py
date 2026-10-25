@@ -14,13 +14,12 @@ from textual.widgets import Button, DataTable, Input, Select, Static, TextArea
 
 from ..ai_dialogs import AIRecordDialog
 from ..dialogs import ConfirmDialog
+from ..widgets import Panel
 from .base import WorkspaceScreen
 
 
 class AIWorkspaceScreen(WorkspaceScreen):
     section = "ai"
-    screen_title = "AI"
-    screen_subtitle = "Диалоги, промпты, память, тарифы и оплачиваемые попытки"
 
     MODES = ("chats", "prompts", "memory", "prices", "tasks")
 
@@ -36,33 +35,34 @@ class AIWorkspaceScreen(WorkspaceScreen):
         self._loading = False
 
     def compose_workspace(self) -> ComposeResult:
-        yield Static(id="ai-summary")
-        with Vertical(id="ai-onboarding"):
-            yield Static(
-                "DeepSeek не подключён\nДобавь один API-ключ, чтобы открыть AI-функции.",
-                id="ai-onboarding-copy",
-            )
-            yield Button("Добавить API-ключ", id="ai-add-key", variant="primary")
-        yield Static(id="ai-statistics")
-        with Horizontal(classes="action-row ai-mode-row"):
-            yield Button("Диалоги", id="ai-mode-chats", variant="primary")
-            yield Button("Промпты", id="ai-mode-prompts")
-            yield Button("Память", id="ai-mode-memory")
-            yield Button("Тарифы", id="ai-mode-prices")
-            yield Button("Попытки", id="ai-mode-tasks")
-        with Vertical(id="ai-list-pane"):
-            with Horizontal(classes="action-row", id="ai-actions"):
-                yield Button("Создать", id="ai-create", variant="primary")
-                yield Button("Открыть", id="ai-open")
-                yield Button("Изменить", id="ai-edit")
-                yield Button("Архивировать", id="ai-archive")
-                yield Button("Активировать", id="ai-activate")
-                yield Button("Повторить", id="ai-retry")
-                yield Button("Настроить ключ", id="ai-config")
-                yield Button("Открыть веб-интерфейс", id="ai-web")
-                yield Button("Обновить", id="ai-refresh")
-            yield DataTable(id="ai-table", cursor_type="row")
-        with Vertical(id="ai-chat-pane"):
+        with Panel(title="AI", id="ai-main"):
+            yield Static(id="ai-summary")
+            with Vertical(id="ai-onboarding"):
+                yield Static(
+                    "DeepSeek не подключён\nДобавь один API-ключ, чтобы открыть AI-функции.",
+                    id="ai-onboarding-copy",
+                )
+                yield Button("Добавить API-ключ", id="ai-add-key", variant="primary")
+            yield Static(id="ai-statistics")
+            with Horizontal(classes="mode-row ai-mode-row"):
+                yield Button("Диалоги", id="ai-mode-chats", variant="primary")
+                yield Button("Промпты", id="ai-mode-prompts")
+                yield Button("Память", id="ai-mode-memory")
+                yield Button("Тарифы", id="ai-mode-prices")
+                yield Button("Попытки", id="ai-mode-tasks")
+            with Vertical(id="ai-list-pane"):
+                with Horizontal(classes="action-row", id="ai-actions"):
+                    yield Button("Создать", id="ai-create", variant="primary")
+                    yield Button("Открыть", id="ai-open")
+                    yield Button("Изменить", id="ai-edit")
+                    yield Button("Архивировать", id="ai-archive")
+                    yield Button("Активировать", id="ai-activate")
+                    yield Button("Повторить", id="ai-retry")
+                    yield Button("Настроить ключ", id="ai-config")
+                    yield Button("Открыть веб-интерфейс", id="ai-web")
+                    yield Button("Обновить", id="ai-refresh")
+                yield DataTable(id="ai-table", cursor_type="row")
+        with Panel(title="Диалог", id="ai-chat-pane"):
             yield Static(id="ai-chat-title", classes="section-heading")
             yield Static(id="ai-history")
             yield Button("Показать более ранние", id="ai-history-older")

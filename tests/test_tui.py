@@ -29,11 +29,9 @@ if TYPE_CHECKING:
     from hoard.tui.app import HelpScreen, HoardApp
     from hoard.tui.dialogs import AuthDialog, ConfirmDialog, SourceDialog
     from hoard.tui.screens import (
-        ActivityScreen,
         AIWorkspaceScreen,
         ArchiveScreen,
-        OverviewScreen,
-        SourcesScreen,
+        HomeScreen,
         TelegramScreen,
     )
     from hoard.tui.widgets import HoardHeader, HoardStatusBar, ProgressView, Sidebar
@@ -58,11 +56,9 @@ def load_textual_after_existing_async_tests():
     from hoard.tui.dialogs import AuthDialog as AuthDialogClass
     from hoard.tui.dialogs import ConfirmDialog as ConfirmDialogClass
     from hoard.tui.dialogs import SourceDialog as SourceDialogClass
-    from hoard.tui.screens import ActivityScreen as ActivityScreenClass
     from hoard.tui.screens import AIWorkspaceScreen as AIWorkspaceScreenClass
     from hoard.tui.screens import ArchiveScreen as ArchiveScreenClass
-    from hoard.tui.screens import OverviewScreen as OverviewScreenClass
-    from hoard.tui.screens import SourcesScreen as SourcesScreenClass
+    from hoard.tui.screens import HomeScreen as HomeScreenClass
     from hoard.tui.screens import TelegramScreen as TelegramScreenClass
     from hoard.tui.widgets import HoardHeader as HoardHeaderClass
     from hoard.tui.widgets import HoardStatusBar as HoardStatusBarClass
@@ -70,26 +66,24 @@ def load_textual_after_existing_async_tests():
     from hoard.tui.widgets import Sidebar as SidebarClass
 
     globals().update(
-        ActivityScreen=ActivityScreenClass,
         AIRecordDialog=AIRecordDialogClass,
-        Button=ButtonClass,
         AIWorkspaceScreen=AIWorkspaceScreenClass,
         ArchiveScreen=ArchiveScreenClass,
         AuthDialog=AuthDialogClass,
+        Button=ButtonClass,
         ConfirmDialog=ConfirmDialogClass,
         DataTable=DataTableClass,
         HelpScreen=HelpScreenClass,
+        HomeScreen=HomeScreenClass,
         HoardApp=HoardAppClass,
         HoardHeader=HoardHeaderClass,
         HoardStatusBar=HoardStatusBarClass,
         Input=InputClass,
         OptionList=OptionListClass,
         SelectionList=SelectionListClass,
-        OverviewScreen=OverviewScreenClass,
         ProgressView=ProgressViewClass,
         Sidebar=SidebarClass,
         SourceDialog=SourceDialogClass,
-        SourcesScreen=SourcesScreenClass,
         Static=StaticClass,
         TelegramScreen=TelegramScreenClass,
         TelegramAIDialog=TelegramAIDialogClass,
@@ -327,20 +321,22 @@ async def wait_for_condition(pilot, predicate, message="condition was not reache
 
 
 @pytest.mark.asyncio
-async def test_initializes_overview_from_real_status_contract():
+async def test_initializes_home_from_real_status_contract():
     api = FakeAPI()
     app = HoardApp(api)
     async with app.run_test(size=(80, 24)) as pilot:
         await wait_for_startup(app, pilot)
-        assert isinstance(app.screen, OverviewScreen)
+        assert isinstance(app.screen, HomeScreen)
         assert api.ensure_calls == 1
         assert api.status_calls == 1
-        summary = str(app.screen.query_one("#system-summary", Static).content)
-        statistics = str(app.screen.query_one("#statistics", Static).content)
+        tools = str(app.screen.query_one("#tools", Static).content)
+        archive = str(app.screen.query_one("#statistics", Static).content)
+        queue = str(app.screen.query_one("#queue-stats", Static).content)
         events = str(app.screen.query_one("#events", Static).content)
-        assert "подключён" in summary
-        assert "работает" in summary
-        assert all(number in statistics for number in ("2", "14", "31", "4", "1"))
+        assert "подключён" in tools
+        assert "работает" in tools
+        assert all(number in archive for number in ("2", "14", "31"))
+        assert all(number in queue for number in ("4", "1", "2"))
         assert "Сохранён кружок" in events
         assert "Нет связи" in events
 
@@ -379,7 +375,7 @@ async def test_round_three_screens_tables_buttons_and_dialogs_remain_strict_blac
     app = HoardApp(api)
     async with app.run_test(size=(100, 30)) as pilot:
         await wait_for_startup(app, pilot)
-        for section in ("telegram", "sources", "archive"):
+        for section in ("home", "telegram", "archive", "ai"):
             app.open_section(section)
             await pilot.pause()
             for node in [app.screen, *app.screen.query("*")]:
@@ -433,23 +429,29 @@ async def test_keyboard_navigation_switches_and_goes_back_without_nested_screens
     async with app.run_test(size=(80, 24)) as pilot:
         await wait_for_startup(app, pilot)
         base_depth = len(app.screen_stack)
-        await pilot.press("j", "j", "j", "enter")
+        # Home, Archive, then the cursor steps over the "ИНСТРУМЕНТЫ" header to Telegram.
+        await pilot.press("j", "j", "enter")
         await pilot.pause()
-        assert isinstance(app.screen, ActivityScreen)
+        assert isinstance(app.screen, TelegramScreen)
         assert len(app.screen_stack) == base_depth
         await pilot.press("h")
         await pilot.pause()
-        assert isinstance(app.screen, OverviewScreen)
+        assert isinstance(app.screen, HomeScreen)
         assert len(app.screen_stack) == base_depth
-        await pilot.press("down", "down", "down", "right")
+        await pilot.press("down", "down", "right")
         await pilot.pause()
-        assert isinstance(app.screen, ActivityScreen)
+        assert isinstance(app.screen, TelegramScreen)
         await pilot.press("escape")
         await pilot.pause()
-        assert isinstance(app.screen, OverviewScreen)
-        await pilot.press("down", "right", "up", "right")
+        assert isinstance(app.screen, HomeScreen)
+        # A list page hands the keyboard to its table; "h" still walks back out.
+        await pilot.press("down", "right")
         await pilot.pause()
-        assert isinstance(app.screen, OverviewScreen)
+        assert isinstance(app.screen, ArchiveScreen)
+        assert isinstance(app.focused, DataTable)
+        await pilot.press("h")
+        await pilot.pause()
+        assert isinstance(app.screen, HomeScreen)
 
 
 @pytest.mark.asyncio
@@ -478,48 +480,15 @@ async def test_q_exits_without_daemon_control_calls():
 
 
 @pytest.mark.asyncio
-async def test_web_launch_runs_off_the_event_loop(monkeypatch):
-    started = threading.Event()
-    release = threading.Event()
-
-    def slow_launch():
-        started.set()
-        release.wait(5)
-        return "http://127.0.0.1:45678/start/test"
-
-    monkeypatch.setattr("hoard.web.launch_web_process", slow_launch)
+async def test_exit_stops_home_timer():
     app = HoardApp(FakeAPI())
     async with app.run_test() as pilot:
         await wait_for_startup(app, pilot)
-        app.open_web_interface()
-        assert await asyncio.to_thread(started.wait, 1)
-        assert app.notice == ("Подготавливаю локальный веб-интерфейс…", False)
-
-        await pilot.press("?")
-        assert isinstance(app.screen, HelpScreen)
-        await pilot.press("escape")
-        await wait_for_condition(pilot, lambda: not isinstance(app.screen, HelpScreen))
-
-        release.set()
-        await wait_for_condition(
-            pilot,
-            lambda: app.notice is not None and app.notice[0].startswith("Веб-интерфейс готов"),
-        )
-    assert app.notice == ("Веб-интерфейс готов: http://127.0.0.1:45678/start/test", False)
-
-
-@pytest.mark.asyncio
-async def test_exit_stops_activity_timer():
-    app = HoardApp(FakeAPI())
-    async with app.run_test() as pilot:
-        await wait_for_startup(app, pilot)
-        app.open_section("activity")
-        await pilot.pause()
-        activity = app.screen
-        assert isinstance(activity, ActivityScreen)
-        assert activity.poll_timer is not None
+        home = app.screen
+        assert isinstance(home, HomeScreen)
+        assert home.poll_timer is not None
         await pilot.press("q")
-    assert activity.poll_timer is None
+    assert home.poll_timer is None
 
 
 @pytest.mark.asyncio
@@ -536,89 +505,15 @@ async def test_empty_status_has_informative_states():
     app = HoardApp(FakeAPI(empty))
     async with app.run_test() as pilot:
         await wait_for_startup(app, pilot)
-        assert "данные недоступны" in str(app.screen.query_one("#system-summary", Static).content)
+        assert "данные недоступны" in str(app.screen.query_one("#tools", Static).content)
         assert "Событий пока нет" in str(app.screen.query_one("#events", Static).content)
 
 
-def test_progress_lines_preserve_aggregate_and_individual_speeds():
-    from hoard.tui.state import progress_lines
-
-    status = {
-        "progress": {
-            "source": "channel/42",
-            "checked": 9,
-            "downloaded": 4,
-            "active_downloads": 3,
-            "aggregate_speed_bps": 4096,
-            "file": "clip.mp4",
-            "bytes": 1024,
-            "total": 2048,
-            "speed_bps": 512,
-        }
-    }
-
-    lines = progress_lines(status)
-    assert "Источник: channel/42" in lines
-    assert "проверено 9 · сохранено 4" in lines
-    assert "Активных загрузок: 3 · суммарно 4.0 KiB/s" in lines
-    assert "clip.mp4" in lines
-    assert "1.0 KiB / 2.0 KiB · 512 B/s" in lines
-
-
-def test_format_bytes_and_progress_fraction_use_real_values():
-    from hoard.tui.state import format_bytes, progress_fraction
-
-    assert format_bytes(1024) == "1.0 KiB"
-    assert format_bytes(1536) == "1.5 KiB"
-    assert format_bytes(None) == "—"
-    assert format_bytes("bad") == "—"
-    assert progress_fraction({"progress": {"bytes": 50, "total": 200}}) == (50, 200)
-    assert progress_fraction({"progress": {"bytes": 50}}) is None
-    assert progress_fraction({"progress": {"bytes": "bad", "total": 200}}) is None
-
-
 @pytest.mark.asyncio
-async def test_activity_progress_bar_uses_real_total():
-    app = HoardApp(FakeAPI(status_fixture()))
-    async with app.run_test() as pilot:
-        await wait_for_startup(app, pilot)
-        app.open_section("activity")
-        await pilot.pause()
-        progress = str(app.screen.query_one(ProgressView).content)
-        assert "1.0 KiB / 4.0 KiB · 512 B/s" in progress
-        assert "25%" in progress
-
-
-@pytest.mark.asyncio
-async def test_archive_can_open_existing_catalog(tmp_path, monkeypatch):
-    catalog = tmp_path / "telegram_archive.html"
-    catalog.write_text("<!doctype html>", encoding="utf-8")
-    status = status_fixture()
-    status["catalog"] = str(catalog)
-    opened: list[tuple[str, int]] = []
-    monkeypatch.setattr(
-        "hoard.tui.screens.archive.webbrowser.open",
-        lambda url, new=0: opened.append((url, new)) or True,
-    )
-    app = HoardApp(FakeAPI(status))
-    async with app.run_test(size=(100, 30)) as pilot:
-        await wait_for_startup(app, pilot)
-        app.open_section("archive")
-        await pilot.pause()
-        app.screen.query_one("#catalog-open").press()
-        await pilot.pause()
-
-    assert opened == [(catalog.resolve().as_uri(), 2)]
-    assert app.notice == ("HTML-каталог открыт в браузере.", False)
-
-
-@pytest.mark.asyncio
-async def test_activity_uses_only_available_progress_values():
+async def test_home_uses_only_available_progress_values():
     app = HoardApp(FakeAPI(status_fixture(total=None)))
     async with app.run_test() as pilot:
         await wait_for_startup(app, pilot)
-        app.open_section("activity")
-        await pilot.pause()
         progress = str(app.screen.query_one(ProgressView).content)
         assert "1.0 KiB" in progress
         assert "512 B/s" in progress
@@ -638,45 +533,24 @@ async def test_ipc_error_is_visible_and_ui_can_close():
 
 
 @pytest.mark.asyncio
-async def test_incompatible_daemon_shows_shutdown_instruction():
-    from hoard.ipc import DaemonCompatibilityError
-
-    message = (
-        "Запущена устаревшая служба Hoard (daemon 0.7.0, клиент 0.7.1.10).\n"
-        "Выполни: hoard shutdown\n"
-        "Затем снова запусти: hoard"
-    )
-    app = HoardApp(FakeAPI(error=DaemonCompatibilityError(message)))
-    async with app.run_test() as pilot:
-        await wait_for_startup(app, pilot)
-        error = str(app.screen.query_one("#status-error", Static).content)
-        assert "устаревшая служба" in error
-        assert "hoard shutdown" in error
-        await pilot.press("q")
-
-
-@pytest.mark.asyncio
-async def test_polling_only_runs_on_activity_and_never_overlaps(monkeypatch):
-    monkeypatch.setattr(ActivityScreen, "POLL_INTERVAL", 0.02)
+async def test_polling_only_runs_on_home_and_never_overlaps(monkeypatch):
+    monkeypatch.setattr(HomeScreen, "POLL_INTERVAL", 0.02)
     api = FakeAPI()
     api.delay = 0.06
     app = HoardApp(api)
     async with app.run_test() as pilot:
         await wait_for_startup(app, pilot)
-        overview_calls = api.status_calls
-        await pilot.pause(0.08)
-        assert api.status_calls == overview_calls
-
-        app.open_section("activity")
+        startup_calls = api.status_calls
         await pilot.pause(0.16)
-        assert api.status_calls > overview_calls
+        assert api.status_calls > startup_calls
         assert api.max_active_calls == 1
 
-        activity = app.screen
-        assert isinstance(activity, ActivityScreen)
-        await pilot.press("h")
-        await pilot.pause(0.08)
-        assert activity.poll_timer is None
+        home = app.screen
+        assert isinstance(home, HomeScreen)
+        await pilot.press("2")
+        await pilot.pause(0.12)
+        assert isinstance(app.screen, ArchiveScreen)
+        assert home.poll_timer is None
         stopped_calls = api.status_calls
         await pilot.pause(0.08)
         assert api.status_calls == stopped_calls
@@ -900,9 +774,9 @@ async def test_source_flow_validates_upserts_and_does_not_create_duplicate_scan(
     app = HoardApp(api)
     async with app.run_test(size=(100, 30)) as pilot:
         await wait_for_startup(app, pilot)
-        app.open_section("sources")
+        app.open_section("telegram")
         await pilot.pause()
-        assert isinstance(app.screen, SourcesScreen)
+        assert isinstance(app.screen, TelegramScreen)
         await pilot.click("#source-add")
         await wait_for_condition(pilot, lambda: isinstance(app.screen, SourceDialog))
         dialog = app.screen
@@ -924,7 +798,7 @@ async def test_source_flow_validates_upserts_and_does_not_create_duplicate_scan(
         )
         await wait_for_condition(pilot, lambda: not dialog._busy)
         dialog.query_one("#source-primary").press()
-        await wait_for_condition(pilot, lambda: isinstance(app.screen, SourcesScreen))
+        await wait_for_condition(pilot, lambda: isinstance(app.screen, TelegramScreen))
 
         await pilot.click("#source-edit")
         await wait_for_condition(pilot, lambda: isinstance(app.screen, SourceDialog))
@@ -938,7 +812,7 @@ async def test_source_flow_validates_upserts_and_does_not_create_duplicate_scan(
         await wait_for_condition(pilot, lambda: getattr(app.screen, "step", None) == "done")
         await wait_for_condition(pilot, lambda: not dialog._busy)
         dialog.query_one("#source-primary").press()
-        await wait_for_condition(pilot, lambda: isinstance(app.screen, SourcesScreen))
+        await wait_for_condition(pilot, lambda: isinstance(app.screen, TelegramScreen))
 
     names = [name for name, _ in api.calls]
     assert names.count("validate_source") == 2
@@ -953,7 +827,7 @@ async def test_sources_toggle_targeted_and_global_scan_are_distinct():
     app = HoardApp(api)
     async with app.run_test() as pilot:
         await wait_for_startup(app, pilot)
-        app.open_section("sources")
+        app.open_section("telegram")
         await pilot.pause()
         await pilot.click("#source-toggle")
         await wait_for_condition(
@@ -981,7 +855,7 @@ async def test_double_source_action_is_dropped_while_first_ipc_call_is_running()
     app = HoardApp(api)
     async with app.run_test() as pilot:
         await wait_for_startup(app, pilot)
-        app.open_section("sources")
+        app.open_section("telegram")
         await pilot.pause()
         screen = app.screen
         screen.action_scan_source()
@@ -1010,71 +884,6 @@ async def test_start_collector_connects_first_when_session_is_not_authorized():
         )
     names = [name for name, _ in api.calls]
     assert names.index("auth_begin") < names.index("start_collector")
-
-
-@pytest.mark.asyncio
-async def test_telegram_web_controls_reflect_state_and_are_nonblocking():
-    api = FakeAPI()
-    app = HoardApp(api)
-    async with app.run_test(size=(100, 30)) as pilot:
-        await wait_for_startup(app, pilot)
-        app.open_section("telegram")
-        await wait_for_condition(
-            pilot,
-            lambda: "выключен" in str(app.screen.query_one("#web-summary", Static).content),
-        )
-        screen = app.screen
-        assert screen.query_one("#web-start", Button).disabled is False
-        assert screen.query_one("#web-open", Button).disabled is True
-        assert screen.query_one("#web-stop", Button).disabled is True
-
-        screen.query_one("#web-start").press()
-        await wait_for_condition(
-            pilot,
-            lambda: "работает" in str(app.screen.query_one("#web-summary", Static).content),
-        )
-        assert screen.query_one("#web-start", Button).disabled is True
-        assert screen.query_one("#web-open", Button).disabled is False
-        assert screen.query_one("#web-stop", Button).disabled is False
-
-        screen.query_one("#web-open").press()
-        await wait_for_condition(
-            pilot, lambda: any(name == "open_web" for name, _ in api.calls)
-        )
-        await wait_for_condition(
-            pilot,
-            lambda: not screen._web_loading and not app._operations,
-        )
-
-        screen.query_one("#web-stop").press()
-        await wait_for_condition(
-            pilot,
-            lambda: "выключен" in str(app.screen.query_one("#web-summary", Static).content),
-        )
-        assert any(name == "stop_web" for name, _ in api.calls)
-        assert not any(
-            name in {"stop_collector", "pause_collector"} for name, _ in api.calls
-        )
-
-    assert [name for name, _ in api.calls].count("web_status") >= 1
-
-
-@pytest.mark.asyncio
-async def test_telegram_web_state_is_recovered_on_reopen():
-    api = FakeAPI()
-    api.web_state = {"state": "ready", "port": 45678, "controllable": True}
-    app = HoardApp(api)
-    async with app.run_test(size=(100, 30)) as pilot:
-        await wait_for_startup(app, pilot)
-        app.open_section("telegram")
-        await wait_for_condition(
-            pilot,
-            lambda: "работает" in str(app.screen.query_one("#web-summary", Static).content),
-        )
-        assert "127.0.0.1:45678" in str(
-            app.screen.query_one("#web-summary", Static).content
-        )
-        assert app.screen.query_one("#web-open", Button).disabled is False
 
 
 @pytest.mark.asyncio
@@ -1209,10 +1018,10 @@ async def test_context_navigation_keeps_tables_native_and_hidden_sidebar_reachab
         assert app.has_class("sidebar-hidden")
         await pilot.press("]")
         await pilot.pause()
-        assert isinstance(app.screen, TelegramScreen)
-        await pilot.press("]")
+        assert isinstance(app.screen, ArchiveScreen)
+        await pilot.press("3")
         await pilot.pause()
-        assert isinstance(app.screen, SourcesScreen)
+        assert isinstance(app.screen, TelegramScreen)
         table = app.screen.query_one("#sources-table", DataTable)
         table.focus()
         before = table.cursor_row
@@ -1237,7 +1046,7 @@ async def test_all_round_three_workspaces_survive_supported_sizes(size):
     app = HoardApp(FakeAPI())
     async with app.run_test(size=size) as pilot:
         await wait_for_startup(app, pilot)
-        for section in ("telegram", "sources", "activity", "archive", "ai", "overview"):
+        for section in ("telegram", "archive", "ai", "home"):
             app.open_section(section)
             await pilot.pause()
             workspace = app.screen.query_one("#workspace")
@@ -1556,6 +1365,490 @@ print("STORAGE", "hoard.storage" in sys.modules)
     assert result.returncode == 0, result.stderr
     assert "TELETHON False" in result.stdout
     assert "STORAGE False" in result.stdout
+
+
+
+@pytest.mark.asyncio
+async def test_navigation_registry_groups_tools_and_matches_registered_screens():
+    from hoard.tui.navigation import GROUP_TITLES, SECTIONS, breadcrumb
+    from hoard.tui.screens.home import MODULE_SUMMARIES
+
+    keys = [section.key for section in SECTIONS]
+    assert keys == ["home", "archive", "telegram", "ai"]
+    assert len(keys) == len(set(keys))
+    assert set(keys) == set(HoardApp.SCREENS)
+    assert set(MODULE_SUMMARIES) <= set(keys)
+    assert [section.label for section in breadcrumb("telegram")] == ["Telegram"]
+    assert [section.label for section in breadcrumb("home")] == ["Главная"]
+
+    app = HoardApp(FakeAPI())
+    async with app.run_test(size=(100, 30)) as pilot:
+        await wait_for_startup(app, pilot)
+        navigation = app.screen.query_one(OptionList)
+        options = [navigation.get_option_at_index(i) for i in range(navigation.option_count)]
+        headers = [option for option in options if option.disabled]
+        assert len(headers) == 1
+        assert GROUP_TITLES["tools"] in str(headers[0].prompt)
+        assert [str(option.id) for option in options if not option.disabled] == keys
+
+
+def test_pages_that_were_merged_still_resolve_and_children_get_a_breadcrumb(monkeypatch):
+    from hoard.tui import navigation
+
+    assert [navigation.resolve(key) for key in ("overview", "activity", "sources")] == [
+        "home",
+        "home",
+        "telegram",
+    ]
+    assert navigation.resolve("archive") == "archive"
+    assert navigation.section_index("sources") == navigation.section_index("telegram")
+
+    child = navigation.Section("video", "Видео", navigation.TOOLS, parent="telegram")
+    monkeypatch.setattr(navigation, "SECTIONS", (*navigation.SECTIONS, child))
+    assert [section.label for section in navigation.breadcrumb("video")] == ["Telegram", "Видео"]
+
+
+@pytest.mark.asyncio
+async def test_legacy_section_keys_open_the_page_that_absorbed_them():
+    app = HoardApp(FakeAPI())
+    async with app.run_test(size=(100, 30)) as pilot:
+        await wait_for_startup(app, pilot)
+        app.open_section("sources")
+        await pilot.pause()
+        assert isinstance(app.screen, TelegramScreen)
+        app.open_section("overview")
+        await pilot.pause()
+        assert isinstance(app.screen, HomeScreen)
+        app.open_section("activity")
+        await pilot.pause()
+        assert isinstance(app.screen, HomeScreen)
+
+
+@pytest.mark.asyncio
+async def test_header_breadcrumb_and_footer_hints_follow_the_screen():
+    app = HoardApp(FakeAPI())
+    async with app.run_test(size=(120, 35)) as pilot:
+        await wait_for_startup(app, pilot)
+        header = str(app.screen.query_one(HoardHeader).content)
+        footer = app.screen.query_one(HoardStatusBar).content
+        assert "Главная" in header and "работает" in header
+        assert "выбор" in str(footer) and "команды" in str(footer) and "выход" in str(footer)
+        # Each shortcut is a reversed (block) chip.
+        assert any("reverse" in str(span.style) for span in footer.spans)
+
+        app.open_section("telegram")
+        await pilot.pause()
+        header = str(app.screen.query_one(HoardHeader).content)
+        footer = str(app.screen.query_one(HoardStatusBar).content)
+        assert "Telegram" in header and "Источники" not in header
+        assert "панели" in footer and "помощь" in footer
+        # The source shortcuts live on the frame of the panel they act on, not in the footer.
+        hints = str(app.screen.query_one("#sources-panel").border_subtitle)
+        assert "добавить" in hints and "изменить" in hints and "проверить" in hints
+        assert "добавить" not in footer
+
+
+@pytest.mark.asyncio
+async def test_footer_keeps_global_shortcuts_on_the_narrowest_terminal():
+    app = HoardApp(FakeAPI())
+    async with app.run_test(size=(40, 16)) as pilot:
+        await wait_for_startup(app, pilot)
+        await pilot.pause()
+        footer = str(app.screen.query_one(HoardStatusBar).content)
+        assert len(footer) <= 40
+        assert ":" in footer and "?" in footer and "q" in footer
+
+
+@pytest.mark.asyncio
+async def test_digit_shortcuts_jump_to_sections_and_leave_text_entry_alone():
+    app = HoardApp(FakeAPI())
+    async with app.run_test(size=(100, 30)) as pilot:
+        await wait_for_startup(app, pilot)
+        await pilot.press("3")
+        await pilot.pause()
+        assert isinstance(app.screen, TelegramScreen)
+        await pilot.press("2")
+        await pilot.pause()
+        assert isinstance(app.screen, ArchiveScreen)
+        await pilot.press("9")
+        await pilot.pause()
+        assert isinstance(app.screen, ArchiveScreen)
+        await pilot.press("1")
+        await pilot.pause()
+        assert isinstance(app.screen, HomeScreen)
+
+        input_widget = Input()
+        await app.screen.query_one("#workspace").mount(input_widget)
+        input_widget.focus()
+        await pilot.press("3", ":")
+        await pilot.pause()
+        assert input_widget.value == "3:"
+        assert isinstance(app.screen, HomeScreen)
+
+
+def test_palette_matching_is_word_based_and_prefers_label_prefixes():
+    from hoard.tui.palette import Command, matches
+
+    commands = [
+        Command("a", "Архив", keywords=("кружки",)),
+        Command("b", "Источники", context="Telegram", keywords=("посты",)),
+        Command("c", "Telegram"),
+    ]
+    assert [item.key for item in matches(commands, "")] == ["a", "b", "c"]
+    assert [item.key for item in matches(commands, "tele")] == ["c", "b"]
+    assert [item.key for item in matches(commands, "telegram ист")] == ["b"]
+    assert [item.key for item in matches(commands, "КРУЖКИ")] == ["a"]
+    assert matches(commands, "нет такого") == []
+
+
+@pytest.mark.asyncio
+async def test_command_palette_filters_navigates_and_never_leaks_keys():
+    from hoard.tui.palette import PaletteScreen
+
+    app = HoardApp(FakeAPI())
+    async with app.run_test(size=(100, 30)) as pilot:
+        await wait_for_startup(app, pilot)
+        await pilot.press(":")
+        await pilot.pause()
+        assert isinstance(app.screen, PaletteScreen)
+        options = app.screen.query_one("#palette-list", OptionList)
+        assert options.option_count == len(app.commands())
+
+        # Letters that are global shortcuts elsewhere are plain text here.
+        await pilot.press("q", "j", "1")
+        await pilot.pause()
+        assert isinstance(app.screen, PaletteScreen)
+        assert app.screen.query_one("#palette-input", Input).value == "qj1"
+        assert options.option_count == 1  # the disabled "nothing found" row
+        assert options.get_option_at_index(0).disabled
+        await pilot.press("enter")
+        await pilot.pause()
+        assert isinstance(app.screen, PaletteScreen)
+
+        await pilot.press("escape")
+        await pilot.pause()
+        assert isinstance(app.screen, HomeScreen)
+        assert app.is_running
+
+        await pilot.press("ctrl+k")
+        await pilot.pause()
+        assert isinstance(app.screen, PaletteScreen)
+        options = app.screen.query_one("#palette-list", OptionList)
+        await pilot.press("t", "e", "l", "e")
+        await pilot.pause()
+        assert options.option_count == 1
+        assert str(options.get_option_at_index(0).id) == "goto:telegram"
+        await pilot.press("enter")
+        await wait_for_condition(pilot, lambda: isinstance(app.screen, TelegramScreen))
+        assert len(app.screen_stack) == 2  # the palette left no screen behind
+
+
+@pytest.mark.asyncio
+async def test_command_palette_runs_app_commands():
+    from hoard.tui.palette import PaletteScreen
+
+    app = HoardApp(FakeAPI())
+    async with app.run_test(size=(100, 30)) as pilot:
+        await wait_for_startup(app, pilot)
+        await pilot.press(":")
+        await pilot.press(*"клавиши")
+        await pilot.press("enter")
+        await wait_for_condition(pilot, lambda: isinstance(app.screen, HelpScreen))
+        await pilot.press("escape")
+        await pilot.pause()
+
+        await pilot.press(":")
+        await pilot.press(*"меню")
+        await pilot.press("enter")
+        await pilot.pause()
+        assert not isinstance(app.screen, PaletteScreen)
+        assert app.has_class("sidebar-hidden")
+
+
+@pytest.mark.asyncio
+async def test_help_and_palette_describe_and_keep_the_black_theme():
+    from hoard import __version__
+    from hoard.tui.palette import PaletteScreen
+
+    app = HoardApp(FakeAPI())
+    async with app.run_test(size=(100, 30)) as pilot:
+        await wait_for_startup(app, pilot)
+        await pilot.press("?")
+        await pilot.pause()
+        text = str(app.screen.query_one("#help-text", Static).content)
+        assert __version__ in text
+        assert "1 – 4" in text and "палитра" in text and "ctrl+k" in text
+        for node in [app.screen, *app.screen.query("*")]:
+            assert node.styles.background.hex == "#000000", repr(node)
+        await pilot.press("escape")
+        await pilot.pause()
+
+        await pilot.press(":")
+        await pilot.pause()
+        assert isinstance(app.screen, PaletteScreen)
+        for node in [app.screen, *app.screen.query("*")]:
+            assert node.styles.background.hex == "#000000", repr(node)
+        navigation = app.screen.query_one("#palette-list", OptionList)
+        assert (
+            navigation.get_component_styles("option-list--option-highlighted").color.hex
+            == "#F79646"
+        )
+
+
+@pytest.mark.asyncio
+async def test_responsive_classes_follow_terminal_size():
+    app = HoardApp(FakeAPI())
+    async with app.run_test(size=(120, 35)) as pilot:
+        await wait_for_startup(app, pilot)
+        wide = {"compact", "narrow", "medium", "short", "tiny"}
+        assert not wide & set(app.classes)
+        await pilot.resize_terminal(80, 24)
+        assert {"narrow", "medium", "short"} <= set(app.classes)
+        assert not {"compact", "tiny"} & set(app.classes)
+        await pilot.resize_terminal(40, 16)
+        assert wide <= set(app.classes)
+        await pilot.resize_terminal(120, 35)
+        assert not wide & set(app.classes)
+
+
+@pytest.mark.asyncio
+async def test_home_summarises_each_tool_and_reflows_statistics():
+    from hoard.tui.widgets import StatisticsView
+
+    status = status_fixture()
+    status["integrations"] = {"ai": True}
+    app = HoardApp(FakeAPI(status))
+    async with app.run_test(size=(120, 35)) as pilot:
+        await wait_for_startup(app, pilot)
+        await pilot.pause()
+        tools = str(app.screen.query_one("#tools", Static).content)
+        assert "Telegram" in tools and "подключён · сборщик работает" in tools
+        assert "AI" in tools and "настроен" in tools and "не настроен" not in tools
+
+        archive = app.screen.query_one("#statistics", StatisticsView)
+        wide_rows = str(archive.content).count("\n")
+        await pilot.resize_terminal(30, 24)
+        await pilot.pause()
+        narrow_rows = str(app.screen.query_one("#statistics", StatisticsView).content).count("\n")
+        assert narrow_rows > wide_rows  # tiles wrap instead of being cut off
+        for number in ("2", "14", "31"):
+            assert number in str(app.screen.query_one("#statistics", StatisticsView).content)
+        for number in ("4", "1", "2"):
+            assert number in str(app.screen.query_one("#queue-stats", StatisticsView).content)
+
+
+@pytest.mark.asyncio
+async def test_actions_and_tables_are_borderless_words_not_boxes():
+    from textual.widgets import Button
+
+    app = HoardApp(FakeAPI())
+    async with app.run_test(size=(120, 35)) as pilot:
+        await wait_for_startup(app, pilot)
+        for section in ("home", "telegram", "archive"):
+            app.open_section(section)
+            await pilot.pause()
+            for button in app.screen.query(Button):
+                assert button.styles.border_top[0] in {"", "none"}, button.id
+                assert button.region.height <= 1, button.id
+            for table in app.screen.query(DataTable):
+                assert table.styles.border_top[0] in {"", "none"}, table.id
+
+
+@pytest.mark.asyncio
+async def test_home_shows_only_the_logo_until_the_daemon_answers():
+    from hoard.tui.widgets import Hero
+
+    app = HoardApp(FakeAPI(error=ConnectionError("socket недоступен")))
+    async with app.run_test(size=(120, 35)) as pilot:
+        await wait_for_startup(app, pilot)
+        assert isinstance(app.screen, HomeScreen)
+        assert app.screen.query_one(Hero).display
+        assert not app.screen.query_one("#home-grid").display
+        assert not app.screen.query_one("#events-panel").display
+        assert app.screen.query_one("#status-error", Static).display
+
+
+@pytest.mark.asyncio
+async def test_home_carries_the_program_name_and_picks_a_logo_that_fits():
+    from hoard.tui.widgets.hero import LOGO_BIG, LOGO_SMALL, logo_text
+
+    app = HoardApp(FakeAPI())
+    async with app.run_test(size=(120, 35)) as pilot:
+        await wait_for_startup(app, pilot)
+        big, small = app.screen.query_one("#hero-big"), app.screen.query_one("#hero-small")
+        assert big.display and not small.display
+        text = str(big.content)
+        assert "локальный архив" in text and "сборщик работает" in text
+        # Letters are painted as coloured blanks, so the solid glyph never reaches the terminal.
+        assert "█" not in text
+        assert len(logo_text(LOGO_BIG, shadow=True)) == len(LOGO_BIG)
+        await pilot.resize_terminal(80, 24)
+        await pilot.pause()
+        assert small.display and not big.display
+        assert all(ch in str(small.content) for ch in "╦╠╩")
+        assert LOGO_SMALL[0][:3] in str(small.content)
+        await pilot.resize_terminal(40, 16)
+        await pilot.pause()
+        assert not big.display and not small.display
+
+
+@pytest.mark.asyncio
+async def test_panels_carry_their_title_in_the_border_and_light_up_with_focus():
+    from hoard.tui.widgets import Panel
+
+    app = HoardApp(FakeAPI())
+    async with app.run_test(size=(120, 35)) as pilot:
+        await wait_for_startup(app, pilot)
+        titles = {str(panel.border_title) for panel in app.screen.query(Panel)}
+        assert {"Сейчас", "Очередь", "Архив", "Инструменты", "События"} <= titles
+        app.open_section("telegram")
+        await pilot.pause()
+        panel = app.screen.query_one("#sources-panel", Panel)
+        table = app.screen.query_one("#sources-table", DataTable)
+        assert app.focused is table
+        assert panel.has_pseudo_class("focus-within")
+        assert str(panel.styles.border_top[1]) != str(
+            app.screen.query_one("#collector-panel", Panel).styles.border_top[1]
+        )
+
+
+@pytest.mark.asyncio
+async def test_sources_table_is_compact_and_trims_timestamps():
+    app = HoardApp(FakeAPI())
+    async with app.run_test(size=(120, 35)) as pilot:
+        await wait_for_startup(app, pilot)
+        app.open_section("telegram")
+        await pilot.pause()
+        table = app.screen.query_one("#sources-table", DataTable)
+        labels = [str(column.label) for column in table.columns.values()]
+        assert labels == ["Источник", "Состояние", "Кружки", "Каждые", "Проверка", "Результат"]
+        row = [str(cell) for cell in table.get_row_at(0)]
+        assert "2026-10-21 10:12" in row and "2026-10-21 10:12:13" not in row
+        assert table.virtual_size.width <= table.size.width  # no horizontal scrollbar at 120 cols
+
+
+@pytest.mark.asyncio
+async def test_sources_table_drops_schedule_columns_instead_of_scrolling_sideways():
+    app = HoardApp(FakeAPI())
+    async with app.run_test(size=(100, 30)) as pilot:
+        await wait_for_startup(app, pilot)
+        app.open_section("telegram")
+        await pilot.pause()
+        table = app.screen.query_one("#sources-table", DataTable)
+        assert [str(column.label) for column in table.columns.values()] == [
+            "Источник",
+            "Состояние",
+            "Кружки",
+            "Результат",
+        ]
+        assert table.virtual_size.width <= table.size.width
+        assert app.screen.selected_source_id == 1
+        await pilot.resize_terminal(130, 35)
+        await pilot.pause()
+        table = app.screen.query_one("#sources-table", DataTable)
+        assert len(table.columns) == 6
+        assert app.screen.selected_source_id == 1
+        await pilot.resize_terminal(80, 24)
+        await pilot.pause()
+        table = app.screen.query_one("#sources-table", DataTable)
+        assert str(table.get_row_at(0)[0]) == "Sample"
+        assert table.virtual_size.width <= table.size.width
+
+
+@pytest.mark.asyncio
+async def test_web_launch_runs_off_the_event_loop(monkeypatch):
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow_launch():
+        started.set()
+        release.wait(5)
+        return "http://127.0.0.1:45678/start/test"
+
+    monkeypatch.setattr("hoard.web.launch_web_process", slow_launch)
+    app = HoardApp(FakeAPI())
+    async with app.run_test() as pilot:
+        await wait_for_startup(app, pilot)
+        app.open_web_interface()
+        assert await asyncio.to_thread(started.wait, 1)
+        assert app.notice == ("Подготавливаю локальный веб-интерфейс…", False)
+
+        await pilot.press("?")
+        assert isinstance(app.screen, HelpScreen)
+        await pilot.press("escape")
+        await wait_for_condition(pilot, lambda: not isinstance(app.screen, HelpScreen))
+
+        release.set()
+        await wait_for_condition(
+            pilot,
+            lambda: app.notice is not None and app.notice[0].startswith("Веб-интерфейс готов"),
+        )
+    assert app.notice == ("Веб-интерфейс готов: http://127.0.0.1:45678/start/test", False)
+
+
+@pytest.mark.asyncio
+async def test_telegram_web_controls_reflect_state_and_are_nonblocking():
+    api = FakeAPI()
+    app = HoardApp(api)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await wait_for_startup(app, pilot)
+        app.open_section("telegram")
+        await wait_for_condition(
+            pilot,
+            lambda: "выключен" in str(app.screen.query_one("#web-summary", Static).content),
+        )
+        screen = app.screen
+        assert screen.query_one("#web-start", Button).disabled is False
+        assert screen.query_one("#web-open", Button).disabled is True
+        assert screen.query_one("#web-stop", Button).disabled is True
+
+        screen.query_one("#web-start").press()
+        await wait_for_condition(
+            pilot,
+            lambda: "работает" in str(app.screen.query_one("#web-summary", Static).content),
+        )
+        assert screen.query_one("#web-start", Button).disabled is True
+        assert screen.query_one("#web-open", Button).disabled is False
+        assert screen.query_one("#web-stop", Button).disabled is False
+
+        screen.query_one("#web-open").press()
+        await wait_for_condition(
+            pilot, lambda: any(name == "open_web" for name, _ in api.calls)
+        )
+        await wait_for_condition(
+            pilot,
+            lambda: not screen._web_loading and not app._operations,
+        )
+
+        screen.query_one("#web-stop").press()
+        await wait_for_condition(
+            pilot,
+            lambda: "выключен" in str(app.screen.query_one("#web-summary", Static).content),
+        )
+        assert any(name == "stop_web" for name, _ in api.calls)
+        assert not any(
+            name in {"stop_collector", "pause_collector"} for name, _ in api.calls
+        )
+
+    assert [name for name, _ in api.calls].count("web_status") >= 1
+
+
+@pytest.mark.asyncio
+async def test_telegram_web_state_is_recovered_on_reopen():
+    api = FakeAPI()
+    api.web_state = {"state": "ready", "port": 45678, "controllable": True}
+    app = HoardApp(api)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await wait_for_startup(app, pilot)
+        app.open_section("telegram")
+        await wait_for_condition(
+            pilot,
+            lambda: "работает" in str(app.screen.query_one("#web-summary", Static).content),
+        )
+        assert "127.0.0.1:45678" in str(
+            app.screen.query_one("#web-summary", Static).content
+        )
+        assert app.screen.query_one("#web-open", Button).disabled is False
 
 
 @pytest.mark.asyncio

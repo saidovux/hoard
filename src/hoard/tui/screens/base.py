@@ -2,39 +2,42 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 from rich.text import Text
 from textual.app import ComposeResult
-from textual.containers import Horizontal, VerticalScroll
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import Screen
 from textual.widgets import Static
 
+from ..colors import ACCENT, TEXT
 from ..widgets import HoardHeader, HoardStatusBar, Sidebar
+from ..widgets.chrome import DEFAULT_HINTS, Hint
 
 if TYPE_CHECKING:
     from ..app import HoardApp
 
 
 class WorkspaceScreen(Screen):
+    """Header, framed navigation, one workspace of panels, a notice line and the shortcut bar."""
+
     section = ""
-    screen_title = ""
-    screen_subtitle = ""
+    #: Shortcuts shown on the left of the footer while this screen is active.
+    HINTS: ClassVar[tuple[Hint, ...]] = DEFAULT_HINTS
 
     @property
     def hoard_app(self) -> HoardApp:
         return self.app  # type: ignore[return-value]
 
     def compose(self) -> ComposeResult:
-        yield HoardHeader()
+        yield HoardHeader(self.section)
         with Horizontal(id="screen-body"):
             yield Sidebar(self.section)
-            with VerticalScroll(id="workspace"):
-                yield Static(self.screen_title, classes="screen-title")
-                yield Static(self.screen_subtitle, classes="screen-subtitle")
-                yield Static(id="status-error")
+            with Vertical(id="content"):
+                with VerticalScroll(id="workspace"):
+                    yield Static(id="status-error")
+                    yield from self.compose_workspace()
                 yield Static(id="action-feedback")
-                yield from self.compose_workspace()
         yield HoardStatusBar()
 
     def compose_workspace(self) -> ComposeResult:
@@ -48,6 +51,7 @@ class WorkspaceScreen(Screen):
 
     def render_status(self, status: dict | None, error: str | None = None) -> None:
         self.query_one(HoardHeader).show_status(status, error)
+        self.query_one(HoardStatusBar).show_hints(self.HINTS)
         self.query_one(Sidebar).set_active(self.section)
         error_view = self.query_one("#status-error", Static)
         if error:
@@ -55,7 +59,7 @@ class WorkspaceScreen(Screen):
                 Text(
                     "Не удалось связаться со службой Hoard.\n"
                     f"{error}\n\nНажмите q, чтобы закрыть интерфейс.",
-                    style="#F79646",
+                    style=ACCENT,
                 )
             )
             error_view.display = True
@@ -65,7 +69,10 @@ class WorkspaceScreen(Screen):
         notice = self.hoard_app.notice
         if notice:
             message, is_error = notice
-            feedback.update(Text(message, style="#F79646" if is_error else "#FFFFFF"))
+            line = Text()
+            line.append("!  " if is_error else "›  ", style=f"bold {ACCENT}")
+            line.append(message, style=ACCENT if is_error else TEXT)
+            feedback.update(line)
             feedback.display = True
         else:
             feedback.display = False
@@ -75,5 +82,14 @@ class WorkspaceScreen(Screen):
     def render_data(self, status: dict) -> None:
         del status
 
+    def on_app_resize(self) -> None:
+        """Called after the terminal changed size; repaint anything that depends on density."""
+        status = self.hoard_app.status
+        if status is not None and self.is_mounted:
+            self.render_data(status)
+
     def on_sidebar_navigate(self, message: Sidebar.Navigate) -> None:
         self.hoard_app.open_section(message.section)
+
+
+__all__ = ["WorkspaceScreen"]

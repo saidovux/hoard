@@ -11,10 +11,15 @@ background service.
 - `tui/` is the only interactive terminal client: a full-screen Textual application. `app.py`
   owns lifecycle, contextual keyboard navigation, named mutation guards and the single in-flight
   status refresh; `api.py` provides typed operations over the existing `ensure_daemon()` /
-  `request()` boundary. Dialogs, screens, status formatting, reusable widgets and TCSS remain
-  separate. The package imports neither storage nor Telethon, and never creates a Telegram client.
+  `request()` boundary. `navigation.py` is the four-page registry (former Overview/Activity map to
+  Home; Sources maps to Telegram) used by the sidebar, breadcrumb, digits and palette;
+  `colors.py` owns the Noir palette; `palette.py` searches sections and app commands;
+  `widgets/panel.py`, `widgets/hero.py`, `widgets/status.py` and `widgets/chrome.py` provide the
+  framed-panel layout, wordmark, figures and key-chip footer. Dialogs, screens, status formatting,
+  reusable widgets and TCSS remain separate. The package imports neither storage nor Telethon, and
+  never creates a Telegram client. See `docs/TUI.md`.
 - `ipc.py` starts the daemon detached when required and sends one JSON request per private
-  Unix-socket connection. Client and daemon must both report Hoard 0.7.2.1 and IPC protocol `1`.
+  Unix-socket connection. Client and daemon must both report Hoard 0.7.2.2 and IPC protocol `1`.
   A held instance lock with no ready socket means initialization is in progress, so the client
   waits for that owner instead of spawning a second daemon.
 - `service.py` owns the database, three independently limited job runners and the sole
@@ -71,24 +76,25 @@ management. The AI runner follows the daemon rather than the collector and uses 
 concurrency limit. Each runner selects only its registered job kinds, so a long AI request
 cannot take a Telegram slot or acquire the Telegram lock. Interrupted AI jobs become `failed` and
 require an explicit retry because a cancelled paid request may already have reached the provider.
-Shutdown closes both runners, the Telegram client, database and socket.
+Shutdown closes the Telegram, AI and media runners, the Telegram client, database and socket.
 Menu keybindings are defined once for arrow and `h/j/k/l` navigation. Telegram IPC failures render
 network/VPN guidance inside the active Textual modal while the daemon owns the actual client.
 
-The Textual client is the sole interactive presentation and may enter application mode. Its
-Overview screen performs no idle polling. The Activity screen owns a moderate 1.5-second timer
-only while active, and the app's async lock drops overlapping ticks. Screen suspension, unmount
-and app exit stop the timer. IPC startup and request errors render inside the stable black
+The Textual client is the sole interactive presentation and may enter application mode. Only the
+visible Home screen owns the moderate 1.5-second status timer; the app's async lock drops
+overlapping ticks. Screen suspension, unmount and app exit stop the timer. IPC startup and request errors render inside the stable black
 workspace so a slow or unavailable daemon never produces an unexplained empty screen. Exiting the
 client sends no collector, shutdown or Telegram command; a previously started Web stays alive.
 
 The Textual theme sets background, surface and panel to `#000000`; TCSS also fixes computed
 backgrounds for containers, navigation components, focus/hover/selected states, inputs, tables,
-buttons, menus and modals. The workspace exposes Overview, Telegram, Sources, Activity, Archive
-and AI. The Telegram workspace mirrors daemon authorization states, controls the existing
-collector, uses `source_add` as an upsert and renders downloads, profiles and jobs returned by
-`status`. The modular AI screen and dialogs expose only implemented IPC operations and never
-import storage, provider transports or Telegram.
+buttons, menus and modals. The workspace exposes **Главная**, **Архив**, **Telegram** and **AI**.
+Home merges the former Overview and Activity dashboards; Telegram contains both collector and
+sources and adds the separate Web process panel; Archive retains downloads, profiles, jobs,
+catalog and video-frame actions. The modular AI screen and dialogs expose only implemented IPC operations and never
+import storage, provider transports or Telegram. Every surface is a black framed-panel workspace
+with an orange focus border; tests enforce the palette, responsive classes and disabled/selected
+states.
 
 ## Telegram authorization
 
