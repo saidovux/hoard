@@ -99,9 +99,12 @@ def _prepare_launcher(monkeypatch, tmp_path):
 
 def _popen_writing_state(monkeypatch, process, *, delay=0.1, status="ready", error=""):
     def fake_popen(*args, **kwargs):
+        launch_id = str((kwargs.get("env") or {}).get("HOARD_WEB_LAUNCH_ID") or "")
+
         def publish():
             web_module._write_state(
                 status,
+                launch_id=launch_id,
                 pid=process.pid,
                 port=45678 if status == "ready" else 0,
                 url="http://127.0.0.1:45678/start/synthetic"
@@ -114,6 +117,113 @@ def _popen_writing_state(monkeypatch, process, *, delay=0.1, status="ready", err
         return process
 
     monkeypatch.setattr("hoard.web.subprocess.Popen", fake_popen)
+    monkeypatch.setattr(
+        "hoard.web._pid_alive", lambda pid: pid == process.pid
+    )
+
+
+def test_launch_web_child_ready_before_popen_returns_is_not_overwritten(
+    monkeypatch, tmp_path
+):
+    _prepare_launcher(monkeypatch, tmp_path)
+    process = FakeWebProcess(pid=45678)
+    monkeypatch.setattr("hoard.web._pid_alive", lambda pid: pid == process.pid)
+
+    def immediate_ready(*args, **kwargs):
+        launch_id = str(
+            (kwargs.get("env") or {}).get("HOARD_WEB_LAUNCH_ID") or ""
+        )
+        web_module._write_state(
+            "ready",
+            launch_id=launch_id,
+            pid=process.pid,
+            port=45678,
+            url="http://127.0.0.1:45678/start/immediate",
+        )
+        return process
+
+    monkeypatch.setattr("hoard.web.subprocess.Popen", immediate_ready)
+
+    assert launch_web_process() == "http://127.0.0.1:45678/start/immediate"
+    state = json.loads((tmp_path / "state" / "web.ready.json").read_text())
+    assert state["status"] == "ready"
+    assert state["pid"] == process.pid
+    assert state["url"] == "http://127.0.0.1:45678/start/immediate"
+
+
+def test_two_concurrent_launches_spawn_only_one_child(monkeypatch, tmp_path):
+    _prepare_launcher(monkeypatch, tmp_path)
+    process = FakeWebProcess(pid=56789)
+    monkeypatch.setattr("hoard.web._pid_alive", lambda pid: pid == process.pid)
+    popen_started = threading.Event()
+    second_started = threading.Event()
+    release_child = threading.Event()
+    calls = 0
+    guard = threading.Lock()
+
+    def controlled_popen(*args, **kwargs):
+        nonlocal calls
+        with guard:
+            calls += 1
+        launch_id = str(
+            (kwargs.get("env") or {}).get("HOARD_WEB_LAUNCH_ID") or ""
+        )
+        popen_started.set()
+        release_child.wait(5)
+        web_module._write_state(
+            "ready",
+            launch_id=launch_id,
+            pid=process.pid,
+            port=45678,
+            url="http://127.0.0.1:45678/start/concurrent",
+        )
+        return process
+
+    monkeypatch.setattr("hoard.web.subprocess.Popen", controlled_popen)
+    results: list[str] = []
+    errors: list[BaseException] = []
+
+    def launch() -> None:
+        try:
+            results.append(launch_web_process())
+        except BaseException as exc:
+            errors.append(exc)
+
+    first = threading.Thread(target=launch, daemon=True)
+    first.start()
+    assert popen_started.wait(5)
+
+    def second_launch() -> None:
+        second_started.set()
+        launch()
+
+    second = threading.Thread(target=second_launch, daemon=True)
+    second.start()
+    assert second_started.wait(5)
+    release_child.set()
+
+    first.join(5)
+    second.join(5)
+    assert first.is_alive() is False
+    assert second.is_alive() is False
+    assert errors == []
+    assert calls == 1
+    assert results == [
+        "http://127.0.0.1:45678/start/concurrent",
+        "http://127.0.0.1:45678/start/concurrent",
+    ]
+
+
+def test_corrupted_state_does_not_block_launch(monkeypatch, tmp_path):
+    _prepare_launcher(monkeypatch, tmp_path)
+    state_path = tmp_path / "state" / "web.ready.json"
+    state_path.parent.mkdir(parents=True)
+    state_path.write_text("{broken", encoding="utf-8")
+    process = FakeWebProcess(pid=54321)
+    _popen_writing_state(monkeypatch, process, delay=0.05)
+
+    assert launch_web_process() == "http://127.0.0.1:45678/start/synthetic"
+    assert json.loads(state_path.read_text())["pid"] == process.pid
 
 
 def test_launch_web_waits_for_real_ready_state(monkeypatch, tmp_path):

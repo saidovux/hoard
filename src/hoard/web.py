@@ -12,6 +12,7 @@ import secrets
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import webbrowser
@@ -509,15 +510,20 @@ def _read_state() -> dict[str, Any] | None:
 def _write_state(
     status: str,
     *,
+    launch_id: str = "",
     pid: int | None = None,
+    parent_pid: int = 0,
     port: int = 0,
     url: str = "",
     error: str = "",
 ) -> None:
-    ensure_private(state_dir())
+    """Publish one complete state file atomically."""
+    directory = ensure_private(state_dir())
     payload = json.dumps(
         {
+            "launch_id": str(launch_id),
             "pid": int(os.getpid() if pid is None else pid),
+            "parent_pid": int(parent_pid),
             "status": status,
             "port": int(port),
             "url": str(url),
@@ -527,27 +533,38 @@ def _write_state(
         ensure_ascii=False,
         separators=(",", ":"),
     )
-    path = _ready_path()
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=".web.ready-", suffix=".tmp", dir=directory
+    )
+    temporary = Path(temporary_name)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
             stream.write(payload)
             stream.flush()
             os.fsync(stream.fileno())
-        path.chmod(0o600)
+        temporary.chmod(0o600)
+        os.replace(temporary, _ready_path())
     except Exception:
-        path.unlink(missing_ok=True)
+        temporary.unlink(missing_ok=True)
         raise
 
 
-def _remove_ready(pid: int) -> None:
+def _remove_state(*, launch_id: str = "", pid: int | None = None) -> bool:
+    """Remove only a state file owned by the caller's launch/process."""
     value = _read_state()
-    try:
-        owner_pid = int(value.get("pid") or 0) if value else 0
-    except (TypeError, ValueError):
-        owner_pid = 0
-    if owner_pid == int(pid):
-        _ready_path().unlink(missing_ok=True)
+    if value is None:
+        return False
+    if launch_id and str(value.get("launch_id") or "") != launch_id:
+        return False
+    if pid is not None and _state_pid(value) != int(pid):
+        return False
+    _ready_path().unlink(missing_ok=True)
+    return True
+
+
+def _clear_state_file() -> None:
+    """Remove a corrupted/unreadable state while the launch lock is held."""
+    _ready_path().unlink(missing_ok=True)
 
 
 def _state_phase(value: dict[str, Any] | None) -> str:
@@ -562,6 +579,10 @@ def _state_pid(value: dict[str, Any] | None) -> int:
         return int(value.get("pid") or 0) if value else 0
     except (TypeError, ValueError):
         return 0
+
+
+def _state_launch_id(value: dict[str, Any] | None) -> str:
+    return str(value.get("launch_id") or "") if value else ""
 
 
 def _state_port(value: dict[str, Any] | None) -> int:
@@ -650,13 +671,27 @@ def _wait_for_web(
     pid: int,
     process: subprocess.Popen | None,
     log: Path,
+    *,
+    launch_id: str,
 ) -> str:
     deadline = time.monotonic() + _WEB_LAUNCH_TIMEOUT
     while time.monotonic() < deadline:
         value = _read_state()
-        if _state_pid(value) == pid:
+        if (
+            _state_launch_id(value) == launch_id
+            and _state_pid(value) == pid
+            and value is not None
+        ):
             phase = _state_phase(value)
             if phase == "ready":
+                if process is not None and process.poll() is not None:
+                    raise RuntimeError(
+                        f"Веб-интерфейс завершился сразу после запуска; проверь {log}"
+                    )
+                if not _pid_alive(pid):
+                    raise RuntimeError(
+                        f"Веб-интерфейс завершился при подготовке; проверь {log}"
+                    )
                 url = _state_url(value)
                 if url and _web_reachable(_state_port(value)):
                     return url
@@ -665,7 +700,11 @@ def _wait_for_web(
                 raise RuntimeError(f"Веб-интерфейс не запустился: {detail}")
         if process is not None and process.poll() is not None:
             value = _read_state()
-            if _state_pid(value) == pid and _state_phase(value) == "error":
+            if (
+                _state_launch_id(value) == launch_id
+                and _state_pid(value) == pid
+                and _state_phase(value) == "error"
+            ):
                 detail = str(value.get("error") or "неизвестная ошибка")
                 raise RuntimeError(f"Веб-интерфейс не запустился: {detail}")
             raise RuntimeError(f"Веб-интерфейс не запустился; проверь {log}")
@@ -677,7 +716,7 @@ def _wait_for_web(
             process.terminate()
         with contextlib.suppress(Exception):
             process.wait(timeout=5)
-        _remove_ready(pid)
+        _remove_state(launch_id=launch_id)
     raise RuntimeError(
         "Веб-интерфейс не завершил подготовку за "
         f"{int(_WEB_LAUNCH_TIMEOUT)} с; проверь {log}"
@@ -703,7 +742,11 @@ def run_web(*, open_browser: bool = True, lifetime: int = 1800) -> str:
                 "Веб-интерфейс уже запускается; повтори через несколько секунд"
             )
 
-        _write_state("preparing")
+        launch_id = (
+            str(os.environ.get("HOARD_WEB_LAUNCH_ID") or "").strip()
+            or secrets.token_hex(16)
+        )
+        _write_state("preparing", launch_id=launch_id)
         server: HoardWebServer | None = None
         url = ""
         failed = False
@@ -730,7 +773,7 @@ def run_web(*, open_browser: bool = True, lifetime: int = 1800) -> str:
             server = create_web_server(state)
             server.timeout = 1
             url = state.start_url
-            _write_state("ready", port=state.port, url=url)
+            _write_state("ready", launch_id=launch_id, port=state.port, url=url)
             print(f"Hoard Web: {url}", flush=True)
             print("Только 127.0.0.1 · Ctrl+C для закрытия", flush=True)
             if open_browser:
@@ -742,14 +785,16 @@ def run_web(*, open_browser: bool = True, lifetime: int = 1800) -> str:
         except Exception as exc:
             failed = True
             _write_state(
-                "error", error=f"{type(exc).__name__}: {exc}"[:500]
+                "error",
+                launch_id=launch_id,
+                error=f"{type(exc).__name__}: {exc}"[:500],
             )
             raise
         finally:
             if server is not None:
                 server.server_close()
             if not failed:
-                _remove_ready(os.getpid())
+                _remove_state(launch_id=launch_id, pid=os.getpid())
         return url
 
 
@@ -759,13 +804,19 @@ def launch_web_process(*, open_browser: bool = True) -> str:
     log = state_dir() / "web.log"
     log.touch(mode=0o600, exist_ok=True)
     process: subprocess.Popen | None = None
-    reused_url = ""
     pid = 0
 
+    # The launch lock is held until the child publishes its own state.  The
+    # parent publishes only the pre-spawn "starting" record, before Popen();
+    # after that, only the child writes preparing/ready/error.  A concurrent
+    # launcher waits here and reuses the ready server instead of spawning a
+    # second one.
     with _file_lock(_launch_lock_path(), blocking=True):
         value = _read_state()
         phase = _state_phase(value)
         existing_pid = _state_pid(value)
+        if value is None:
+            _clear_state_file()
         if existing_pid and _pid_alive(existing_pid):
             if phase == "ready":
                 existing_url = _state_url(value)
@@ -776,36 +827,49 @@ def launch_web_process(*, open_browser: bool = True) -> str:
                     )
                 if open_browser:
                     _open_browser(existing_url)
-                reused_url = existing_url
-                pid = existing_pid
-            elif phase in {"preparing", "starting"}:
-                pid = existing_pid
-            elif phase == "error":
+                return existing_url
+            if phase in {"preparing", "starting"}:
+                return _wait_for_web(
+                    existing_pid,
+                    None,
+                    log,
+                    launch_id=_state_launch_id(value),
+                )
+            if phase == "error":
                 detail = str(value.get("error") or "неизвестная ошибка")
                 raise RuntimeError(f"Веб-интерфейс не запустился: {detail}")
-            else:
-                _remove_ready(existing_pid)
+            _clear_state_file()
+        elif existing_pid:
+            _clear_state_file()
+
+        launch_id = secrets.token_hex(16)
+        _write_state(
+            "starting",
+            launch_id=launch_id,
+            pid=0,
+            parent_pid=os.getpid(),
+        )
+        command = [sys.executable, "-m", "hoard", "web"]
+        environment = os.environ.copy()
+        environment["HOARD_WEB_LAUNCH_ID"] = launch_id
+        options: dict[str, Any] = {
+            "stdin": subprocess.DEVNULL,
+            "close_fds": True,
+            "env": environment,
+        }
+        if is_windows():
+            options["creationflags"] = (
+                subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+            )
         else:
-            if existing_pid:
-                _remove_ready(existing_pid)
-            command = [sys.executable, "-m", "hoard", "web"]
-            options: dict[str, Any] = {
-                "stdin": subprocess.DEVNULL,
-                "close_fds": True,
-            }
-            if is_windows():
-                options["creationflags"] = (
-                    subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
-                )
-            else:
-                options["start_new_session"] = True
+            options["start_new_session"] = True
+        try:
             with log.open("ab") as stream:
                 options["stdout"] = stream
                 options["stderr"] = stream
                 process = subprocess.Popen(command, **options)
-            pid = process.pid
-            _write_state("starting", pid=pid)
-
-    if reused_url:
-        return reused_url
-    return _wait_for_web(pid, process, log)
+        except BaseException:
+            _remove_state(launch_id=launch_id)
+            raise
+        pid = process.pid
+        return _wait_for_web(pid, process, log, launch_id=launch_id)

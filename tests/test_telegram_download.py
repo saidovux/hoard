@@ -18,7 +18,11 @@ from telethon.tl import types
 from hoard.archive_paths import video_note_path
 from hoard.models import Post
 from hoard.storage import Store
-from hoard.telegram import TelegramEngine, _await_with_stall_detection
+from hoard.telegram import (
+    TelegramEngine,
+    _await_with_stall_detection,
+    _DownloadActivity,
+)
 from hoard.telegram_download import VIDEO_NOTE_PART_SIZE_KB
 
 
@@ -356,3 +360,135 @@ async def test_stall_detector_cancels_inner_task():
             never(), lambda: time.monotonic() - 1, timeout=0.05
         )
     assert finished.is_set()
+
+
+def test_download_activity_requires_actual_byte_growth(monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr("hoard.telegram.time.monotonic", lambda: clock[0])
+    activity = _DownloadActivity()
+
+    clock[0] = 101.0
+    activity.update(0)
+    activity.update(None)
+    activity.update("not-a-number")
+    activity.update(-5)
+    assert activity.max_bytes == 0
+    assert activity.last_activity == 100.0
+
+    activity.update(10)
+    assert activity.max_bytes == 10
+    assert activity.last_activity == 101.0
+
+    clock[0] = 150.0
+    activity.update(10)
+    activity.update(9)
+    assert activity.max_bytes == 10
+    assert activity.last_activity == 101.0
+
+    activity.update(11)
+    assert activity.max_bytes == 11
+    assert activity.last_activity == 150.0
+
+
+async def test_repeated_zero_progress_still_times_out(tmp_path, monkeypatch):
+    store = Store(tmp_path / "db.sqlite")
+    store.add_source(Post("channel", 1), str(tmp_path / "archive"))
+    source = store.source(1)
+    message = SyntheticMessage(b"synthetic", message_id=22)
+
+    async def repeating(*_args, **kwargs):
+        callback = kwargs.get("progress_callback")
+        # download_one passes the callback positionally to download_video_note.
+        callback = callback or _args[3]
+        for _ in range(100):
+            callback(0, 100)
+            await asyncio.sleep(0.01)
+
+    monkeypatch.setattr("hoard.telegram.download_video_note", repeating)
+    monkeypatch.setattr("hoard.telegram.TELEGRAM_DOWNLOAD_IDLE_TIMEOUT", 0.05)
+    engine = TelegramEngine(store)
+
+    with pytest.raises(TimeoutError, match="остановилась"):
+        await engine.download_one(object(), Post("channel", 1), source, message)
+
+    assert not list(Path(source["output"]).rglob("*.part"))
+    assert store.db.execute("SELECT COUNT(*) FROM downloads").fetchone()[0] == 0
+    assert store.source(1)["last_id"] == 0
+    store.close()
+
+
+async def test_increasing_progress_completes_and_is_not_cancelled(tmp_path, monkeypatch):
+    store = Store(tmp_path / "db.sqlite")
+    store.add_source(Post("channel", 1), str(tmp_path / "archive"))
+    source = store.source(1)
+    message = SyntheticMessage(b"synthetic", message_id=22)
+
+    async def transferring(_client, _message, stream, callback):
+        payload = b"real-video-bytes"
+        for index in range(1, len(payload) + 1):
+            stream.write(payload[index - 1:index])
+            callback(index, len(payload))
+            await asyncio.sleep(0)
+        return stream
+
+    monkeypatch.setattr("hoard.telegram.download_video_note", transferring)
+    monkeypatch.setattr("hoard.telegram.TELEGRAM_DOWNLOAD_IDLE_TIMEOUT", 0.5)
+    engine = TelegramEngine(store)
+
+    video = await engine.download_one(object(), Post("channel", 1), source, message)
+
+    output = Path(video["file_path"])
+    assert output.read_bytes() == b"real-video-bytes"
+    assert output.with_suffix(".json").is_file()
+    assert not list(Path(source["output"]).rglob("*.part"))
+    store.close()
+
+
+async def test_delayed_cancellation_is_awaited_before_cleanup():
+    cancel_seen = asyncio.Event()
+    release = asyncio.Event()
+    finished = asyncio.Event()
+
+    async def stubborn():
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            cancel_seen.set()
+            await release.wait()
+            finished.set()
+            raise
+
+    helper = asyncio.create_task(
+        _await_with_stall_detection(
+            stubborn(), lambda: time.monotonic() - 1, timeout=0.01
+        )
+    )
+    await asyncio.wait_for(cancel_seen.wait(), 1)
+    assert helper.done() is False
+
+    release.set()
+    with pytest.raises(TimeoutError):
+        await helper
+    assert finished.is_set()
+
+
+async def test_external_cancellation_propagates_to_inner_download():
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def inner():
+        started.set()
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    helper = asyncio.create_task(
+        _await_with_stall_detection(inner(), lambda: time.monotonic(), timeout=60)
+    )
+    await asyncio.wait_for(started.wait(), 1)
+    helper.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await helper
+    assert cancelled.is_set()

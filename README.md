@@ -1,4 +1,4 @@
-# Hoard 0.7.1.8
+# Hoard 0.7.1.9
 
 Hoard is a local-first Linux and Windows archive for Telegram posts, profiles and video notes
 found in a channel post's comments. It uses Telethon, SQLite, an autonomous offline HTML catalog
@@ -73,6 +73,16 @@ cannot display; existing broken video-avatar records are repaired on their next 
 A transfer that makes no progress for two minutes is aborted with a retryable network error
 instead of holding the collector indefinitely after a dropped connection.
 
+The 0.7.1.9 patch closes the remaining startup and transfer races. Web state files are published
+atomically and carry a launch identifier owned by the spawned server; the parent writes only the
+pre-spawn record and never overwrites a child's `preparing`/`ready` state. The launch lock is held
+until the server is ready, so concurrent requests reuse one process. Telegram inactivity now
+tracks strictly increasing received bytes: repeated progress callbacks with the same count no
+longer postpone the two-minute timeout. Cancellation is awaited until the transfer really stops
+before the stream is closed or `.part` is removed; Telethon does not suppress cancellation, and
+an arbitrary third-party coroutine that does would be allowed to finish rather than risk writing
+into a reused file.
+
 ## Terminal interfaces
 
 The round-three interface is a complete Telegram workspace:
@@ -120,7 +130,7 @@ For development, install the test tools with `python -m pip install -e '.[dev]'`
 
 An upgrade keeps the existing XDG configuration, database, Telegram session and archive.
 If an older daemon is still running, execute `hoard shutdown` before starting the upgraded
-installation. The 0.7.1.8 client accepts only a daemon reporting the same application version and
+installation. The 0.7.1.9 client accepts only a daemon reporting the same application version and
 IPC protocol `1`; it reports the mismatch instead of starting a competing service. If a matching
 daemon already owns the service lock but is still initializing, clients wait for it and show a
 specific startup diagnostic.

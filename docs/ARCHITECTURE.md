@@ -13,7 +13,7 @@ background service.
   `request()` boundary. Dialogs, screens, status formatting, reusable widgets and TCSS remain
   separate. The package imports neither storage nor Telethon.
 - `ipc.py` starts the daemon detached when required and sends one JSON request per private
-  Unix-socket connection. Client and daemon must both report Hoard 0.7.1.8 and IPC protocol `1`.
+  Unix-socket connection. Client and daemon must both report Hoard 0.7.1.9 and IPC protocol `1`.
   A held instance lock with no ready socket means initialization is in progress, so the client
   waits for that owner instead of spawning a second daemon.
 - `service.py` owns the database, two independently limited job runners and the sole
@@ -35,12 +35,15 @@ background service.
   bootstrap/session token, HttpOnly SameSite cookie, independent CSRF token and CSP protect every
   write. Only media paths already validated into the current catalog snapshot and still contained
   by one of the daemon-reported archive roots are served through an opaque root-prefixed URL.
-  The launcher and server coordinate through private state files: `preparing` is published before
-  catalog generation, `ready` only after the HTTP socket is bound, and `error` retains a sanitized
-  failure message. PIDs and a server lock prevent a second launch or reuse of a stale ready file;
-  the launcher waits for the real build (up to four minutes), verifies a loopback connection, and
-  terminates only its own timed-out child. A healthy existing server is reused and its bootstrap
-  URL is returned to the TUI/CLI.
+  The launcher and server coordinate through one atomically replaced private state file. Before
+  spawning, the parent writes a `starting` record with a random launch identifier; only the child
+  writes `preparing`, `ready` (after binding the HTTP socket) and `error`. The parent never writes
+  after `Popen()`, so a fast child cannot be overwritten by an older state. A launch/server lock
+  and the launch identifier prevent a second server, reject a ready record whose process has
+  exited, and let the launcher wait for the real build (up to four minutes), verify a loopback
+  connection, and terminate only its own timed-out child. Corrupt and stale state files are
+  discarded under the lock. A healthy existing server is reused and its bootstrap URL is returned
+  to the TUI/CLI.
 - The socket and all XDG state directories are user-only. No persistent or remotely reachable
   TCP/HTTP listener exists; the loopback browser session starts only by explicit user action and
   expires after inactivity.
@@ -171,8 +174,12 @@ failures without rewinding any source checkpoint. Privacy/RPC failures and Flood
 are recorded on the profile and do not fail the source scan. Authorization loss, inaccessible
 peers, privacy/access restrictions, FloodWait and network failures have distinct retry classes;
 local filesystem write failures fail the photo job and are never mislabeled as network trouble.
-A Telegram transfer with no byte progress for two minutes is cancelled as a retryable network
-stall, so a dropped connection cannot leave one scan task alive forever.
+A Telegram transfer with no **increasing received-byte counter** for two minutes is cancelled as
+a retryable network stall; repeated callbacks that report the same count do not refresh the timer,
+so a dropped connection cannot leave one scan task alive forever. Cancellation is awaited until
+the transfer stops before the caller closes the stream or removes `.part`, avoiding writes into a
+reused file. Telethon's download loop propagates `CancelledError`; an arbitrary coroutine that
+suppresses cancellation indefinitely would delay shutdown by design rather than risk corruption.
 
 ## Offline catalog
 

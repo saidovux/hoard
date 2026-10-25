@@ -25,12 +25,34 @@ SCAN_CHECKPOINT_MAX_DELAY = 0.25
 TELEGRAM_DOWNLOAD_IDLE_TIMEOUT = 120.0
 
 
-async def _await_with_stall_detection(awaitable, last_activity, *, timeout: float):
-    """Abort one Telegram transfer when no bytes arrive for ``timeout`` seconds.
+class _DownloadActivity:
+    """Track real byte growth, not merely repeated progress callbacks."""
 
-    Telethon's recovery-aware download loop can otherwise wait indefinitely after
-    a dropped connection.  Cancellation of the surrounding scan must still cancel
-    the transfer normally.
+    def __init__(self) -> None:
+        self.max_bytes = 0
+        self.last_activity = time.monotonic()
+
+    def update(self, current) -> None:
+        try:
+            value = int(current)
+        except (TypeError, ValueError):
+            return
+        if value < 0 or value <= self.max_bytes:
+            return
+        self.max_bytes = value
+        self.last_activity = time.monotonic()
+
+
+async def _await_with_stall_detection(awaitable, last_activity, *, timeout: float):
+    """Abort one Telegram transfer when no new bytes arrive for ``timeout``.
+
+    Cancellation is awaited to completion before the caller closes the stream or
+    removes ``.part``.  Telethon's download loop does not suppress
+    ``CancelledError``, so this is bounded in practice.  A third-party coroutine
+    that deliberately swallows cancellation forever cannot be aborted without
+    closing a file that may still be written; that unsafe shortcut is not used.
+    Shutdown therefore waits for such a coroutine rather than corrupting its
+    output.
     """
     task = asyncio.create_task(awaitable)
     try:
@@ -956,22 +978,23 @@ class TelegramEngine:
             )
             try:
                 with partial.open("wb") as f:
-                    last_at = time.monotonic()
+                    activity = _DownloadActivity()
+                    last_at = activity.last_activity
                     last_size = 0
                     last_speed = None
-                    last_activity = last_at
 
                     def callback(current: int, total: int) -> None:
-                        nonlocal last_at, last_size, last_speed, last_activity
+                        nonlocal last_at, last_size, last_speed
+                        activity.update(current)
+                        received = activity.max_bytes
                         now = time.monotonic()
-                        last_activity = now
                         elapsed = now - last_at
                         if elapsed >= 0.5:
-                            last_speed = max(0.0, (current - last_size) / elapsed)
-                            last_at, last_size = now, current
+                            last_speed = max(0.0, (received - last_size) / elapsed)
+                            last_at, last_size = now, received
                         self._update_download_progress(
                             progress_key,
-                            current=current,
+                            current=received,
                             total=total,
                             speed_bps=last_speed,
                         )
@@ -979,7 +1002,7 @@ class TelegramEngine:
                     # File object avoids Telethon appending a file extension to .part.
                     result = await _await_with_stall_detection(
                         download_video_note(client, msg, f, callback),
-                        lambda: last_activity,
+                        lambda activity=activity: activity.last_activity,
                         timeout=TELEGRAM_DOWNLOAD_IDLE_TIMEOUT,
                     )
                     f.flush()
@@ -1145,14 +1168,14 @@ class TelegramEngine:
                     except OSError as exc:
                         raise ProfilePhotoWriteError(str(exc)) from exc
                     with partial.open("wb") as stream:
-                        photo_activity = [time.monotonic()]
+                        photo_activity = _DownloadActivity()
 
                         def photo_progress(
-                            _current: int,
+                            current: int,
                             _total: int,
                             activity=photo_activity,
                         ) -> None:
-                            activity[0] = time.monotonic()
+                            activity.update(current)
 
                         result = await _await_with_stall_detection(
                             client.download_media(
@@ -1161,7 +1184,7 @@ class TelegramEngine:
                                 progress_callback=photo_progress,
                                 **({"thumb": thumb} if thumb is not None else {}),
                             ),
-                            lambda activity=photo_activity: activity[0],
+                            lambda activity=photo_activity: activity.last_activity,
                             timeout=TELEGRAM_DOWNLOAD_IDLE_TIMEOUT,
                         )
                         try:
