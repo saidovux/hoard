@@ -14,7 +14,7 @@ background service.
   `request()` boundary. Dialogs, screens, status formatting, reusable widgets and TCSS remain
   separate. The package imports neither storage nor Telethon, and never creates a Telegram client.
 - `ipc.py` starts the daemon detached when required and sends one JSON request per private
-  Unix-socket connection. Client and daemon must both report Hoard 0.7.2.0 and IPC protocol `1`.
+  Unix-socket connection. Client and daemon must both report Hoard 0.7.2.1 and IPC protocol `1`.
   A held instance lock with no ready socket means initialization is in progress, so the client
   waits for that owner instead of spawning a second daemon.
 - `service.py` owns the database, three independently limited job runners and the sole
@@ -164,8 +164,13 @@ Temporary files are removed on failure; a cancelled job is returned to the durab
 absence is a terminal per-set diagnostic, not an installation or daemon failure.
 
 Previously saved MP4s are intentionally not discovered as automatic jobs. The explicit old-archive
-action starts a durable cursor and the media scheduler keeps at most eight frame jobs waiting while
-one runs; paused backfill stops new scheduling but does not cancel already queued work. Successful
+action starts a durable cursor and the media scheduler adds work only into free slots of an
+eight-job queued/running budget while one FFmpeg process runs. New download frame jobs keep their
+immediate enqueue path and are never delayed by old work. The cursor advances across scanned
+records; when the backfill budget is exhausted the loop stops before the next unscanned row, so no
+video is lost. Failed/stale records
+do not stall the traversal. Pause is soft: it stops new backfill scheduling but does not cancel the
+current FFmpeg process or already queued work. Successful
 sets are skipped on resume. Failed and stale sets require the explicit retry action. Catalog
 changes made by frame completion use the same catalog dirty/revision and atomic publication path;
 if the Telegram runner is stopped, a bounded deferred task performs the existing report through
@@ -401,7 +406,10 @@ opening an existing analysis performs only a read. No new Telegram download is t
 Telegram AI can select three modes without creating a second provider workflow: saved profile
 photos; three frames from one saved video note; or those three frames plus one profile photo of
 the same author. Frame handles are resolved from the local frame set, never by arbitrary path or
-another person's files. The three frames are attached in timestamp order to one user message and
+another person's files. A publication-scoped analysis carries its resolved `source_id` through
+preview, the durable batch request and resume; frame options and explicit video IDs are filtered to
+that source. Profile-only analysis without a publication can still choose among all of that person's
+saved sources. The three frames are attached in timestamp order to one user message and
 one `ai_attempts` row; preview fingerprints are rechecked before queueing. The request asks the
 model to treat them as moments of one video and keeps the same PSL output contract. No download
 or frame-extraction completion queues an AI attempt.

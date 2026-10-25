@@ -27,7 +27,14 @@ Local-first Telegram archive and extensible small-tool core, Python >=3.11. Keep
   request (and at most one same-author profile photo in combined mode); never mix authors, never send
   separate paid requests per frame, and keep preview fingerprints and operation-key idempotency.
 - Existing MP4s are not mass-processed on upgrade. The explicit old-archive action must remain
-  resumable, bounded and independent of new Telegram jobs.
+  resumable, bounded and independent of new Telegram jobs. It may fill only free slots in the
+  eight-job frame queue; never append a fixed-size batch past that limit. Advance the durable
+  cursor only over scanned records and stop before unscanned work when capacity is exhausted.
+  Its pause is soft: stop scheduling new backfill jobs, but let the current FFmpeg process and
+  already queued jobs finish.
+- A publication-scoped Telegram AI analysis must pass that `source_id` into frame selection during
+  preview, queueing and durable batch resume. A profile-only analysis may choose frames from any
+  of that profile's saved sources. Never fall back to a newer video from another publication.
 - Keep unimplemented integrations hidden from UI. Do not expand personal data gathering without explicit consent.
 - Recheck Python syntax, tests, CLI, IPC and `pytest -q` after changes. Live Telegram tests require user's authorization and should be run against permitted content.
 - Every completed and locally verified Hoard round must be published automatically to

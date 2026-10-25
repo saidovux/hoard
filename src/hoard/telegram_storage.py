@@ -666,15 +666,22 @@ class TelegramStorage:
         ]
         return result
 
-    def video_frame_options(self, author_id: int) -> list[dict[str, Any]]:
+    def video_frame_options(
+        self, author_id: int, *, source_id: int | None = None
+    ) -> list[dict[str, Any]]:
+        scope = ""
+        parameters: list[Any] = [int(author_id)]
+        if source_id is not None:
+            scope = " AND sets.source_id=?"
+            parameters.append(int(source_id))
         rows = list(
             self.db.execute(
-                """SELECT sets.source_id,sets.message_id FROM tg_video_frame_sets sets
+                f"""SELECT sets.source_id,sets.message_id FROM tg_video_frame_sets sets
                 LEFT JOIN downloads d ON d.source_id=sets.source_id
                   AND d.message_id=sets.message_id
-                WHERE sets.author_id=? AND sets.status='saved'
+                WHERE sets.author_id=? AND sets.status='saved'{scope}
                 ORDER BY COALESCE(d.date,'') DESC,sets.message_id DESC""",
-                (int(author_id),),
+                parameters,
             )
         )
         result: list[dict[str, Any]] = []
@@ -689,16 +696,25 @@ class TelegramStorage:
         author_id: int,
         video_id: str | None = None,
         image_ids: list[Any] | None = None,
+        *,
+        source_id: int | None = None,
     ) -> dict[str, Any]:
-        options = self.video_frame_options(author_id)
+        options = self.video_frame_options(author_id, source_id=source_id)
         if not options:
-            raise ValueError("Нет готового набора кадров этого профиля")
+            raise ValueError(
+                "Нет готового набора кадров этого профиля в выбранной публикации"
+                if source_id is not None
+                else "Нет готового набора кадров этого профиля"
+            )
         selected = None
         if video_id:
             value = str(video_id).strip()
             selected = next((item for item in options if item["video_id"] == value), None)
             if selected is None:
-                raise ValueError("Выбранный видеокружок не принадлежит профилю или кадры не готовы")
+                raise ValueError(
+                    "Выбранный видеокружок не принадлежит профилю, публикации "
+                    "или кадры не готовы"
+                )
         else:
             selected = options[0]
         frames = list(selected["frames"])

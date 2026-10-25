@@ -59,7 +59,7 @@ class ArchiveScreen(WorkspaceScreen):
             yield Button("Кадры кружка", id="frames-view")
             yield Button("AI по кадрам", id="frames-ai")
             yield Button("Обработать старые кружки", id="frames-backfill")
-            yield Button("Пауза обработки кадров", id="frames-backfill-pause")
+            yield Button("Пауза очереди кадров", id="frames-backfill-pause")
             yield Button("Повторить ошибки кадров", id="frames-retry")
         yield Select(
             [("Все публикации", "")],

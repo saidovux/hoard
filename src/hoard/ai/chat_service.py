@@ -206,6 +206,7 @@ class AIChatService:
         image_mode: Any = "photos",
         video_id: Any = None,
         image_ids: Any = None,
+        frame_source_id: Any = None,
     ) -> dict:
         """Freeze local Telegram images and queue one explicitly confirmed paid request."""
         if self.telegram_storage is None:
@@ -228,12 +229,16 @@ class AIChatService:
 
         text = bounded_text(content, field="Запрос")
         mode = self._image_mode(image_mode)
+        source_scope = None
+        if frame_source_id not in {None, ""}:
+            source_scope = self.telegram_storage.resolve_source_id(frame_source_id)
         selected_video, images, _choices = self._select_images(
             selected_author,
             mode,
             video_id=video_id,
             photo_ids=photo_ids,
             image_ids=image_ids,
+            frame_source_id=source_scope,
         )
         if not images:
             raise ValueError("Нет доступных локальных изображений")
@@ -584,6 +589,7 @@ class AIChatService:
         video_id: Any = None,
         photo_ids: Any = None,
         image_ids: Any = None,
+        frame_source_id: int | None = None,
     ) -> tuple[dict[str, Any] | None, list[dict[str, Any]], list[dict[str, Any]]]:
         """Resolve only local images; never substitutes another person's files."""
         if self.telegram_storage is None:
@@ -624,9 +630,15 @@ class AIChatService:
                 [],
             )
 
-        options = self.telegram_storage.video_frame_options(author)
+        options = self.telegram_storage.video_frame_options(
+            author, source_id=frame_source_id
+        )
         if not options:
-            raise ValueError("Нет готового набора кадров этого профиля")
+            raise ValueError(
+                "Нет готового набора кадров этого профиля в выбранной публикации"
+                if frame_source_id is not None
+                else "Нет готового набора кадров этого профиля"
+            )
         selected_video = options[0]
         requested_video = str(video_id or "").strip()
         if requested_video:
@@ -636,7 +648,10 @@ class AIChatService:
             )
             if selected_video is None:
                 raise ValueError(
-                    "Выбранный видеокружок не принадлежит профилю или кадры не готовы"
+                    "Выбранный видеокружок не принадлежит профилю, публикации "
+                    "или кадры не готовы"
+                    if frame_source_id is not None
+                    else "Выбранный видеокружок не принадлежит профилю или кадры не готовы"
                 )
         raw_ids = (
             [str(value) for value in image_ids] if isinstance(image_ids, list) else []
@@ -648,6 +663,7 @@ class AIChatService:
                 author,
                 str(selected_video["video_id"]),
                 frame_ids or None,
+                source_id=frame_source_id,
             )
             selected_photos: list[dict[str, Any]] = []
         else:
@@ -655,6 +671,7 @@ class AIChatService:
                 author,
                 str(selected_video["video_id"]),
                 frame_ids or None,
+                source_id=frame_source_id,
             )
             available_photos = [
                 item
@@ -729,6 +746,7 @@ class AIChatService:
         video_ids: Any = None,
         image_ids: Any = None,
         image_snapshots: Any = None,
+        frame_source_id: Any = None,
     ) -> tuple[list[dict[str, Any]], int | None]:
         """Resolve and validate an entirely local selection without provider calls."""
         if self.telegram_storage is None:
@@ -744,6 +762,12 @@ class AIChatService:
             identifiers = self.telegram_storage.source_profiles(selected_source)
         else:
             identifiers = self._author_ids(author_ids)
+        scope_source = selected_source
+        if frame_source_id not in {None, ""}:
+            resolved_scope = self.telegram_storage.resolve_source_id(frame_source_id)
+            if selected_source is not None and resolved_scope != selected_source:
+                raise ValueError("Источник изображений не совпадает с выбранной публикацией")
+            scope_source = resolved_scope
         previous_by_author = self.storage.latest_telegram_analyses(identifiers)
         include_photo_details = len(identifiers) == 1
         mode = self._image_mode(image_mode)
@@ -824,6 +848,7 @@ class AIChatService:
                     video_id=requested_video,
                     photo_ids=requested,
                     image_ids=requested_images,
+                    frame_source_id=scope_source,
                 )
                 _fingerprints, snapshot = self._image_fingerprints(images)
                 if expected_snapshot and snapshot != expected_snapshot:
@@ -1020,6 +1045,7 @@ class AIChatService:
                 "provider": values.get("provider"),
                 "model": values.get("model"),
                 "image_mode": mode,
+                "source_id": selected_source,
             },
         )
         await self.resume_telegram_psl_batch(str(batch["id"]))
@@ -1037,6 +1063,10 @@ class AIChatService:
             "Analyze these explicitly selected local images using the PSL contract."
         )
         mode = self._image_mode(request.get("image_mode", "photos"))
+        batch_record = self.storage.telegram_batch(batch_id)
+        batch_source = batch_record.get("source_id")
+        if batch_source in {None, ""}:
+            batch_source = request.get("source_id")
         for item in self.storage.pending_telegram_batch_items(batch_id):
             await asyncio.sleep(0)
             item_mode = self._image_mode(item.get("image_mode") or mode)
@@ -1051,6 +1081,7 @@ class AIChatService:
                 "image_snapshots": {
                     str(item["author_id"]): str(item.get("photo_snapshot") or "")
                 },
+                "frame_source_id": batch_source,
             }
             if item_mode == "photos":
                 candidate_args["photo_ids"] = {str(item["author_id"]): image_ids}
@@ -1076,6 +1107,7 @@ class AIChatService:
                     image_ids=selected_ids,
                     image_mode=item_mode,
                     video_id=item.get("video_id") or None,
+                    frame_source_id=batch_source,
                     content=content,
                     operation_id=f"batch:{operation}:{item['author_id']}",
                     adult_confirmed=True,

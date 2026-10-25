@@ -211,29 +211,43 @@ class Service:
         telegram = self.store.telegram
         if not telegram.frame_stats()["backfill_active"]:
             return
-        queued = self.store.db.execute(
-            """SELECT COUNT(*) FROM jobs WHERE kind='telegram.video_frames'
-            AND state IN ('queued','running')"""
-        ).fetchone()[0]
-        if int(queued) >= 8:
+        queued = int(
+            self.store.db.execute(
+                """SELECT COUNT(*) FROM jobs WHERE kind='telegram.video_frames'
+                AND state IN ('queued','running')"""
+            ).fetchone()[0]
+        )
+        slots = max(0, 8 - queued)
+        if slots == 0:
             return
         cursor = int(telegram.get_setting("frames_backfill_cursor", "0") or 0)
         rows = telegram.next_frame_backfill_downloads(cursor, 50)
         if not rows:
             telegram.set_frame_backfill_cursor(cursor, complete=True)
             return
+        last_processed = cursor
+        stopped_for_capacity = False
         for row in rows:
             status = str(row.get("frame_status") or "")
             if status in {"saved", "pending", "running", "failed", "stale"}:
+                last_processed = int(row["cursor_rowid"])
                 continue
+            if slots <= 0:
+                stopped_for_capacity = True
+                break
             try:
                 telegram.queue_frame_job(
                     int(row["source_id"]), int(row["message_id"])
                 )
             except ValueError:
-                continue
+                # A missing/corrupt old MP4 is recorded by its status and must
+                # not stall the traversal.
+                pass
+            last_processed = int(row["cursor_rowid"])
+            slots -= 1
         telegram.set_frame_backfill_cursor(
-            int(rows[-1]["cursor_rowid"]), complete=len(rows) < 50
+            last_processed,
+            complete=(not stopped_for_capacity and len(rows) < 50),
         )
 
     async def _telegram_video_frames(self, payload: dict) -> str:
@@ -821,7 +835,10 @@ class Service:
                 return {"message": "Обработка сохранённых видеокружков запущена", "stats": stats}
             if method == "telegram_frames_backfill_pause":
                 return {
-                    "message": "Постановка новых заданий остановлена",
+                    "message": (
+                        "Новые задания больше не ставятся; текущий FFmpeg завершится, "
+                        "а очередь доработает"
+                    ),
                     "stats": self.store.telegram.pause_frame_backfill(),
                 }
             if method == "telegram_frames_retry_failed":

@@ -339,3 +339,249 @@ async def test_source_video_change_marks_existing_frames_stale(tmp_path):
     finally:
         await service.stop_background()
         store.close()
+
+
+async def test_backfill_never_fills_more_than_eight_slots_and_resumes_without_loss(tmp_path):
+    archive = tmp_path / "archive"
+    archive.mkdir()
+    store = Store(tmp_path / "backfill.sqlite")
+    source_id = store.add_source(Post("channelx", 7), str(archive))
+    with store.db:
+        store.db.execute(
+            "INSERT INTO tg_profiles(author_id,display_name) VALUES(101,'Alice')"
+        )
+        for index in range(1, 31):
+            video = archive / f"old-{index}.mp4"
+            video.write_bytes(b"x" * 100)
+            store.db.execute(
+                """INSERT INTO downloads(source_id,message_id,author_id,author_username,
+                author_name,date,media_url,file_path,size,state)
+                VALUES(?,?,?,?,?,?,?,?,?,'saved')""",
+                (
+                    source_id,
+                    index,
+                    101,
+                    "alice",
+                    "Alice",
+                    f"2026-01-{index:02d}",
+                    f"https://t.me/channelx/7?comment={index}",
+                    str(video),
+                    video.stat().st_size,
+                ),
+            )
+        # Two already-ready sets must be skipped without consuming a queue slot.
+        for index in (1, 2):
+            store.db.execute(
+                """INSERT INTO tg_video_frame_sets(
+                source_id,message_id,author_id,video_path,video_size,video_mtime_ns,
+                frame_set_id,status,frame_count,updated_at)
+                VALUES(?,?,?,?,?,?,?,'saved',3,'2026-01-01')""",
+                (
+                    source_id,
+                    index,
+                    101,
+                    str(archive / f"old-{index}.mp4"),
+                    100,
+                    0,
+                    f"ready-{index}",
+                ),
+            )
+    service = make_service(store)
+    try:
+        await service.handle("telegram_frames_backfill_start", {})
+        service._enqueue_frame_backfill()
+        active = store.db.execute(
+            """SELECT COUNT(*) FROM jobs WHERE kind='telegram.video_frames'
+            AND state IN ('queued','running')"""
+        ).fetchone()[0]
+        assert active == 8
+        assert store.db.execute(
+            "SELECT COUNT(*) FROM tg_video_frame_sets WHERE status='pending'"
+        ).fetchone()[0] == 8
+        cursor_after_first = store.telegram.get_setting("frames_backfill_cursor")
+        service._enqueue_frame_backfill()
+        assert store.db.execute(
+            """SELECT COUNT(*) FROM jobs WHERE kind='telegram.video_frames'
+            AND state IN ('queued','running')"""
+        ).fetchone()[0] == 8
+        assert store.telegram.get_setting("frames_backfill_cursor") == cursor_after_first
+
+        # Simulate completion of four jobs, then restart the service.  The
+        # scheduler may fill only the four free slots and must continue from
+        # the persisted cursor.
+        with store.db:
+            store.db.execute(
+                """UPDATE jobs SET state='done' WHERE id IN (
+                SELECT id FROM jobs WHERE kind='telegram.video_frames'
+                AND state='queued' ORDER BY id LIMIT 4)"""
+            )
+            store.db.execute(
+                """UPDATE tg_video_frame_sets SET status='saved'
+                WHERE status='pending' AND (source_id,message_id) IN (
+                SELECT source_id,message_id FROM downloads
+                WHERE message_id BETWEEN 3 AND 6)"""
+            )
+        service2 = make_service(store)
+        service2._enqueue_frame_backfill()
+        assert store.db.execute(
+            """SELECT COUNT(*) FROM jobs WHERE kind='telegram.video_frames'
+            AND state IN ('queued','running')"""
+        ).fetchone()[0] == 8
+
+        paused = await service2.handle("telegram_frames_backfill_pause", {})
+        assert paused["stats"]["backfill_active"] is False
+        with store.db:
+            store.db.execute(
+                """UPDATE jobs SET state='done' WHERE kind='telegram.video_frames'
+                AND state='queued'"""
+            )
+            store.db.execute(
+                "UPDATE tg_video_frame_sets SET status='saved' WHERE status='pending'"
+            )
+        service2._enqueue_frame_backfill()
+        assert store.db.execute(
+            """SELECT COUNT(*) FROM jobs WHERE kind='telegram.video_frames'
+            AND state IN ('queued','running')"""
+        ).fetchone()[0] == 0
+
+        await service2.handle("telegram_frames_backfill_start", {})
+        while True:
+            service2._enqueue_frame_backfill()
+            active = store.db.execute(
+                """SELECT COUNT(*) FROM jobs WHERE kind='telegram.video_frames'
+                AND state IN ('queued','running')"""
+            ).fetchone()[0]
+            if active == 0 and store.telegram.frame_stats()["backfill_complete"]:
+                break
+            with store.db:
+                store.db.execute(
+                    """UPDATE jobs SET state='done' WHERE kind='telegram.video_frames'
+                    AND state='queued'"""
+                )
+                store.db.execute(
+                    "UPDATE tg_video_frame_sets SET status='saved' WHERE status='pending'"
+                )
+        stats = store.telegram.frame_stats()
+        assert stats["missing"] == 0
+        assert stats["backfill_complete"] is True
+        assert stats["saved"] == 30
+        assert store.db.execute(
+            "SELECT COUNT(*) FROM tg_video_frame_sets"
+        ).fetchone()[0] == 30
+        assert store.db.execute(
+            """SELECT COUNT(DISTINCT unique_key) FROM jobs
+            WHERE kind='telegram.video_frames'"""
+        ).fetchone()[0] == store.db.execute(
+            "SELECT COUNT(*) FROM jobs WHERE kind='telegram.video_frames'"
+        ).fetchone()[0]
+    finally:
+        await service.stop_background()
+        await service2.stop_background()
+        store.close()
+
+
+async def test_backfill_coexists_with_new_download_and_refills_only_free_slots(tmp_path):
+    archive = tmp_path / "archive"
+    archive.mkdir()
+    store = Store(tmp_path / "coexist.sqlite")
+    source_id = store.add_source(Post("channelx", 7), str(archive))
+    with store.db:
+        store.db.execute(
+            "INSERT INTO tg_profiles(author_id,display_name) VALUES(101,'Alice')"
+        )
+        for index in range(1, 21):
+            video = archive / f"old-{index}.mp4"
+            video.write_bytes(b"x" * 100)
+            store.db.execute(
+                """INSERT INTO downloads(source_id,message_id,author_id,author_username,
+                author_name,date,media_url,file_path,size,state)
+                VALUES(?,?,?,?,?,?,?,?,?,'saved')""",
+                (
+                    source_id,
+                    index,
+                    101,
+                    "alice",
+                    "Alice",
+                    f"2026-01-{index:02d}",
+                    f"https://t.me/channelx/7?comment={index}",
+                    str(video),
+                    video.stat().st_size,
+                ),
+            )
+    service = make_service(store)
+    try:
+        await service.handle("telegram_frames_backfill_start", {})
+        service._enqueue_frame_backfill()
+        assert store.db.execute(
+            """SELECT COUNT(*) FROM jobs WHERE kind='telegram.video_frames'
+            AND state IN ('queued','running')"""
+        ).fetchone()[0] == 8
+
+        new_video = archive / "new.mp4"
+        new_video.write_bytes(b"new" * 50)
+        create_download(store, source_id, 100, new_video)
+        new_job = store.db.execute(
+            """SELECT 1 FROM jobs WHERE kind='telegram.video_frames'
+            AND unique_key=? AND state IN ('queued','running')""",
+            (f"video-frames:{source_id}:100",),
+        ).fetchone()
+        assert new_job is not None
+        assert store.db.execute(
+            """SELECT COUNT(*) FROM jobs WHERE kind='telegram.video_frames'
+            AND state IN ('queued','running')"""
+        ).fetchone()[0] == 9
+
+        with store.db:
+            store.db.execute(
+                """UPDATE jobs SET state='done' WHERE id IN (
+                SELECT id FROM jobs WHERE kind='telegram.video_frames'
+                AND state='queued' ORDER BY id LIMIT 6)"""
+            )
+            store.db.execute(
+                "UPDATE tg_video_frame_sets SET status='saved' WHERE status='pending'"
+            )
+        service._enqueue_frame_backfill()
+        assert store.db.execute(
+            """SELECT COUNT(*) FROM jobs WHERE kind='telegram.video_frames'
+            AND state IN ('queued','running')"""
+        ).fetchone()[0] == 8
+
+        await service.handle("telegram_frames_backfill_pause", {})
+        with store.db:
+            store.db.execute(
+                """UPDATE jobs SET state='done' WHERE kind='telegram.video_frames'
+                AND state='queued'"""
+            )
+            store.db.execute(
+                "UPDATE tg_video_frame_sets SET status='saved' WHERE status='pending'"
+            )
+        service._enqueue_frame_backfill()
+        assert store.db.execute(
+            """SELECT COUNT(*) FROM jobs WHERE kind='telegram.video_frames'
+            AND state IN ('queued','running')"""
+        ).fetchone()[0] == 0
+
+        await service.handle("telegram_frames_backfill_start", {})
+        while True:
+            service._enqueue_frame_backfill()
+            active = store.db.execute(
+                """SELECT COUNT(*) FROM jobs WHERE kind='telegram.video_frames'
+                AND state IN ('queued','running')"""
+            ).fetchone()[0]
+            if active == 0 and store.telegram.frame_stats()["backfill_complete"]:
+                break
+            with store.db:
+                store.db.execute(
+                    """UPDATE jobs SET state='done' WHERE kind='telegram.video_frames'
+                    AND state='queued'"""
+                )
+                store.db.execute(
+                    "UPDATE tg_video_frame_sets SET status='saved' WHERE status='pending'"
+                )
+        assert store.telegram.frame_stats()["missing"] == 0
+        assert store.db.execute(
+            "SELECT COUNT(*) FROM tg_video_frame_sets"
+        ).fetchone()[0] == 21
+    finally:
+        await service.stop_background()
+        store.close()

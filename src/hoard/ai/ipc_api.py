@@ -224,6 +224,7 @@ class AIIPC:
                 image_ids=raw_images,
                 image_mode=args.get("image_mode", "photos"),
                 video_id=args.get("video_id"),
+                frame_source_id=args.get("source_id") or args.get("source_url"),
                 content=args.get("content"),
                 operation_id=args.get("operation_id"),
                 adult_confirmed=True,

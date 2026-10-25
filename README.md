@@ -1,4 +1,4 @@
-# Hoard 0.7.2.0
+# Hoard 0.7.2.1
 
 Hoard is a local-first Linux and Windows archive for Telegram posts, profiles and video notes
 found in a channel post's comments. It uses Telethon, SQLite, an autonomous offline HTML catalog
@@ -93,6 +93,17 @@ and fetches a new normalized snapshot only after a complete HTML publication; da
 counters and media allowlists are replaced without a full page reload, while search, filters,
 pagination, selection, scroll and active media playback are preserved.
 
+The 0.7.2.1 patch tightens two frame-processing boundaries. When AI analysis starts from
+one saved publication, frame selection is restricted to video notes from that same source in
+preview, queueing and durable batch resume; an explicit foreign `video_id` is rejected and no
+newer video from another publication can be substituted. Profile-only analysis keeps access to
+all of that profile's saved video notes. The old-archive backfill now adds work only into free
+slots of an eight-job queued/running budget rather than adding another fifty jobs; new download
+jobs keep their immediate path and are not delayed by old work. The cursor advances
+only across scanned records, stops before unscanned work when the budget is full, and keeps
+failed or already-ready records from stalling the traversal. Its pause is explicitly soft:
+new backfill work stops, while the current FFmpeg process and already queued jobs finish normally.
+
 The 0.7.2.0 release adds automatic local frame extraction for every newly saved Telegram
 video note. A separate media job runs at most one FFmpeg process, writes three JPEG frames at
 20%, 50% and 80% of the real duration, and never delays the Telegram download path. A failed or
@@ -164,7 +175,7 @@ For development, install the test tools with `python -m pip install -e '.[dev]'`
 
 An upgrade keeps the existing XDG configuration, database, Telegram session and archive.
 If an older daemon is still running, execute `hoard shutdown` before starting the upgraded
-installation. The 0.7.2.0 client accepts only a daemon reporting the same application version and
+installation. The 0.7.2.1 client accepts only a daemon reporting the same application version and
 IPC protocol `1`; it reports the mismatch instead of starting a competing service. If a matching
 daemon already owns the service lock but is still initializing, clients wait for it and show a
 specific startup diagnostic.
@@ -372,9 +383,10 @@ sudo pacman -S ffmpeg
 ```
 
 Existing video notes are not mass-processed after an upgrade. In **Архив → Кружки** choose
-**Обработать старые кружки** to start the bounded resumable backfill; **Пауза обработки кадров**
-stops scheduling new work and **Повторить ошибки кадров** retries failed/stale sets after fixing
-the dependency. Processing continues in the daemon when the TUI or Web is closed and does not
+**Обработать старые кружки** to start the bounded resumable backfill; **Пауза очереди кадров**
+is a soft pause: it stops placing new backfill jobs, while the current FFmpeg process and already
+queued jobs finish. **Повторить ошибки кадров** retries failed/stale sets after fixing the
+dependency. Processing continues in the daemon when the TUI or Web is closed and does not
 download the MP4 again. Frame completion marks the catalog dirty; an open Web receives the new
 frames without a reload. The autonomous `file://` catalog also displays frames when their files
 remain inside the archive.
