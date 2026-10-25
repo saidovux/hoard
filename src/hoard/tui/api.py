@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any, Protocol, TypedDict
 
 from hoard.ipc import ensure_daemon, request
@@ -65,6 +66,14 @@ class HoardAPI(Protocol):
     async def enrich_telegram(self) -> dict[str, Any]: ...
 
     async def retry_job(self, job_id: int) -> dict[str, Any]: ...
+
+    async def web_status(self) -> dict[str, Any]: ...
+
+    async def start_web(self) -> dict[str, Any]: ...
+
+    async def open_web(self) -> dict[str, Any]: ...
+
+    async def stop_web(self) -> dict[str, Any]: ...
 
     async def ai_call(
         self, method: str, args: dict[str, Any] | None = None
@@ -159,6 +168,26 @@ class IPCStatusAPI:
 
     async def retry_job(self, job_id: int) -> dict[str, Any]:
         return await request("job_retry", {"id": job_id}, timeout=self.CONTROL_TIMEOUT)
+
+    async def web_status(self) -> dict[str, Any]:
+        from hoard.web import web_status
+
+        return await asyncio.to_thread(web_status)
+
+    async def start_web(self) -> dict[str, Any]:
+        from hoard.web import start_web
+
+        return await asyncio.to_thread(start_web)
+
+    async def open_web(self) -> dict[str, Any]:
+        from hoard.web import open_web
+
+        return await asyncio.to_thread(open_web)
+
+    async def stop_web(self) -> dict[str, Any]:
+        from hoard.web import stop_web
+
+        return await asyncio.to_thread(stop_web)
 
     async def ai_call(
         self, method: str, args: dict[str, Any] | None = None

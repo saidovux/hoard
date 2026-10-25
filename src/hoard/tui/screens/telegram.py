@@ -20,6 +20,11 @@ class TelegramScreen(WorkspaceScreen):
     screen_title = "Telegram"
     screen_subtitle = "Подключение аккаунта и управление сборщиком"
 
+    def __init__(self) -> None:
+        super().__init__()
+        self._web_state: dict[str, Any] = {"state": "stopped"}
+        self._web_loading = False
+
     def compose_workspace(self) -> ComposeResult:
         yield Static(id="telegram-summary")
         with Horizontal(classes="action-row", id="telegram-actions"):
@@ -33,6 +38,20 @@ class TelegramScreen(WorkspaceScreen):
             "прервать активное задание, но не завершают службу и не удаляют очередь.",
             id="collector-help",
         )
+        yield Static("WEB-ИНТЕРФЕЙС", classes="section-heading")
+        yield Static(id="web-summary")
+        with Horizontal(classes="action-row", id="web-actions"):
+            yield Button("Включить Web", id="web-start", variant="primary")
+            yield Button("Открыть Web", id="web-open")
+            yield Button("Выключить Web", id="web-stop")
+
+    def on_mount(self) -> None:
+        super().on_mount()
+        self._refresh_web()
+
+    def on_screen_resume(self) -> None:
+        super().on_screen_resume()
+        self._refresh_web()
 
     def render_data(self, status: dict) -> None:
         summary = Text()
@@ -61,6 +80,39 @@ class TelegramScreen(WorkspaceScreen):
         self.query_one("#collector-stop", Button).disabled = (
             not running and collector_state == "stopped"
         )
+        self._render_web()
+
+    def _render_web(self) -> None:
+        state = str(self._web_state.get("state") or "stopped")
+        labels = {
+            "stopped": "выключен",
+            "starting": "запускается",
+            "ready": "работает",
+            "stopping": "останавливается",
+            "error": "ошибка",
+        }
+        text = Text()
+        text.append("Web        ", style="#888888")
+        text.append(labels.get(state, state), style="#FFFFFF")
+        if state == "ready" and self._web_state.get("port"):
+            text.append(f" · 127.0.0.1:{self._web_state['port']}", style="#888888")
+        if state == "error" and self._web_state.get("error"):
+            text.append(f"\n{self._web_state['error']}", style="#F79646")
+        if state == "ready" and not self._web_state.get("controllable", True):
+            text.append(
+                "\nWeb запущен без управляющего канала; перезапусти его вручную",
+                style="#F79646",
+            )
+        self.query_one("#web-summary", Static).update(text)
+
+        busy = self._web_loading
+        controllable = bool(self._web_state.get("controllable", True))
+        start = self.query_one("#web-start", Button)
+        open_button = self.query_one("#web-open", Button)
+        stop = self.query_one("#web-stop", Button)
+        start.disabled = busy or state in {"starting", "ready", "stopping"}
+        open_button.disabled = busy or state != "ready" or not controllable
+        stop.disabled = busy or state != "ready" or not controllable
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         actions = {
@@ -68,10 +120,89 @@ class TelegramScreen(WorkspaceScreen):
             "collector-start": self._start,
             "collector-pause": self._pause,
             "collector-stop": self._stop,
+            "web-start": self._web_start,
+            "web-open": self._web_open,
+            "web-stop": self._web_stop,
         }
         action = actions.get(str(event.button.id))
         if action:
             action()
+
+    def _refresh_web(self) -> None:
+        if self._web_loading:
+            return
+        self._web_loading = True
+        self._render_web()
+        self.run_worker(
+            self._load_web_state(), name="web-status", exit_on_error=False
+        )
+
+    async def _load_web_state(self) -> None:
+        try:
+            self._web_state = await self.hoard_app.api.web_status()
+        except Exception as exc:
+            self._web_state = {"state": "error", "error": str(exc) or type(exc).__name__}
+        finally:
+            self._web_loading = False
+            if self.is_mounted:
+                self._render_web()
+
+    def _web_start(self) -> None:
+        if self._web_loading:
+            return
+        self._web_state = {"state": "starting"}
+        self._run_web_action(
+            "web-start",
+            self.hoard_app.api.start_web,
+            "Включаем Web…",
+        )
+
+    def _web_open(self) -> None:
+        self._run_web_action(
+            "web-open",
+            self.hoard_app.api.open_web,
+            "Открываем Web…",
+        )
+
+    def _web_stop(self) -> None:
+        if self._web_loading:
+            return
+        self._web_state = {"state": "stopping"}
+        self._run_web_action(
+            "web-stop",
+            self.hoard_app.api.stop_web,
+            "Останавливаем Web…",
+        )
+
+    def _run_web_action(
+        self,
+        key: str,
+        operation: Callable[[], Awaitable[dict[str, Any]]],
+        pending: str,
+    ) -> None:
+        if self._web_loading:
+            return
+        self._web_loading = True
+        self.hoard_app.set_notice(pending)
+        self._render_web()
+        self.run_worker(
+            self._perform_web_action(key, operation), name=key, exit_on_error=False
+        )
+
+    async def _perform_web_action(
+        self,
+        key: str,
+        operation: Callable[[], Awaitable[dict[str, Any]]],
+    ) -> None:
+        del key
+        try:
+            result = await operation()
+        except Exception as exc:
+            self.hoard_app.set_notice(str(exc) or type(exc).__name__, error=True)
+        else:
+            self.hoard_app.set_notice(str(result.get("message") or "Готово"))
+        finally:
+            await self._load_web_state()
 
     def _connect(self) -> None:
         self.hoard_app.open_auth()

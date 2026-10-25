@@ -243,16 +243,19 @@ async def test_ai_catalog_change_is_delivered_without_starting_stopped_runner(
         await service.start()
 
     assert await service._ai_chat({"attempt_id": "synthetic"}) == "completed"
-    assert store.db.execute(
-        """SELECT COUNT(*) FROM jobs WHERE kind='telegram.report'
-        AND state IN ('queued','running')"""
-    ).fetchone()[0] == 1
-    if not runner_started:
+    if runner_started:
+        assert store.db.execute(
+            """SELECT COUNT(*) FROM jobs WHERE kind='telegram.report'
+            AND state IN ('queued','running','done')"""
+        ).fetchone()[0] >= 1
+        assert await asyncio.to_thread(built.wait, 5)
+    else:
         assert service.running is False
-        assert built.is_set() is False
-        await service.start()
+        assert built.is_set() is True
+        assert store.db.execute(
+            """SELECT COUNT(*) FROM jobs WHERE kind='telegram.report'"""
+        ).fetchone()[0] == 0
 
-    assert await asyncio.to_thread(built.wait, 5)
     await wait_until(lambda: not store.telegram.catalog_dirty())
     html = (archive / "telegram_archive.html").read_text(encoding="utf-8")
     assert '"author_id":701' in html

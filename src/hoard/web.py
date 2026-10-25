@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import errno
+import http.client
 import json
 import mimetypes
 import os
@@ -38,6 +39,8 @@ _LAUNCH_LOCK_FILE = "web.launch.lock"
 _SERVER_LOCK_FILE = "web.server.lock"
 _WEB_LAUNCH_TIMEOUT = 240.0
 _WEB_POLL_INTERVAL = 0.1
+_BOOTSTRAP_TTL = 300.0
+_CONTROL_TIMEOUT = 5.0
 
 
 async def _daemon_request(
@@ -58,10 +61,18 @@ class WebState:
     lifetime: int = 1800
     host: str = "127.0.0.1"
     port: int = 0
+    control_port: int = 0
+    control_token: str = ""
     last_seen: float = field(default_factory=time.monotonic)
     refresh_lock: threading.Lock = field(default_factory=threading.Lock)
+    snapshot_lock: threading.RLock = field(default_factory=threading.RLock)
+    bootstrap_lock: threading.Lock = field(default_factory=threading.Lock)
     media_files: dict[str, tuple[Path, int]] = field(default_factory=dict)
+    previous_media_files: dict[str, tuple[Path, int]] = field(default_factory=dict)
     catalog_payload: dict[str, Any] = field(default_factory=dict)
+    catalog_token: str = ""
+    bootstrap_tokens: dict[str, float] = field(default_factory=dict)
+    stop_event: threading.Event = field(default_factory=threading.Event)
 
     def __post_init__(self) -> None:
         self.catalog_path = self.catalog_path.expanduser().resolve(strict=True)
@@ -69,6 +80,9 @@ class WebState:
         self.allowed_media_roots = tuple(
             dict.fromkeys(Path(root).expanduser().resolve(strict=False) for root in roots)
         )
+        self.bootstrap_tokens = {
+            self.bootstrap_token: time.monotonic() + _BOOTSTRAP_TTL
+        }
         self.reload_media_allowlist()
 
     @property
@@ -83,8 +97,41 @@ class WebState:
     def start_url(self) -> str:
         return f"{self.origin}/start/{self.bootstrap_token}"
 
+    def issue_bootstrap(self) -> str:
+        """Issue a fresh one-time URL without invalidating other pending opens."""
+        token = secrets.token_urlsafe(32)
+        now = time.monotonic()
+        with self.bootstrap_lock:
+            self.bootstrap_tokens = {
+                key: expires for key, expires in self.bootstrap_tokens.items()
+                if expires > now
+            }
+            self.bootstrap_tokens[token] = now + _BOOTSTRAP_TTL
+        return f"{self.origin}/start/{token}"
+
+    def consume_bootstrap(self, token: str) -> bool:
+        now = time.monotonic()
+        with self.bootstrap_lock:
+            expires = self.bootstrap_tokens.get(token)
+            if expires is None or expires <= now:
+                self.bootstrap_tokens.pop(token, None)
+                return False
+            del self.bootstrap_tokens[token]
+            return True
+
     def call(self, method: str, args: dict[str, Any], *, timeout: float = 20) -> dict[str, Any]:
         return asyncio.run(self.requester(method, args, timeout))
+
+    def published_version(self) -> str | None:
+        try:
+            stat = self.catalog_path.stat()
+        except OSError:
+            return None
+        return f"{stat.st_mtime_ns}:{stat.st_size}:{stat.st_ino}"
+
+    def media_file(self, path: str) -> tuple[Path, int] | None:
+        with self.snapshot_lock:
+            return self.media_files.get(path) or self.previous_media_files.get(path)
 
     def refresh_catalog(self) -> dict[str, Any]:
         with self.refresh_lock:
@@ -92,19 +139,23 @@ class WebState:
             path = Path(str(result.get("catalog") or "")).expanduser().resolve(strict=True)
             if not path.is_file() or path.name != "telegram_archive.html":
                 raise RuntimeError("Daemon вернул недопустимый путь HTML-каталога")
-            self.catalog_path = path
             roots = result.get("media_roots") or [path.parent]
-            self.allowed_media_roots = tuple(
-                dict.fromkeys(
-                    Path(str(root)).expanduser().resolve(strict=False) for root in roots
+            with self.snapshot_lock:
+                self.catalog_path = path
+                self.allowed_media_roots = tuple(
+                    dict.fromkeys(
+                        Path(str(root)).expanduser().resolve(strict=False)
+                        for root in roots
+                    )
                 )
-            )
             self.reload_media_allowlist()
             return result
 
-    def reload_media_allowlist(self) -> None:
-        """Allow only files explicitly validated into the current catalog snapshot."""
-        source = self.catalog_path.read_text(encoding="utf-8")
+    def _read_snapshot(self) -> tuple[str, dict[str, Any], dict[str, tuple[Path, int]]]:
+        with self.catalog_path.open("rb") as stream:
+            raw = stream.read()
+            stat = os.fstat(stream.fileno())
+        source = raw.decode("utf-8")
         marker = "window.HOARD_CATALOG="
         start = source.find(marker)
         if start < 0:
@@ -157,8 +208,27 @@ class WebState:
             web_url = f"/media/r{root_index}/{quote(rooted_path, safe='/._-~')}"
             allowed[web_url] = (target, expected)
             item["url"] = web_url
-        self.media_files = allowed
-        self.catalog_payload = payload
+        token = f"{stat.st_mtime_ns}:{stat.st_size}:{stat.st_ino}"
+        return token, payload, allowed
+
+    def reload_media_allowlist(self) -> None:
+        """Reload the current published file and publish an atomic data view."""
+        token, payload, allowed = self._read_snapshot()
+        with self.snapshot_lock:
+            self.previous_media_files = self.media_files
+            self.media_files = allowed
+            self.catalog_payload = payload
+            self.catalog_token = token
+
+    def refresh_snapshot(self) -> tuple[str, dict[str, Any]]:
+        """Load a new published snapshot; leave all old state untouched on failure."""
+        token, payload, allowed = self._read_snapshot()
+        with self.snapshot_lock:
+            self.previous_media_files = self.media_files
+            self.media_files = allowed
+            self.catalog_payload = payload
+            self.catalog_token = token
+            return token, payload
 
 
 class HoardWebServer(ThreadingHTTPServer):
@@ -169,6 +239,61 @@ class HoardWebServer(ThreadingHTTPServer):
         self.state = state
         super().__init__(address, HoardWebHandler)
         state.port = int(self.server_address[1])
+
+
+class HoardControlServer(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = False
+
+    def __init__(self, address: tuple[str, int], state: WebState):
+        self.state = state
+        super().__init__(address, HoardControlHandler)
+        state.control_port = int(self.server_address[1])
+
+
+class HoardControlHandler(BaseHTTPRequestHandler):
+    """Private loopback control channel; never exposed through the web app."""
+
+    server: HoardControlServer
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, _format: str, *args: Any) -> None:
+        return
+
+    @property
+    def state(self) -> WebState:
+        return self.server.state
+
+    def _authorized(self) -> bool:
+        provided = self.headers.get("X-Hoard-Control", "")
+        return bool(
+            provided
+            and self.state.control_token
+            and secrets.compare_digest(provided, self.state.control_token)
+        )
+
+    def _reply(self, status: int, value: dict[str, Any]) -> None:
+        payload = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def do_POST(self) -> None:  # noqa: N802 - stdlib handler API
+        if not self._authorized():
+            self._reply(HTTPStatus.FORBIDDEN, {"error": "Доступ к управлению запрещён"})
+            return
+        path = urlsplit(self.path).path
+        if path == "/open":
+            self._reply(HTTPStatus.OK, {"url": self.state.issue_bootstrap()})
+            return
+        if path == "/stop":
+            self.state.stop_event.set()
+            self._reply(HTTPStatus.OK, {"message": "Web останавливается"})
+            return
+        self._reply(HTTPStatus.NOT_FOUND, {"error": "Неизвестная команда управления"})
 
 
 class HoardWebHandler(BaseHTTPRequestHandler):
@@ -260,12 +385,9 @@ class HoardWebHandler(BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
     def _bootstrap(self, token: str) -> None:
-        if not self._host_is_valid() or not secrets.compare_digest(
-            token, self.state.bootstrap_token
-        ):
+        if not self._host_is_valid() or not self.state.consume_bootstrap(token):
             self._reject(HTTPStatus.NOT_FOUND, "Страница не найдена")
             return
-        self.state.bootstrap_token = secrets.token_urlsafe(32)
         self.state.last_seen = time.monotonic()
         self.send_response(HTTPStatus.SEE_OTHER)
         self.send_header("Location", "/")
@@ -278,14 +400,19 @@ class HoardWebHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def _interactive_html(self) -> bytes:
-        source = self.state.catalog_path.read_text(encoding="utf-8")
+        with self.state.snapshot_lock:
+            catalog_path = self.state.catalog_path
+            payload = self.state.catalog_payload
+            catalog_token = self.state.catalog_token
+            nonce = self.state.nonce
+        source = catalog_path.read_text(encoding="utf-8")
         marker = "window.HOARD_CATALOG="
         start = source.find(marker)
         if start < 0:
             raise RuntimeError("HTML-каталог не содержит локальный снимок")
         _, end = json.JSONDecoder().raw_decode(source, start + len(marker))
         data = json.dumps(
-            self.state.catalog_payload,
+            payload,
             ensure_ascii=False,
             separators=(",", ":"),
         )
@@ -297,7 +424,6 @@ class HoardWebHandler(BaseHTTPRequestHandler):
             .replace("\u2029", "\\u2029")
         )
         source = source[: start + len(marker)] + data + source[end:]
-        nonce = self.state.nonce
         source = source.replace(
             '<style data-hoard-bundle="style">',
             f'<style nonce="{nonce}" data-hoard-bundle="style">',
@@ -310,7 +436,11 @@ class HoardWebHandler(BaseHTTPRequestHandler):
         )
         app_tag = '<script data-hoard-bundle="app">'
         config = json.dumps(
-            {"csrf": self.state.csrf_token, "interactive": True},
+            {
+                "csrf": self.state.csrf_token,
+                "interactive": True,
+                "catalog": catalog_token,
+            },
             ensure_ascii=True,
             separators=(",", ":"),
         )
@@ -342,7 +472,7 @@ class HoardWebHandler(BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
     def _serve_media(self, request_path: str) -> None:
-        selected = self.state.media_files.get(request_path)
+        selected = self.state.media_file(request_path)
         if selected is None:
             self._reject(HTTPStatus.NOT_FOUND, "Файл не найден")
             return
@@ -404,6 +534,27 @@ class HoardWebHandler(BaseHTTPRequestHandler):
                 return
             self._send_json(result)
             return
+        if parsed.path == "/api/catalog/version":
+            token = self.state.published_version()
+            if token is None:
+                self._reject(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    "Опубликованный HTML-каталог временно недоступен",
+                )
+                return
+            self._send_json({"token": token})
+            return
+        if parsed.path == "/api/catalog/snapshot":
+            try:
+                token, payload = self.state.refresh_snapshot()
+            except (OSError, RuntimeError, UnicodeError) as exc:
+                self._reject(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    str(exc) or "Новый снимок каталога пока недоступен",
+                )
+                return
+            self._send_json({"token": token, "catalog": payload})
+            return
         if parsed.path.startswith("/api/batches/"):
             batch_id = parsed.path.removeprefix("/api/batches/")
             if not _ID.fullmatch(batch_id):
@@ -418,7 +569,7 @@ class HoardWebHandler(BaseHTTPRequestHandler):
                 return
             self._send_json(result)
             return
-        if parsed.path in self.state.media_files:
+        if self.state.media_file(parsed.path) is not None:
             self._serve_media(parsed.path)
             return
         self._reject(HTTPStatus.NOT_FOUND, "Страница не найдена")
@@ -514,6 +665,8 @@ def _write_state(
     pid: int | None = None,
     parent_pid: int = 0,
     port: int = 0,
+    control_port: int = 0,
+    control_token: str = "",
     url: str = "",
     error: str = "",
 ) -> None:
@@ -526,6 +679,8 @@ def _write_state(
             "parent_pid": int(parent_pid),
             "status": status,
             "port": int(port),
+            "control_port": int(control_port),
+            "control_token": str(control_token),
             "url": str(url),
             "error": str(error)[:500],
             "updated_at": time.time(),
@@ -585,6 +740,14 @@ def _state_launch_id(value: dict[str, Any] | None) -> str:
     return str(value.get("launch_id") or "") if value else ""
 
 
+def _state_control_port(value: dict[str, Any] | None) -> int:
+    try:
+        port = int(value.get("control_port") or 0) if value else 0
+    except (TypeError, ValueError):
+        return 0
+    return port if 0 < port <= 65535 else 0
+
+
 def _state_port(value: dict[str, Any] | None) -> int:
     try:
         port = int(value.get("port") or 0) if value else 0
@@ -597,10 +760,12 @@ def _state_url(value: dict[str, Any] | None) -> str:
     return str(value.get("url") or "") if value else ""
 
 
-def _open_browser(url: str) -> None:
+def _open_browser(url: str) -> bool:
     """Browser launch is best-effort; the printed/returned URL remains usable."""
-    with contextlib.suppress(Exception):
-        webbrowser.open(url, new=2)
+    try:
+        return bool(webbrowser.open(url, new=2))
+    except Exception:
+        return False
 
 
 def _web_reachable(port: int) -> bool:
@@ -723,6 +888,129 @@ def _wait_for_web(
     )
 
 
+def _control_request(
+    value: dict[str, Any], action: str, *, timeout: float = _CONTROL_TIMEOUT
+) -> dict[str, Any]:
+    port = _state_control_port(value)
+    token = str(value.get("control_token") or "")
+    if not port or not token:
+        raise RuntimeError("У работающего Web нет управляющего канала; перезапусти его")
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
+    try:
+        connection.request(
+            "POST",
+            f"/{action}",
+            body=b"{}",
+            headers={
+                "X-Hoard-Control": token,
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "Host": f"127.0.0.1:{port}",
+            },
+        )
+        response = connection.getresponse()
+        payload = json.loads(response.read() or b"{}")
+        if response.status != HTTPStatus.OK:
+            raise RuntimeError(
+                str(payload.get("error") or f"Web control HTTP {response.status}")
+            )
+        return payload if isinstance(payload, dict) else {}
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeError("Web не отвечает на локальную команду управления") from exc
+    finally:
+        connection.close()
+
+
+def web_status() -> dict[str, Any]:
+    """Return actual Web process state without exposing bootstrap/control secrets."""
+    value = _read_state()
+    phase = _state_phase(value)
+    pid = _state_pid(value)
+    port = _state_port(value)
+    if phase == "ready" and pid and _pid_alive(pid) and _web_reachable(port):
+        return {
+            "state": "ready",
+            "pid": pid,
+            "port": port,
+            "controllable": bool(_state_control_port(value) and value.get("control_token")),
+        }
+    if phase in {"preparing", "starting"} and pid and _pid_alive(pid):
+        return {"state": "starting", "pid": pid}
+    if phase == "error":
+        return {"state": "error", "error": str(value.get("error") or "Ошибка Web")}
+    return {"state": "stopped"}
+
+
+def start_web() -> dict[str, Any]:
+    """Enable Web without opening a browser; safe to call repeatedly."""
+    launch_web_process(open_browser=False)
+    return {"state": "ready", "message": "Web включён"}
+
+
+def open_web(*, open_browser: bool = True) -> dict[str, Any]:
+    """Request a fresh one-time bootstrap URL from the running Web process."""
+    value = _read_state()
+    if (
+        _state_phase(value) != "ready"
+        or not _state_pid(value)
+        or not _pid_alive(_state_pid(value))
+        or not _web_reachable(_state_port(value))
+    ):
+        raise RuntimeError("Web не запущен; сначала включи его")
+    payload = _control_request(value, "open")
+    url = str(payload.get("url") or "")
+    if not url:
+        raise RuntimeError("Web не выдал ссылку авторизации")
+    opened = _open_browser(url) if open_browser else False
+    message = (
+        "Web открыт в браузере"
+        if opened
+        else f"Браузер не открылся. Ссылка: {url}"
+    )
+    return {"state": "ready", "url": url, "message": message}
+
+
+def stop_web() -> dict[str, Any]:
+    """Stop only the running Web process through its authenticated control port."""
+    value = _read_state()
+    phase = _state_phase(value)
+    pid = _state_pid(value)
+    if phase in {"preparing", "starting"} and pid and _pid_alive(pid):
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            value = _read_state()
+            phase = _state_phase(value)
+            pid = _state_pid(value)
+            if phase not in {"preparing", "starting"} or not pid or not _pid_alive(pid):
+                break
+            time.sleep(_WEB_POLL_INTERVAL)
+        if phase in {"preparing", "starting"} and pid and _pid_alive(pid):
+            raise RuntimeError("Web ещё запускается; повтори остановку после готовности")
+    if phase != "ready" or not pid or not _pid_alive(pid):
+        return {"state": "stopped", "message": "Web уже выключен"}
+    if not _state_control_port(value) or not value.get("control_token"):
+        raise RuntimeError(
+            "У работающего Web нет управляющего канала; безопасная остановка невозможна"
+        )
+    _control_request(value, "stop")
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        current = _read_state()
+        current_pid = _state_pid(current)
+        if current_pid != pid or not _pid_alive(pid):
+            return {"state": "stopped", "message": "Web остановлен"}
+        if _state_phase(current) == "stopped":
+            return {"state": "stopped", "message": "Web остановлен"}
+        time.sleep(_WEB_POLL_INTERVAL)
+    raise RuntimeError("Web не подтвердил остановку; повтори проверку состояния")
+
+
+def stop_web_for_shutdown() -> None:
+    """Best-effort cleanup used by daemon shutdown; never touches Telegram/AI."""
+    with contextlib.suppress(Exception):
+        stop_web()
+
+
 def run_web(*, open_browser: bool = True, lifetime: int = 1800) -> str:
     """Run the explicit loopback-only browser session until idle expiry or Ctrl+C."""
     with _file_lock(_server_lock_path(), blocking=False) as acquired:
@@ -734,6 +1022,11 @@ def run_web(*, open_browser: bool = True, lifetime: int = 1800) -> str:
                 and url
                 and _web_reachable(_state_port(value))
             ):
+                if _state_control_port(value) and value.get("control_token"):
+                    try:
+                        url = str(_control_request(value, "open").get("url") or url)
+                    except RuntimeError:
+                        pass
                 print(f"Hoard Web уже запущен: {url}", flush=True)
                 if open_browser:
                     _open_browser(url)
@@ -748,8 +1041,10 @@ def run_web(*, open_browser: bool = True, lifetime: int = 1800) -> str:
         )
         _write_state("preparing", launch_id=launch_id)
         server: HoardWebServer | None = None
+        control: HoardControlServer | None = None
         url = ""
         failed = False
+        manual = os.environ.get("HOARD_WEB_MANUAL") == "1"
         try:
             asyncio.run(ensure_daemon())
             report = asyncio.run(request("telegram_report", timeout=180))
@@ -772,13 +1067,30 @@ def run_web(*, open_browser: bool = True, lifetime: int = 1800) -> str:
             )
             server = create_web_server(state)
             server.timeout = 1
+            state.control_token = secrets.token_urlsafe(32)
+            control = HoardControlServer((state.host, 0), state)
+            control.timeout = 1
+            threading.Thread(
+                target=control.serve_forever,
+                name="hoard-web-control",
+                daemon=True,
+            ).start()
             url = state.start_url
-            _write_state("ready", launch_id=launch_id, port=state.port, url=url)
+            _write_state(
+                "ready",
+                launch_id=launch_id,
+                port=state.port,
+                control_port=state.control_port,
+                control_token=state.control_token,
+                url=url,
+            )
             print(f"Hoard Web: {url}", flush=True)
             print("Только 127.0.0.1 · Ctrl+C для закрытия", flush=True)
             if open_browser:
                 _open_browser(url)
-            while time.monotonic() - state.last_seen <= state.lifetime:
+            while not state.stop_event.is_set() and (
+                manual or time.monotonic() - state.last_seen <= state.lifetime
+            ):
                 server.handle_request()
         except KeyboardInterrupt:
             pass
@@ -791,6 +1103,10 @@ def run_web(*, open_browser: bool = True, lifetime: int = 1800) -> str:
             )
             raise
         finally:
+            if control is not None:
+                with contextlib.suppress(Exception):
+                    control.shutdown()
+                control.server_close()
             if server is not None:
                 server.server_close()
             if not failed:
@@ -826,6 +1142,13 @@ def launch_web_process(*, open_browser: bool = True) -> str:
                         "закрой его или дождись завершения"
                     )
                 if open_browser:
+                    if _state_control_port(value) and value.get("control_token"):
+                        try:
+                            existing_url = str(
+                                _control_request(value, "open").get("url") or existing_url
+                            )
+                        except RuntimeError:
+                            pass
                     _open_browser(existing_url)
                 return existing_url
             if phase in {"preparing", "starting"}:
@@ -852,6 +1175,7 @@ def launch_web_process(*, open_browser: bool = True) -> str:
         command = [sys.executable, "-m", "hoard", "web"]
         environment = os.environ.copy()
         environment["HOARD_WEB_LAUNCH_ID"] = launch_id
+        environment["HOARD_WEB_MANUAL"] = "1"
         options: dict[str, Any] = {
             "stdin": subprocess.DEVNULL,
             "close_fds": True,

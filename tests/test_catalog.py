@@ -359,7 +359,7 @@ def test_catalog_template_markers_inside_data_are_not_replaced(tmp_path):
     assert payload_from(report)["posts"][0]["channel_title"] == title
     html = report.read_text(encoding="utf-8")
     assert html.count('<script data-hoard-bundle="app">') == 1
-    assert html.count("const catalog = window.HOARD_CATALOG || {};") == 1
+    assert html.count("let catalog = window.HOARD_CATALOG || {};") == 1
     assert "</script><script>" not in html
     store.close()
 

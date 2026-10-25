@@ -14,7 +14,7 @@ background service.
   `request()` boundary. Dialogs, screens, status formatting, reusable widgets and TCSS remain
   separate. The package imports neither storage nor Telethon, and never creates a Telegram client.
 - `ipc.py` starts the daemon detached when required and sends one JSON request per private
-  Unix-socket connection. Client and daemon must both report Hoard 0.7.1.10 and IPC protocol `1`.
+  Unix-socket connection. Client and daemon must both report Hoard 0.7.1.11 and IPC protocol `1`.
   A held instance lock with no ready socket means initialization is in progress, so the client
   waits for that owner instead of spawning a second daemon.
 - `service.py` owns the database, two independently limited job runners and the sole
@@ -43,10 +43,20 @@ background service.
   and the launch identifier prevent a second server, reject a ready record whose process has
   exited, and let the launcher wait for the real build (up to four minutes), verify a loopback
   connection, and terminate only its own timed-out child. Corrupt and stale state files are
-  discarded under the lock. A healthy existing server is reused and its bootstrap URL is returned
-  to the TUI/CLI. Known limitation for the next Web round: the ready record contains one
-  single-use bootstrap URL, so reopening an already authenticated Web can return a consumed URL
-  and appear stale. Authentication is intentionally not weakened to work around it.
+  discarded under the lock. A healthy existing server is reused. Each one-time bootstrap token
+  is kept in a short-lived in-memory set; issuing a new URL does not invalidate other pending
+  opens, while consuming a token removes it permanently. Authenticated browser sessions remain
+  unchanged. A separate authenticated loopback control server, advertised only in the private
+  `0600` state file, issues fresh bootstrap URLs and accepts a stop command. It is never exposed
+  by the browser app and uses no session/CSRF token. The TUI controls Web exclusively through
+  this channel and never kills a PID from JSON. Web enabled by the TUI runs with a manual lifetime
+  until stop, daemon shutdown or crash; direct `hoard web --lifetime` keeps its idle lifetime.
+  Each published HTML snapshot is detected by a stat token endpoint. Only after a complete atomic
+  replacement does the page request `/api/catalog/snapshot`; the new payload and validated media
+  allowlist are swapped under a snapshot lock, with the previous allowlist retained for one
+  generation so active media is not interrupted. The browser updates its mutable collections,
+  maps and search indexes in place and defers visual rebuilds while a modal viewer or playing
+  video is active.
 - The socket and all XDG state directories are user-only. No persistent or remotely reachable
   TCP/HTTP listener exists; the loopback browser session starts only by explicit user action and
   expires after inactivity.

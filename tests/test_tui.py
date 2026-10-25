@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Any
 import pytest
 
 if TYPE_CHECKING:
-    from textual.widgets import DataTable, Input, OptionList, SelectionList, Static
+    from textual.widgets import Button, DataTable, Input, OptionList, SelectionList, Static
 
     from hoard.tui.ai_dialogs import AIRecordDialog, TelegramAIDialog, TelegramAnalysisDialog
     from hoard.tui.app import HelpScreen, HoardApp
@@ -30,6 +30,7 @@ if TYPE_CHECKING:
 @pytest.fixture(scope="module", autouse=True)
 def load_textual_after_existing_async_tests():
     """Keep Textual initialization local to its own headless test module."""
+    from textual.widgets import Button as ButtonClass
     from textual.widgets import DataTable as DataTableClass
     from textual.widgets import Input as InputClass
     from textual.widgets import OptionList as OptionListClass
@@ -58,6 +59,7 @@ def load_textual_after_existing_async_tests():
     globals().update(
         ActivityScreen=ActivityScreenClass,
         AIRecordDialog=AIRecordDialogClass,
+        Button=ButtonClass,
         AIWorkspaceScreen=AIWorkspaceScreenClass,
         ArchiveScreen=ArchiveScreenClass,
         AuthDialog=AuthDialogClass,
@@ -140,6 +142,7 @@ class FakeAPI:
         self.operation_delay = 0.0
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self.responses: dict[str, list[dict[str, Any] | Exception]] = {}
+        self.web_state: dict[str, Any] = {"state": "stopped"}
 
     def queue(self, name: str, *responses: dict[str, Any] | Exception) -> None:
         self.responses[name] = list(responses)
@@ -248,6 +251,32 @@ class FakeAPI:
 
     async def retry_job(self, job_id: int) -> dict:
         return await self._operation("retry_job", {"id": job_id})
+
+    async def web_status(self) -> dict:
+        self.calls.append(("web_status", {}))
+        return dict(self.web_state)
+
+    async def start_web(self) -> dict:
+        self.web_state = {"state": "ready", "port": 45678}
+        return await self._operation(
+            "start_web", default={"state": "ready", "message": "Web включён"}
+        )
+
+    async def open_web(self) -> dict:
+        return await self._operation(
+            "open_web",
+            default={
+                "state": "ready",
+                "url": "http://127.0.0.1:45678/start/test",
+                "message": "Web открыт в браузере",
+            },
+        )
+
+    async def stop_web(self) -> dict:
+        self.web_state = {"state": "stopped"}
+        return await self._operation(
+            "stop_web", default={"state": "stopped", "message": "Web остановлен"}
+        )
 
     async def ai_call(self, method: str, args: dict[str, Any] | None = None) -> dict:
         defaults = {
@@ -967,6 +996,71 @@ async def test_start_collector_connects_first_when_session_is_not_authorized():
         )
     names = [name for name, _ in api.calls]
     assert names.index("auth_begin") < names.index("start_collector")
+
+
+@pytest.mark.asyncio
+async def test_telegram_web_controls_reflect_state_and_are_nonblocking():
+    api = FakeAPI()
+    app = HoardApp(api)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await wait_for_startup(app, pilot)
+        app.open_section("telegram")
+        await wait_for_condition(
+            pilot,
+            lambda: "выключен" in str(app.screen.query_one("#web-summary", Static).content),
+        )
+        screen = app.screen
+        assert screen.query_one("#web-start", Button).disabled is False
+        assert screen.query_one("#web-open", Button).disabled is True
+        assert screen.query_one("#web-stop", Button).disabled is True
+
+        screen.query_one("#web-start").press()
+        await wait_for_condition(
+            pilot,
+            lambda: "работает" in str(app.screen.query_one("#web-summary", Static).content),
+        )
+        assert screen.query_one("#web-start", Button).disabled is True
+        assert screen.query_one("#web-open", Button).disabled is False
+        assert screen.query_one("#web-stop", Button).disabled is False
+
+        screen.query_one("#web-open").press()
+        await wait_for_condition(
+            pilot, lambda: any(name == "open_web" for name, _ in api.calls)
+        )
+        await wait_for_condition(
+            pilot,
+            lambda: not screen._web_loading and not app._operations,
+        )
+
+        screen.query_one("#web-stop").press()
+        await wait_for_condition(
+            pilot,
+            lambda: "выключен" in str(app.screen.query_one("#web-summary", Static).content),
+        )
+        assert any(name == "stop_web" for name, _ in api.calls)
+        assert not any(
+            name in {"stop_collector", "pause_collector"} for name, _ in api.calls
+        )
+
+    assert [name for name, _ in api.calls].count("web_status") >= 1
+
+
+@pytest.mark.asyncio
+async def test_telegram_web_state_is_recovered_on_reopen():
+    api = FakeAPI()
+    api.web_state = {"state": "ready", "port": 45678, "controllable": True}
+    app = HoardApp(api)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await wait_for_startup(app, pilot)
+        app.open_section("telegram")
+        await wait_for_condition(
+            pilot,
+            lambda: "работает" in str(app.screen.query_one("#web-summary", Static).content),
+        )
+        assert "127.0.0.1:45678" in str(
+            app.screen.query_one("#web-summary", Static).content
+        )
+        assert app.screen.query_one("#web-open", Button).disabled is False
 
 
 @pytest.mark.asyncio

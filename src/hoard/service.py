@@ -124,6 +124,22 @@ class Service:
         self.ai_runner.wakeup()
         return jid
 
+    async def _publish_ai_catalog(self) -> None:
+        """Publish AI-visible changes even when the Telegram collector is stopped."""
+        if not self.store.telegram.catalog_dirty():
+            return
+        if self.runner.running:
+            self._queue_report()
+            return
+        if not self.store.telegram.catalog_report_due():
+            return
+        try:
+            await self._telegram_report({})
+        except Exception:
+            # The AI result remains saved; the existing durable dirty marker
+            # and report diagnostics allow a later retry.
+            pass
+
     async def _ai_request(self, payload: dict) -> str:
         try:
             result = await self.ai_service.execute_legacy(payload)
@@ -134,8 +150,7 @@ class Service:
             self._ai_key_state = "verified"
             return result
         finally:
-            if self.store.telegram.catalog_dirty():
-                self._queue_report()
+            await self._publish_ai_catalog()
 
     async def _ai_chat(self, payload: dict) -> str:
         try:
@@ -147,8 +162,7 @@ class Service:
             self._ai_key_state = "verified"
             return result
         finally:
-            if self.store.telegram.catalog_dirty():
-                self._queue_report()
+            await self._publish_ai_catalog()
 
     @staticmethod
     def _scan_error(exc: Exception) -> str:
@@ -696,6 +710,14 @@ async def run_daemon():
                 await server.wait_closed()
             await service.stop_background()
             await service.stop()
+            # The loopback Web is a separate process.  A normal Hoard
+            # shutdown must not leave it orphaned.
+            try:
+                from .web import stop_web_for_shutdown
+
+                await asyncio.to_thread(stop_web_for_shutdown)
+            except Exception:
+                pass
             service.store.close()
             if token is not None:
                 remove_endpoint_if_owned(endpoint_path(), token)

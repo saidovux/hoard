@@ -1,4 +1,4 @@
-# Hoard 0.7.1.10
+# Hoard 0.7.1.11
 
 Hoard is a local-first Linux and Windows archive for Telegram posts, profiles and video notes
 found in a channel post's comments. It uses Telethon, SQLite, an autonomous offline HTML catalog
@@ -83,6 +83,16 @@ before the stream is closed or `.part` is removed; Telethon does not suppress ca
 an arbitrary third-party coroutine that does would be allowed to finish rather than risk writing
 into a reused file.
 
+The 0.7.1.11 release adds complete Telegram Web lifecycle control and live catalog refresh.
+The Textual Telegram screen can enable, open and stop the separate loopback Web process; it
+survives closing the TUI. Each open receives a fresh one-time bootstrap URL through a private
+authenticated loopback control channel, while used URLs stay invalid and existing browser
+sessions remain valid. A managed Web runs until an explicit stop, daemon shutdown or crash,
+independent of the browser-session lifetime. The open page polls a small catalog-version endpoint
+and fetches a new normalized snapshot only after a complete HTML publication; data, indexes,
+counters and media allowlists are replaced without a full page reload, while search, filters,
+pagination, selection, scroll and active media playback are preserved.
+
 The 0.7.1.10 release makes the existing full-screen Textual workspace the only interactive
 terminal interface. `hoard`, `hoard ui` and `hoard tui` open the same Textual application; `ui`
 and `tui` remain compatibility aliases. The old inline Rich/InquirerPy client and its InquirerPy
@@ -100,8 +110,9 @@ Its implemented sections are **Обзор**, **Telegram**, **Источники*
 **AI**.
 They cover login including 2FA, collector start/pause/stop, source validation and editing,
 selected-source or global scans, downloads, profile summaries, jobs, errors, enrichment,
-manual HTML generation, AI chats and AI settings. All operations use the private daemon IPC
-layer; the TUI never opens
+manual HTML generation, AI chats and AI settings. **Telegram → Web** enables, opens and stops the
+separate local Web process; closing the TUI does not stop a running Web. All daemon operations use
+the private IPC layer; the TUI never opens
 SQLite or creates a Telegram client. Only the visible Activity screen polls, with one status
 request in flight at a time.
 
@@ -136,7 +147,7 @@ For development, install the test tools with `python -m pip install -e '.[dev]'`
 
 An upgrade keeps the existing XDG configuration, database, Telegram session and archive.
 If an older daemon is still running, execute `hoard shutdown` before starting the upgraded
-installation. The 0.7.1.10 client accepts only a daemon reporting the same application version and
+installation. The 0.7.1.11 client accepts only a daemon reporting the same application version and
 IPC protocol `1`; it reports the mismatch instead of starting a competing service. If a matching
 daemon already owns the service lock but is still initializing, clients wait for it and show a
 specific startup diagnostic.
@@ -284,12 +295,26 @@ Run the browser workflow explicitly:
 hoard web
 ```
 
-Hoard rebuilds the same catalog through daemon IPC, binds a short-lived HTTP session to a random
+Hoard rebuilds the same catalog through daemon IPC, binds a local HTTP server to a random
 `127.0.0.1` port and opens it in the default browser. The browser view reuses the packaged catalog
 HTML, CSS and JavaScript; no CDN or third-party browser dependency is loaded. A one-time bootstrap
 URL creates an HttpOnly, SameSite session cookie. Exact Host and Origin checks, a separate CSRF
 token, a strict content security policy and closed write routes prevent unrelated local pages from
-driving Hoard. The server never listens on a LAN address and expires after inactivity.
+driving Hoard. The server never listens on a LAN address. The direct `hoard web` command keeps
+`--no-open` and its idle `--lifetime`; Web enabled from **Telegram → Web** uses a manual lifetime
+until explicitly stopped. Closing the TUI leaves it running. Each **Открыть Web** asks the running
+process for a fresh one-time URL; used URLs are rejected and do not invalidate other browser
+sessions. A fresh URL and the stop command are available only through a separate authenticated
+loopback control channel advertised in the private mode-`0600` state file. The browser page never
+receives that token and has no server-stop route.
+
+While the browser is visible it polls a tiny published-catalog-version endpoint. It requests the
+new normalized snapshot only when the atomically replaced HTML changes, then updates collections,
+search indexes, counters and media allowlists in place. Existing filters, search, pagination,
+selection, route and scroll are retained; an open image viewer or playing video defers only the
+visual rebuild. New Telegram and completed AI data therefore appear without a page reload, even
+when the TUI is closed. The autonomous `file://` catalog remains independent and makes no local
+HTTP requests.
 
 Interactive mode adds contextual actions to saved publications and profiles. It can analyze one
 profile, selected profiles, or every locally linked profile of a saved publication. Before any

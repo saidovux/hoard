@@ -1,7 +1,7 @@
 (() => {
   "use strict";
 
-  const catalog = window.HOARD_CATALOG || {};
+  let catalog = window.HOARD_CATALOG || {};
   const interactive = window.HOARD_INTERACTIVE || null;
   const interactiveEnabled = Boolean(interactive && interactive.interactive && interactive.csrf);
   const PAGE_SIZE = 48;
@@ -15,19 +15,24 @@
   const direction = byId("direction");
   const toolbar = byId("toolbar");
   const profileFilters = byId("profile-filters");
-  const posts = Array.isArray(catalog.posts) ? catalog.posts : [];
-  const profiles = Array.isArray(catalog.profiles) ? catalog.profiles : [];
-  const videos = Array.isArray(catalog.videos) ? catalog.videos : [];
-  const postMap = new Map(posts.map((item) => [Number(item.source_id), item]));
-  const profileMap = new Map(profiles.map((item) => [Number(item.author_id), item]));
-  const videoMap = new Map(videos.map((item) => [String(item.video_id), item]));
-  const profileSearchIndex = new Map();
-  const postSearchIndex = new Map();
+  let posts = Array.isArray(catalog.posts) ? catalog.posts : [];
+  let profiles = Array.isArray(catalog.profiles) ? catalog.profiles : [];
+  let videos = Array.isArray(catalog.videos) ? catalog.videos : [];
+  let postMap = new Map(posts.map((item) => [Number(item.source_id), item]));
+  let profileMap = new Map(profiles.map((item) => [Number(item.author_id), item]));
+  let videoMap = new Map(videos.map((item) => [String(item.video_id), item]));
+  let profileSearchIndex = new Map();
+  let postSearchIndex = new Map();
   const sectionPages = new Map();
   const selectedProfiles = new Set();
   const validProfileId = (value) => Number.isSafeInteger(Number(value)) && Number(value) > 0;
   let currentRoute = null;
   let inputTimer = null;
+  let catalogToken = String(interactive && interactive.catalog || "");
+  let catalogUpdateTimer = null;
+  let catalogUpdateFailures = 0;
+  let catalogErrorShown = false;
+  let pendingCatalogRender = false;
 
   const emptyFilters = () => ({
     source: "", photos: "any", videos: "any", psl: "any",
@@ -669,6 +674,89 @@
 
   posts.forEach((post) => postSearchIndex.set(Number(post.source_id), postSearch(post)));
 
+  function rebuildSearchIndexes() {
+    profileSearchIndex = new Map();
+    postSearchIndex = new Map();
+    profiles.forEach((profile) => profileSearchIndex.set(Number(profile.author_id), profileSearch(profile)));
+    posts.forEach((post) => postSearchIndex.set(Number(post.source_id), postSearch(post)));
+  }
+
+  function playbackActive() {
+    if (viewer.open) return true;
+    return [...document.querySelectorAll("video")].some((video) => !video.paused && !video.ended);
+  }
+
+  function renderAfterCatalogUpdate() {
+    const scrollY = window.scrollY;
+    saveInteractiveState();
+    renderRoute(currentRoute || parseRoute());
+    window.requestAnimationFrame(() => window.scrollTo(0, scrollY));
+  }
+
+  function flushPendingCatalog() {
+    if (!pendingCatalogRender || playbackActive()) return;
+    pendingCatalogRender = false;
+    renderAfterCatalogUpdate();
+  }
+
+  function applyCatalogSnapshot(snapshot, token) {
+    if (!snapshot || typeof snapshot !== "object") return;
+    catalog = snapshot;
+    posts = Array.isArray(snapshot.posts) ? snapshot.posts : [];
+    profiles = Array.isArray(snapshot.profiles) ? snapshot.profiles : [];
+    videos = Array.isArray(snapshot.videos) ? snapshot.videos : [];
+    postMap = new Map(posts.map((item) => [Number(item.source_id), item]));
+    profileMap = new Map(profiles.map((item) => [Number(item.author_id), item]));
+    videoMap = new Map(videos.map((item) => [String(item.video_id), item]));
+    rebuildSearchIndexes();
+    for (const id of [...selectedProfiles]) {
+      if (!profileMap.has(Number(id))) selectedProfiles.delete(id);
+    }
+    const selectedButton = byId("analyze-selected");
+    if (selectedButton) selectedButton.textContent = `Анализировать выбранные (${selectedProfiles.size})`;
+    setSourceOptions();
+    byId("summary").textContent = `${posts.length} публикаций · ${profiles.length} профилей · ${videos.length} кружков`;
+    byId("generated").textContent = `Снимок: ${dateText(catalog.generated_at)}`;
+    catalogToken = String(token || "");
+    if (playbackActive()) {
+      pendingCatalogRender = true;
+      return;
+    }
+    renderAfterCatalogUpdate();
+  }
+
+  async function checkCatalogUpdate() {
+    if (!interactiveEnabled) return;
+    if (document.visibilityState === "visible") {
+      try {
+        const version = await api("/api/catalog/version");
+        if (version.token && version.token !== catalogToken) {
+          const snapshot = await api("/api/catalog/snapshot");
+          if (snapshot.token && snapshot.catalog) {
+            applyCatalogSnapshot(snapshot.catalog, snapshot.token);
+          }
+        }
+        catalogUpdateFailures = 0;
+        if (catalogErrorShown) {
+          catalogErrorShown = false;
+          showNotice("");
+        }
+      } catch (error) {
+        catalogUpdateFailures += 1;
+        if (!catalogErrorShown) {
+          catalogErrorShown = true;
+          showNotice(`Не удалось получить обновление каталога: ${error.message}`, true);
+        }
+      }
+    }
+    const visible = document.visibilityState === "visible";
+    const delay = visible
+      ? Math.min(30000, 3000 * (2 ** Math.min(catalogUpdateFailures, 4)))
+      : 15000;
+    window.clearTimeout(catalogUpdateTimer);
+    catalogUpdateTimer = window.setTimeout(checkCatalogUpdate, delay);
+  }
+
   function listRoute(view) {
     return {type: "list", view: view === "profiles" ? "profiles" : "posts"};
   }
@@ -754,6 +842,7 @@
     byId("viewer-stage").replaceChildren();
     if (typeof viewer.close === "function" && viewer.open) viewer.close();
     else viewer.removeAttribute("open");
+    window.setTimeout(flushPendingCatalog, 0);
   }
 
   function renderViewer() {
@@ -1357,6 +1446,8 @@
   }
 
   function setSourceOptions() {
+    const select = byId("filter-source");
+    const previous = select.value;
     const first = element("option", "", "Все источники");
     first.value = "";
     const options = [first, ...posts.map((post) => {
@@ -1364,7 +1455,12 @@
       option.value = String(post.source_id);
       return option;
     })];
-    byId("filter-source").replaceChildren(...options);
+    select.replaceChildren(...options);
+    if (previous && options.some((option) => option.value === previous)) select.value = previous;
+    else {
+      select.value = "";
+      if (lists.profiles.filters.source === previous) lists.profiles.filters.source = "";
+    }
   }
 
   queryInput.addEventListener("input", () => {
@@ -1445,6 +1541,14 @@
     if (!currentRoute || routeHash(parsed) !== routeHash(currentRoute)) renderRoute(parsed);
   });
   window.addEventListener("beforeunload", rememberScroll);
+  document.addEventListener("ended", flushPendingCatalog, true);
+  document.addEventListener("pause", flushPendingCatalog, true);
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible") {
+      window.clearTimeout(catalogUpdateTimer);
+      catalogUpdateTimer = window.setTimeout(checkCatalogUpdate, 0);
+    }
+  });
 
   setSourceOptions();
   byId("summary").textContent = `${posts.length} публикаций · ${profiles.length} профилей · ${videos.length} кружков`;
@@ -1455,4 +1559,7 @@
   const initialRoute = parseRoute();
   history.replaceState({hoard: true, route: initialRoute, depth: 0, scrollY: 0}, "", routeHash(initialRoute));
   renderRoute(initialRoute);
+  if (interactiveEnabled) {
+    catalogUpdateTimer = window.setTimeout(checkCatalogUpdate, 2000);
+  }
 })();

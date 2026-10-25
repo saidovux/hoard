@@ -5,6 +5,7 @@ import base64
 import http.client
 import json
 import os
+import secrets
 import shutil
 import subprocess
 import threading
@@ -226,6 +227,33 @@ def test_corrupted_state_does_not_block_launch(monkeypatch, tmp_path):
     assert json.loads(state_path.read_text())["pid"] == process.pid
 
 
+def test_launcher_gives_child_manual_lifetime_and_launch_identity(
+    monkeypatch, tmp_path
+):
+    _prepare_launcher(monkeypatch, tmp_path)
+    process = FakeWebProcess(pid=54321)
+    monkeypatch.setattr("hoard.web._pid_alive", lambda pid: pid == process.pid)
+    captured: dict = {}
+
+    def fake_popen(*args, **kwargs):
+        captured.update(kwargs)
+        launch_id = kwargs["env"]["HOARD_WEB_LAUNCH_ID"]
+        web_module._write_state(
+            "ready",
+            launch_id=launch_id,
+            pid=process.pid,
+            port=45678,
+            url="http://127.0.0.1:45678/start/manual",
+        )
+        return process
+
+    monkeypatch.setattr("hoard.web.subprocess.Popen", fake_popen)
+
+    assert launch_web_process() == "http://127.0.0.1:45678/start/manual"
+    assert captured["env"]["HOARD_WEB_MANUAL"] == "1"
+    assert len(captured["env"]["HOARD_WEB_LAUNCH_ID"]) == 32
+
+
 def test_launch_web_waits_for_real_ready_state(monkeypatch, tmp_path):
     _prepare_launcher(monkeypatch, tmp_path)
     process = FakeWebProcess()
@@ -410,6 +438,203 @@ def test_web_requires_bootstrap_cookie_exact_host_origin_and_csrf(tmp_path):
         thread.join(timeout=5)
 
 
+def _catalog_document(snapshot: dict) -> str:
+    return (
+        '<!doctype html><style data-hoard-bundle="style"></style>'
+        '<script data-hoard-bundle="data">window.HOARD_CATALOG='
+        + json.dumps(snapshot)
+        + ";</script>"
+        '<script data-hoard-bundle="app"></script>'
+    )
+
+
+def _login(server, state):
+    status, headers, _ = request(
+        server,
+        "GET",
+        f"/start/{state.bootstrap_token}",
+        headers={"Host": state.host_header},
+    )
+    assert status == 303
+    return {
+        "Host": state.host_header,
+        "Cookie": headers["Set-Cookie"].split(";", 1)[0],
+    }
+
+
+def test_each_open_gets_a_new_one_time_bootstrap_token(tmp_path):
+    catalog = tmp_path / "telegram_archive.html"
+    catalog.write_text(_catalog_document({"posts": [], "profiles": [], "videos": []}))
+    state = WebState(catalog, requester=FakeDaemon())
+    server = create_web_server(state)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        first_token = state.bootstrap_token
+        common = _login(server, state)
+        assert common
+
+        status, _headers, _payload = request(
+            server,
+            "GET",
+            f"/start/{first_token}",
+            headers={"Host": state.host_header},
+        )
+        assert status == 404
+
+        token_a = state.issue_bootstrap().rsplit("/", 1)[-1]
+        token_b = state.issue_bootstrap().rsplit("/", 1)[-1]
+        assert token_a != token_b
+        assert token_a != first_token
+        for token in (token_a, token_b):
+            status, _headers, _payload = request(
+                server, "GET", f"/start/{token}", headers={"Host": state.host_header}
+            )
+            assert status == 303
+        status, _headers, _payload = request(
+            server,
+            "GET",
+            f"/start/{token_a}",
+            headers={"Host": state.host_header},
+        )
+        assert status == 404
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_catalog_version_and_snapshot_deliver_only_published_data(tmp_path):
+    root = tmp_path / "archive"
+    root.mkdir()
+    media_one = root / "one.jpg"
+    media_two = root / "two.jpg"
+    media_one.write_bytes(b"one")
+    media_two.write_bytes(b"two")
+    catalog = root / "telegram_archive.html"
+    first = {
+        "generated_at": "2026-10-25T00:00:00+00:00",
+        "revision": 1,
+        "posts": [
+            {
+                "source_id": 1,
+                "post_id": 10,
+                "channel_username": "sample",
+                "channel_title": "Sample",
+                "profile_ids": [],
+                "video_ids": [],
+                "media": [],
+            }
+        ],
+        "profiles": [],
+        "videos": [],
+    }
+    catalog.write_text(_catalog_document(first))
+    state = WebState(catalog, requester=FakeDaemon())
+    server = create_web_server(state)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        common = _login(server, state)
+        status, _headers, payload = request(
+            server, "GET", "/api/catalog/version", headers=common
+        )
+        assert status == 200
+        first_token = json.loads(payload)["token"]
+        status, _headers, payload = request(
+            server, "GET", "/api/catalog/snapshot", headers=common
+        )
+        assert status == 200
+        assert json.loads(payload)["catalog"]["revision"] == 1
+
+        second = {
+            **first,
+            "generated_at": "2026-10-25T00:01:00+00:00",
+            "revision": 2,
+            "profiles": [
+                {
+                    "author_id": 7,
+                    "display_name": "New",
+                    "photos": [
+                        {
+                            "photo_id": "7",
+                            "url": "two.jpg",
+                            "available": True,
+                            "size": media_two.stat().st_size,
+                        }
+                    ],
+                }
+            ],
+        }
+        temporary = root / ".next.html"
+        temporary.write_text(_catalog_document(second))
+        os.replace(temporary, catalog)
+
+        status, _headers, payload = request(
+            server, "GET", "/api/catalog/version", headers=common
+        )
+        assert status == 200
+        second_token = json.loads(payload)["token"]
+        assert second_token != first_token
+        assert len(payload) < 1000
+
+        status, _headers, payload = request(
+            server, "GET", "/api/catalog/snapshot", headers=common
+        )
+        assert status == 200
+        result = json.loads(payload)
+        assert result["token"] == second_token
+        assert result["catalog"]["revision"] == 2
+        assert result["catalog"]["profiles"][0]["author_id"] == 7
+        media_url = result["catalog"]["profiles"][0]["photos"][0]["url"]
+        assert media_url.startswith("/media/r0/")
+        status, _headers, payload = request(server, "GET", media_url, headers=common)
+        assert status == 200
+        assert payload == b"two"
+
+        # A broken in-progress publication must not replace the last good view.
+        catalog.write_text("<!doctype html><p>broken</p>")
+        status, _headers, payload = request(
+            server, "GET", "/api/catalog/snapshot", headers=common
+        )
+        assert status == 503
+        assert state.catalog_payload["revision"] == 2
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def test_loopback_control_issues_urls_and_stops_without_browser_route(tmp_path):
+    catalog = tmp_path / "telegram_archive.html"
+    catalog.write_text(_catalog_document({"posts": [], "profiles": [], "videos": []}))
+    state = WebState(catalog, requester=FakeDaemon())
+    state.control_token = secrets.token_urlsafe(32)
+    control = web_module.HoardControlServer(("127.0.0.1", 0), state)
+    thread = threading.Thread(target=control.serve_forever, daemon=True)
+    thread.start()
+    try:
+        value = {
+            "control_port": state.control_port,
+            "control_token": state.control_token,
+        }
+        result = web_module._control_request(value, "open")
+        assert result["url"].startswith(state.origin + "/start/")
+        status, _headers, _payload = request(
+            control,
+            "POST",
+            "/open",
+            headers={"X-Hoard-Control": "wrong"},
+        )
+        assert status == 403
+        web_module._control_request(value, "stop")
+        assert state.stop_event.is_set()
+    finally:
+        control.shutdown()
+        control.server_close()
+        thread.join(timeout=5)
+
+
 def test_web_serves_catalog_media_from_each_explicit_allowed_root(tmp_path):
     catalog_root = tmp_path / "catalog"
     media_root = tmp_path / "source-media"
@@ -474,6 +699,97 @@ def test_web_serves_catalog_media_from_each_explicit_allowed_root(tmp_path):
         server.shutdown()
         server.server_close()
         thread.join(timeout=5)
+
+
+@pytest.mark.skipif(shutil.which("chromium") is None, reason="Chromium is not installed")
+def test_catalog_poll_updates_open_browser_without_reload(tmp_path, monkeypatch):
+    root = tmp_path / "archive"
+    root.mkdir()
+    one = root / "one.jpg"
+    two = root / "two.jpg"
+    one.write_bytes(b"synthetic-one")
+    two.write_bytes(b"synthetic-two")
+    store = Store(tmp_path / "db.sqlite")
+    store.add_source(Post("synthetic_channel", 1), str(root))
+    store.telegram.observe_profile(
+        author_id=1, username="user1", display_name="Old Name", source_id=1
+    )
+    store.telegram.record_profile_photo(
+        1, "1", file_path=str(one), size=one.stat().st_size, photo_date="2026-10-25"
+    )
+    catalog = build_catalog(store)
+    store.close()
+    state = WebState(catalog, requester=FakeDaemon())
+    server = create_web_server(state)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    original_version = state.published_version
+    swapped = False
+    update_trigger = threading.Event()
+    update_done = threading.Event()
+
+    def publish_new_catalog():
+        try:
+            update_trigger.wait(10)
+            concurrent = Store(tmp_path / "db.sqlite")
+            try:
+                concurrent.telegram.observe_profile(
+                    author_id=1, username="user1", display_name="New Name", source_id=1
+                )
+                concurrent.telegram.observe_profile(
+                    author_id=2, username="user2", display_name="Second", source_id=1
+                )
+                concurrent.telegram.record_profile_photo(
+                    2, "2", file_path=str(two), size=two.stat().st_size, photo_date="2026-10-25"
+                )
+                build_catalog(concurrent)
+            finally:
+                concurrent.close()
+        finally:
+            update_done.set()
+
+    updater = threading.Thread(target=publish_new_catalog, daemon=True)
+    updater.start()
+
+    def updating_version():
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+            update_trigger.set()
+            assert update_done.wait(10)
+        return original_version()
+
+    monkeypatch.setattr(state, "published_version", updating_version)
+    profile = tmp_path / "chromium-refresh"
+    command = [
+        str(shutil.which("chromium")),
+        "--headless=new",
+        "--no-sandbox",
+        "--disable-gpu",
+        "--disable-background-networking",
+        f"--user-data-dir={profile}",
+        "--virtual-time-budget=12000",
+        "--dump-dom",
+    ]
+    try:
+        result = subprocess.run(
+            [*command, state.start_url],
+            capture_output=True,
+            text=True,
+            timeout=40,
+            check=False,
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+        update_trigger.set()
+        updater.join(timeout=5)
+
+    assert result.returncode == 0, result.stderr
+    assert "New Name" in result.stdout
+    assert "Second" in result.stdout
+    assert "2 профилей" in result.stdout
 
 
 @pytest.mark.skipif(shutil.which("chromium") is None, reason="Chromium is not installed")
