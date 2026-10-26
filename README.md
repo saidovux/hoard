@@ -1,4 +1,4 @@
-# Hoard 0.7.2.2
+# Hoard 0.7.2.3
 
 Hoard is a local-first Linux and Windows archive for Telegram posts, profiles and video notes
 found in a channel post's comments. It uses Telethon, SQLite, an autonomous offline HTML catalog
@@ -93,6 +93,16 @@ and fetches a new normalized snapshot only after a complete HTML publication; da
 counters and media allowlists are replaced without a full page reload, while search, filters,
 pagination, selection, scroll and active media playback are preserved.
 
+The 0.7.2.3 patch fixes the interaction and layout regressions found in the Noir v2 port. Home
+polling no longer resets a sidebar selection every 1.5 seconds; Archive reloads, terminal resizes
+and profile multi-selection keep the table cursor and scroll position. Action rows are allocated
+by the available terminal width, and table columns are fitted or reduced instead of producing
+horizontal scrolling. Archive’s advanced frame/profile commands are grouped behind a visible
+**Ещё…** control, while the primary actions stay on one compact row. On short terminals pages
+open at the top instead of auto-scrolling a barely visible table, `Ctrl+PageUp` / `Ctrl+PageDown`
+scroll the page, hidden sidebars cannot keep keyboard focus, and the AI chat pane replaces the
+list view and focuses its message field immediately.
+
 The 0.7.2.2 release ports the Hoard TUI to the Noir v2 terminal-native design while preserving
 all current 0.7.2.1 functionality. The six former pages become four: **Главная** merges Overview
 and Activity, and **Telegram** now owns both the account/collector and Sources. The old
@@ -160,9 +170,11 @@ hairlines `#262626` and the accent `#F79646`. Pages are framed panels with title
 the focused panel lights up, the footer shows key chips, tables and buttons use an orange selection
 block. Use `j`/`k` or arrows to move, `l`, Right or Enter to open, `h`, Left or Esc to return,
 `1`–`9` to jump to a page, `:` or Ctrl+K for the command palette, `?` for help, `b` to toggle the
-sidebar and `q` to close only the UI. `[` and `]` switch pages even when the sidebar is hidden.
-On terminals narrower than 60 columns the sidebar hides automatically; dense tables drop less
-important columns instead of scrolling sideways.
+sidebar and `q` to close only the UI. `[` and `]` switch pages even when the sidebar is hidden;
+`Ctrl+PageUp` / `Ctrl+PageDown` scroll the current page. On terminals narrower than 60 columns the
+sidebar hides automatically. Action grids and table columns adapt to the available width, dropping
+or shortening secondary columns instead of scrolling sideways. Archive’s less frequent frame and
+profile AI commands live behind **Ещё…**, so the primary action row stays compact.
 
 `hoard ui` and `hoard tui` are compatibility aliases for the same Textual application.
 Scripts and all existing non-interactive commands are unchanged, do not require a TTY and do not
@@ -188,7 +200,7 @@ For development, install the test tools with `python -m pip install -e '.[dev]'`
 
 An upgrade keeps the existing XDG configuration, database, Telegram session and archive.
 If an older daemon is still running, execute `hoard shutdown` before starting the upgraded
-installation. The 0.7.2.2 client accepts only a daemon reporting the same application version and
+installation. The 0.7.2.3 client accepts only a daemon reporting the same application version and
 IPC protocol `1`; it reports the mismatch instead of starting a competing service. If a matching
 daemon already owns the service lock but is still initializing, clients wait for it and show a
 specific startup diagnostic.

@@ -2030,3 +2030,200 @@ async def test_profile_frame_ai_preview_shows_video_and_frame_choice():
         assert chooser.highlighted == 0
         assert chooser.get_option_at_index(0).id == "1:10"
         assert any(name == "ai_telegram_batch_preview" for name, _ in api.calls)
+
+
+@pytest.mark.asyncio
+async def test_home_polling_keeps_sidebar_selection(monkeypatch):
+    from hoard.tui.screens.home import HomeScreen
+
+    monkeypatch.setattr(HomeScreen, "POLL_INTERVAL", 0.05)
+    api = FakeAPI()
+    app = HoardApp(api)
+    async with app.run_test(size=(80, 24)) as pilot:
+        await wait_for_startup(app, pilot)
+        navigation = app.screen.query_one(OptionList)
+        navigation.focus()
+        await pilot.press("j")
+        assert navigation.get_option_at_index(navigation.highlighted).id == "archive"
+        await wait_for_condition(pilot, lambda: api.status_calls >= 2)
+        assert navigation.get_option_at_index(navigation.highlighted).id == "archive"
+
+
+@pytest.mark.asyncio
+async def test_archive_preserves_cursor_across_refresh_resize_and_profile_toggle():
+    status = status_fixture()
+    status["downloads"] = [
+        {
+            "source_id": 1,
+            "message_id": 100 + index,
+            "date": f"2026-10-21T10:{index:02d}:00+00:00",
+            "author_name": f"Author {index}",
+            "source_name": "sample_channel",
+            "post_id": 42,
+            "size": 1024,
+            "frame_status": "saved",
+            "frame_count": 3,
+            "state": "saved",
+        }
+        for index in range(6)
+    ]
+    status["profiles"] = [
+        {
+            "display_name": f"Profile {index}",
+            "current_username": f"profile_{index}",
+            "author_id": 1000 + index,
+            "source_count": 1,
+            "photo_count": 0,
+            "video_count": 1,
+            "frame_set_count": 1,
+            "last_seen": "2026-10-21",
+            "photo_error": "",
+        }
+        for index in range(6)
+    ]
+    app = HoardApp(FakeAPI(status))
+    async with app.run_test(size=(120, 35)) as pilot:
+        await wait_for_startup(app, pilot)
+        app.open_section("archive")
+        await pilot.pause()
+        table = app.screen.query_one("#archive-table", DataTable)
+        table.move_cursor(row=4, scroll=False)
+        app.set_notice("refresh")
+        await pilot.pause()
+        assert table.cursor_row == 4
+
+        await pilot.resize_terminal(100, 30)
+        await pilot.pause()
+        table = app.screen.query_one("#archive-table", DataTable)
+        assert table.cursor_row == 4
+
+        await pilot.click("#mode-profiles")
+        await wait_for_condition(pilot, lambda: len(app.screen._profile_ids) == 6)
+        table = app.screen.query_one("#archive-table", DataTable)
+        table.move_cursor(row=3, scroll=False)
+        app.screen._toggle_profile_selection()
+        await pilot.pause()
+        assert table.cursor_row == 3
+        assert 1003 in app.screen._selected_profiles
+
+
+@pytest.mark.asyncio
+async def test_source_table_fits_long_real_values_at_supported_widths():
+    status = status_fixture()
+    status["sources"][0].update(
+        {
+            "title": "",
+            "username": "very_long_source_username",
+            "last_error": "Нет связи с Telegram: очень длинное описание сетевой ошибки",
+        }
+    )
+    app = HoardApp(FakeAPI(status))
+    async with app.run_test(size=(120, 35)) as pilot:
+        await wait_for_startup(app, pilot)
+        app.open_section("telegram")
+        await pilot.pause()
+        for width, height in ((120, 35), (100, 30), (80, 24)):
+            if (app.size.width, app.size.height) != (width, height):
+                await pilot.resize_terminal(width, height)
+                await pilot.pause()
+            table = app.screen.query_one("#sources-table", DataTable)
+            assert table.virtual_size.width <= table.size.width
+        await pilot.resize_terminal(60, 20)
+        await pilot.pause()
+        table = app.screen.query_one("#sources-table", DataTable)
+        assert table.virtual_size.width <= table.size.width
+
+
+@pytest.mark.asyncio
+async def test_workspace_is_not_a_dead_tab_stop_and_hidden_sidebar_drops_focus():
+    app = HoardApp(FakeAPI())
+    async with app.run_test(size=(80, 24)) as pilot:
+        await wait_for_startup(app, pilot)
+        workspace = app.screen.query_one("#workspace")
+        assert workspace.can_focus is False
+        await pilot.press("ctrl+pagedown")
+        await pilot.pause()
+        assert workspace.scroll_offset.y > 0
+        await pilot.resize_terminal(40, 16)
+        await pilot.pause()
+        assert app.focused is None
+        await pilot.resize_terminal(80, 24)
+        await pilot.pause()
+        assert getattr(app.focused, "id", None) == "navigation"
+
+
+@pytest.mark.asyncio
+async def test_ai_opens_chat_with_visible_focus_and_returns_to_table():
+    from textual.widgets import TextArea
+
+    api = FakeAPI()
+    api.queue(
+        "ai_config_get",
+        {"configured": True, "key_status": "verified", "key_source": "file"},
+    )
+    api.queue(
+        "ai_chat_list",
+        {
+            "items": [
+                {
+                    "id": 1,
+                    "title": "Test chat",
+                    "provider": "deepseek",
+                    "model": "deepseek-chat",
+                    "prompt_id": "prompt-1",
+                    "message_count": 2,
+                }
+            ],
+            "has_more": False,
+        },
+    )
+    api.queue(
+        "ai_chat_history",
+        {
+            "items": [
+                {"role": "user", "state": "completed", "content": "hello"},
+                {"role": "assistant", "state": "completed", "content": "hi"},
+            ],
+            "has_more": False,
+        },
+    )
+    app = HoardApp(api)
+    async with app.run_test(size=(80, 24)) as pilot:
+        await wait_for_startup(app, pilot)
+        app.open_section("ai")
+        await wait_for_condition(pilot, lambda: isinstance(app.focused, DataTable))
+        await pilot.press("enter")
+        await wait_for_condition(pilot, lambda: isinstance(app.focused, TextArea))
+        assert app.screen.query_one("#ai-main").display is False
+        assert app.screen.query_one("#ai-chat-pane").display is True
+        assert app.screen.query_one("#ai-message").is_on_screen
+
+        app.screen.query_one("#ai-chat-back").press()
+        await pilot.pause()
+        assert app.screen.query_one("#ai-main").display is True
+        assert app.screen.query_one("#ai-chat-pane").display is False
+        assert isinstance(app.focused, DataTable)
+
+
+@pytest.mark.asyncio
+async def test_archive_actions_fit_and_advanced_actions_are_opt_in():
+    app = HoardApp(FakeAPI())
+    async with app.run_test(size=(100, 30)) as pilot:
+        await wait_for_startup(app, pilot)
+        app.open_section("archive")
+        await pilot.pause()
+        screen = app.screen
+        assert screen.query_one("#archive-advanced").display is False
+        for mode in ("downloads", "profiles", "jobs"):
+            await pilot.click(f"#mode-{mode}")
+            await pilot.pause()
+            for button in screen.query(Button):
+                if button.display and button.region.width:
+                    assert button.region.right <= app.size.width, (mode, button.id)
+        await pilot.click("#mode-profiles")
+        await pilot.click("#archive-more")
+        await pilot.pause()
+        assert screen.query_one("#archive-advanced").display is True
+        for button in screen.query(Button):
+            if button.display and button.region.width:
+                assert button.region.right <= app.size.width, button.id

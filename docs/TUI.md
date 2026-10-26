@@ -40,7 +40,7 @@ now **Главная**, and *Источники* lives on the **Telegram** page.
 | Page | Contents |
 | --- | --- |
 | **Главная** | the HOARD wordmark with the daemon state; panels *Сейчас* (current task + progress), *Очередь*, *Архив*, *Инструменты* (one line per tool) and *События* |
-| **Архив** | Кружки / Профили / Задания, catalogue actions, frame inspection and the bounded old-archive frame backfill |
+| **Архив** | Кружки / Профили / Задания, catalogue actions, frame inspection and the bounded old-archive frame backfill; less frequent frame/profile AI commands sit behind **Ещё…** |
 | **Telegram** | panels *Сборщик* (account and collector control), *Web* (separate loopback process) and *Источники* (table + add / edit / toggle / scan / frame AI) |
 | **AI** | provider settings, record list and chat |
 
@@ -61,6 +61,24 @@ The reference layout was designed before the Web process and video-frame workflo
 current features are integrated as additional panels/toolbars with the same framing, typography and
 key-chip language: **Web** sits on Telegram, and frame inspection/backfill/AI actions sit inside the
 Archive page. No old functional control was removed.
+
+## Responsive and interactive rules
+
+* Table columns are fitted to the actual page width. Secondary columns are shortened or dropped
+  rather than creating a horizontal scrollbar; the same rule applies to Archive and AI lists.
+* Archive has a compact primary action row. Frame backfill, pause/retry and the less common AI
+  modes live behind the **Ещё…** tab, so opening the page does not turn the action block into a
+  wall of controls. The advanced block is mode-specific and closes when the mode changes.
+* A table is auto-focused only when it is fully visible. On short terminals the page opens at the
+  top (summary and actions first); `Ctrl+PageUp` and `Ctrl+PageDown` scroll the page even while a
+  table or the sidebar owns the keyboard.
+* When the sidebar is hidden by the responsive breakpoint, focus is moved out of it. It must not
+  keep receiving `j`/`k` while invisible.
+* Status polling updates data but must not rebuild the sidebar or move the navigation highlight.
+* Opening an AI conversation hides the list workspace, gives the message field focus and scrolls
+  the conversation to its top. Returning restores the list and focus.
+* Archive and Telegram tables preserve the selected record across status refreshes, terminal
+  resizes and profile multi-selection.
 
 The Home wordmark comes in two sizes (`widgets/hero.py`): six rows when the terminal is at least
 30 rows tall and 76 columns wide, three rows below that, and none under 22 rows — the header

@@ -21,6 +21,8 @@ from .base import WorkspaceScreen
 SOURCE_COLUMNS = ("Источник", "Состояние", "Кружки", "Каждые", "Проверка", "Результат")
 #: Indices into SOURCE_COLUMNS that stay on terminals narrower than 110 columns.
 DENSE_SOURCE_COLUMNS = (0, 1, 2, 5)
+#: Below 76 columns only the identity and live state are useful.
+COMPACT_SOURCE_COLUMNS = (0, 1, 2)
 SOURCE_HINTS: tuple[Hint, ...] = (("a", "добавить"), ("e", "изменить"), ("s", "проверить"))
 
 
@@ -28,6 +30,25 @@ def _short_time(value: object) -> str:
     """``2026-10-21 10:12:13`` -> ``2026-10-21 10:12``; the seconds never help in a table."""
     text = str(value or "")
     return text[:16] if text else "ещё не проверялся"
+
+
+def _source_widths(columns: tuple[int, ...], table_width: int) -> tuple[int, ...]:
+    """Fixed widths keep long usernames/errors from creating a horizontal scrollbar."""
+    count = len(columns)
+    available = max(count * 4, table_width - count * 2 - 1)
+    if count == 6:
+        state, downloads, interval, checked = 9, 6, 7, 16
+        source = max(8, int(available * 0.32))
+        result = max(8, available - source - state - downloads - interval - checked)
+        return source, state, downloads, interval, checked, result
+    if count == 4:
+        state, downloads = 9, 6
+        source = max(8, int(available * 0.36))
+        result = max(7, available - source - state - downloads)
+        return source, state, downloads, result
+    state, downloads = 8, 6
+    source = max(7, available - state - downloads)
+    return source, state, downloads
 
 
 class TelegramScreen(WorkspaceScreen):
@@ -42,7 +63,7 @@ class TelegramScreen(WorkspaceScreen):
     def __init__(self) -> None:
         super().__init__()
         self._source_ids: list[int] = []
-        self._dense_table: bool | None = None
+        self._source_layout: tuple[tuple[int, ...], tuple[int, ...]] | None = None
         self._web_state: dict[str, Any] = {"state": "stopped"}
         self._web_loading = False
 
@@ -76,8 +97,13 @@ class TelegramScreen(WorkspaceScreen):
     def on_mount(self) -> None:
         super().on_mount()
         self._refresh_web()
-        # The sources are the page's working surface: j / k and a / e / s act on them at once.
-        self.query_one("#sources-table", DataTable).focus()
+        self.call_after_refresh(self._focus_initial)
+
+    def _focus_initial(self) -> None:
+        # The sources are the page's working surface: j / k and a / e / s act on them at
+        # once.  On a short terminal, however, auto-scrolling them into view would hide the
+        # account and collector; keep focus on the visible top of the page instead.
+        self.focus_working_surface(self.query_one("#sources-table", DataTable))
 
     def on_screen_resume(self) -> None:
         super().on_screen_resume()
@@ -273,27 +299,50 @@ class TelegramScreen(WorkspaceScreen):
     def _render_sources(self, status: dict) -> None:
         table = self.query_one("#sources-table", DataTable)
         selected = self.selected_source_id
-        # Below 110 columns the schedule columns would not fit and the table would scroll
-        # sideways, so only the ones that say what happened are kept.
+        compact = self.hoard_app.has_class("compact")
         dense = self.hoard_app.has_class("medium")
-        short_labels = self.hoard_app.has_class("narrow")
-        keep = DENSE_SOURCE_COLUMNS if dense else range(len(SOURCE_COLUMNS))
-        if dense != self._dense_table:
+        if compact:
+            keep = COMPACT_SOURCE_COLUMNS
+        elif dense:
+            # Below 110 columns the schedule columns would not fit and the table would
+            # scroll sideways, so only the columns that say what happened are kept.
+            keep = DENSE_SOURCE_COLUMNS
+        else:
+            keep = tuple(range(len(SOURCE_COLUMNS)))
+        # The table can be repainted before its own layout has caught up with a terminal
+        # resize.  Derive the width from the app/sidebar geometry instead of the old table
+        # size so the columns do not keep the previous layout's oversized widths.
+        table_width = max(
+            20,
+            self.hoard_app.size.width
+            - (6 if self.hoard_app.has_class("sidebar-hidden") else 28),
+        )
+        widths = _source_widths(keep, table_width)
+        layout = (keep, widths)
+        if layout != self._source_layout:
             table.clear(columns=True)
-            table.add_columns(*(SOURCE_COLUMNS[index] for index in keep))
-            self._dense_table = dense
+            for index, width in zip(keep, widths, strict=True):
+                table.add_column(SOURCE_COLUMNS[index], width=width)
+            self._source_layout = layout
         table.clear()
         sources = list(status.get("sources") or [])
         self._source_ids = []
+        short_labels = self.hoard_app.has_class("narrow") or compact
         for source in sources:
             source_id = int(source.get("id") or 0)
             self._source_ids.append(source_id)
-            name = str(source.get("title") or source.get("username") or "—")
+            title = str(source.get("title") or "")
             username = str(source.get("username") or "")
             post_id = source.get("post_id", "—")
-            label = f"{name}  @{username}/{post_id}" if username else f"{name}/{post_id}"
-            if short_labels and source.get("title"):
-                label = name  # the post address is in the edit dialog; here the room is for state
+            name = title or username or "—"
+            if short_labels:
+                label = name  # the post address is in the edit dialog; keep the state readable
+            elif title and username and title != username:
+                label = f"{title} @{username}/{post_id}"
+            elif username:
+                label = f"@{username}/{post_id}"
+            else:
+                label = f"{name}/{post_id}"
             cells = (
                 label,
                 "включён" if source.get("enabled") else "отключён",

@@ -9,13 +9,65 @@ from typing import Any
 
 from rich.text import Text
 from textual.app import ComposeResult
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import Button, DataTable, Input, Select, Static, TextArea
 
 from ..ai_dialogs import AIRecordDialog
 from ..dialogs import ConfirmDialog
 from ..widgets import Panel
 from .base import WorkspaceScreen
+
+AI_COLUMNS = {
+    "chats": ("Название", "Провайдер", "Модель", "Промпт", "Сообщения"),
+    "prompts": (
+        "Название", "Область", "Версия", "ID версии", "Модель", "Формат", "Активен",
+    ),
+    "memory": ("Название", "Область", "Версия", "Состояние", "Содержимое"),
+    "prices": ("Провайдер", "Модель", "Валюта", "Cache hit", "Cache miss", "Output"),
+    "tasks": ("Состояние", "Область", "Модель", "Стоимость", "Ошибка", "Создана"),
+}
+
+AI_TABLE_LAYOUTS = {
+    "chats": {
+        "full": (tuple(range(5)), (30, 12, 18, 10, 10)),
+        "medium": ((0, 2, 3, 4), (30, 18, 10, 10)),
+        "narrow": ((0, 2, 3, 4), (28, 18, 10, 10)),
+        "compact": ((0, 2, 4), (18, 12, 8)),
+    },
+    "prompts": {
+        "full": (tuple(range(7)), (22, 9, 8, 15, 16, 10, 8)),
+        "medium": ((0, 1, 2, 4, 6), (18, 8, 8, 14, 7)),
+        "narrow": ((0, 1, 2, 4, 6), (20, 9, 9, 16, 8)),
+        "compact": ((0, 1, 6), (18, 8, 7)),
+    },
+    "memory": {
+        "full": (tuple(range(5)), (22, 9, 8, 12, 49)),
+        "medium": ((0, 1, 3, 4), (18, 8, 10, 24)),
+        "narrow": ((0, 1, 3), (24, 9, 14)),
+        "compact": ((0, 1, 3), (18, 8, 9)),
+    },
+    "prices": {
+        "full": (tuple(range(6)), (10, 14, 8, 10, 11, 8)),
+        "medium": ((0, 1, 3, 4, 5), (10, 14, 10, 11, 8)),
+        "narrow": ((0, 1, 3, 4, 5), (9, 14, 10, 11, 8)),
+        "compact": ((0, 1, 5), (10, 14, 8)),
+    },
+    "tasks": {
+        "full": (tuple(range(6)), (14, 9, 18, 11, 20, 12)),
+        "medium": ((0, 1, 2, 3, 4), (14, 9, 16, 11, 18)),
+        "narrow": ((0, 1, 2, 3, 4), (14, 9, 16, 11, 18)),
+        "compact": ((0, 2, 3), (14, 16, 12)),
+    },
+}
+
+
+def _fit_widths(weights: tuple[int, ...], table_width: int) -> tuple[int, ...]:
+    available = max(len(weights), table_width - len(weights) * 2 - 1)
+    total = sum(weights)
+    widths = [max(1, available * weight // total) for weight in weights]
+    widest = max(range(len(widths)), key=widths.__getitem__)
+    widths[widest] += available - sum(widths)
+    return tuple(widths)
 
 
 class AIWorkspaceScreen(WorkspaceScreen):
@@ -33,6 +85,8 @@ class AIWorkspaceScreen(WorkspaceScreen):
         self.selected_chat: dict[str, Any] | None = None
         self.history_offset = 0
         self._loading = False
+        self._table_mode: str | None = None
+        self._table_layout: tuple[str, tuple[int, ...], tuple[int, ...]] | None = None
 
     def compose_workspace(self) -> ComposeResult:
         with Panel(title="AI", id="ai-main"):
@@ -156,6 +210,7 @@ class AIWorkspaceScreen(WorkspaceScreen):
             if self.is_mounted:
                 self._render_statistics()
                 self._render_table()
+                self._focus_default_control()
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -193,54 +248,57 @@ class AIWorkspaceScreen(WorkspaceScreen):
 
     def _render_table(self) -> None:
         table = self.query_one("#ai-table", DataTable)
-        table.clear(columns=True)
+        old_row = table.cursor_row if self._table_mode == self.mode else 0
+        columns = AI_COLUMNS[self.mode]
+        cells_rows: list[tuple[str, ...]] = []
         if self.mode == "chats":
-            table.add_columns("Название", "Провайдер", "Модель", "Промпт", "Сообщения")
             for item in self.items:
-                table.add_row(
-                    str(item.get("title") or "—"),
-                    str(item.get("provider") or "—"),
-                    str(item.get("model") or "—"),
-                    str(item.get("prompt_id") or "—")[:10],
-                    str(item.get("message_count") or 0),
+                cells_rows.append(
+                    (
+                        str(item.get("title") or "—"),
+                        str(item.get("provider") or "—"),
+                        str(item.get("model") or "—"),
+                        str(item.get("prompt_id") or "—")[:10],
+                        str(item.get("message_count") or 0),
+                    )
                 )
         elif self.mode == "prompts":
-            table.add_columns(
-                "Название", "Область", "Версия", "ID версии", "Модель", "Формат", "Активен"
-            )
             for item in self.items:
-                table.add_row(
-                    str(item.get("name") or "—"),
-                    str(item.get("scope") or "—"),
-                    str(item.get("version") or "—"),
-                    str(item.get("version_id") or "—"),
-                    str(item.get("model") or "—"),
-                    str(item.get("response_format") or "—"),
-                    "да" if item.get("active") else "нет",
+                cells_rows.append(
+                    (
+                        str(item.get("name") or "—"),
+                        str(item.get("scope") or "—"),
+                        str(item.get("version") or "—"),
+                        str(item.get("version_id") or "—"),
+                        str(item.get("model") or "—"),
+                        str(item.get("response_format") or "—"),
+                        "да" if item.get("active") else "нет",
+                    )
                 )
         elif self.mode == "memory":
-            table.add_columns("Название", "Область", "Версия", "Состояние", "Содержимое")
             for item in self.items:
-                table.add_row(
-                    str(item.get("title") or "—"),
-                    str(item.get("scope") or "—"),
-                    str(item.get("version") or "—"),
-                    "включена" if item.get("enabled") else "выключена",
-                    str(item.get("content") or "")[:80],
+                cells_rows.append(
+                    (
+                        str(item.get("title") or "—"),
+                        str(item.get("scope") or "—"),
+                        str(item.get("version") or "—"),
+                        "включена" if item.get("enabled") else "выключена",
+                        str(item.get("content") or "")[:80],
+                    )
                 )
         elif self.mode == "prices":
-            table.add_columns("Провайдер", "Модель", "Валюта", "Cache hit", "Cache miss", "Output")
             for item in self.items:
-                table.add_row(
-                    str(item.get("provider") or "—"),
-                    str(item.get("model") or "—"),
-                    str(item.get("currency") or "—"),
-                    str(item.get("input_cache_hit_per_million") or "неизвестно"),
-                    str(item.get("input_cache_miss_per_million") or "неизвестно"),
-                    str(item.get("output_per_million") or "неизвестно"),
+                cells_rows.append(
+                    (
+                        str(item.get("provider") or "—"),
+                        str(item.get("model") or "—"),
+                        str(item.get("currency") or "—"),
+                        str(item.get("input_cache_hit_per_million") or "неизвестно"),
+                        str(item.get("input_cache_miss_per_million") or "неизвестно"),
+                        str(item.get("output_per_million") or "неизвестно"),
+                    )
                 )
         else:
-            table.add_columns("Состояние", "Область", "Модель", "Стоимость", "Ошибка", "Создана")
             for item in self.items:
                 state = str(item.get("state") or "—")
                 if state == "outcome_unknown":
@@ -251,17 +309,59 @@ class AIWorkspaceScreen(WorkspaceScreen):
                     if cost is not None
                     else "неизвестно"
                 )
-                table.add_row(
-                    state,
-                    str(item.get("scope") or "—"),
-                    str(item.get("actual_model") or item.get("requested_model") or "—"),
-                    cost_text,
-                    str(item.get("error_code") or "—"),
-                    str(item.get("created_at") or "—"),
+                cells_rows.append(
+                    (
+                        state,
+                        str(item.get("scope") or "—"),
+                        str(item.get("actual_model") or item.get("requested_model") or "—"),
+                        cost_text,
+                        str(item.get("error_code") or "—"),
+                        str(item.get("created_at") or "—"),
+                    )
                 )
-        if not self.items:
-            table.add_row(*(["Пока пусто"] + ["—"] * (len(table.columns) - 1)))
+        if not cells_rows:
+            cells_rows.append(("Пока пусто", *(["—"] * (len(columns) - 1))))
+        compact = self.hoard_app.has_class("compact")
+        narrow = self.hoard_app.has_class("narrow")
+        medium = self.hoard_app.has_class("medium")
+        size_key = (
+            "compact" if compact
+            else "narrow" if narrow
+            else "medium" if medium
+            else "full"
+        )
+        keep, weights = AI_TABLE_LAYOUTS[self.mode][size_key]
+        table_width = max(
+            20,
+            self.hoard_app.size.width
+            - (6 if self.hoard_app.has_class("sidebar-hidden") else 28),
+        )
+        widths = _fit_widths(tuple(weights), table_width)
+        layout = (self.mode, keep, widths)
+        if layout != self._table_layout:
+            table.clear(columns=True)
+            for index, width in zip(keep, widths, strict=True):
+                table.add_column(columns[index], width=width)
+            self._table_layout = layout
+        table.clear()
+        for cells in cells_rows:
+            table.add_row(*(cells[index] for index in keep))
+        if table.row_count:
+            table.move_cursor(row=min(max(0, old_row), table.row_count - 1), scroll=False)
+        self._table_mode = self.mode
         self._show_actions()
+
+    def _focus_default_control(self) -> None:
+        """Put the keyboard on the page's working surface, not an invisible container."""
+        if self.hoard_app.screen is not self:
+            return
+        focused = self.hoard_app.focused
+        if focused is not None and getattr(focused, "id", None) != "navigation":
+            return
+        if self.query_one("#ai-list-pane").display:
+            self.focus_working_surface(self.query_one("#ai-table", DataTable))
+        elif self.query_one("#ai-onboarding").display:
+            self.query_one("#ai-add-key", Button).focus()
 
     def _show_actions(self) -> None:
         create = self.query_one("#ai-create", Button)
@@ -322,8 +422,11 @@ class AIWorkspaceScreen(WorkspaceScreen):
         elif identifier == "ai-chat-back":
             self.selected_chat = None
             self.query_one("#ai-chat-pane").display = False
+            self.query_one("#ai-main").display = True
             self.query_one("#ai-list-pane").display = True
+            self.query_one("#workspace", VerticalScroll).scroll_home(animate=False)
             self._load()
+            self.query_one("#ai-table", DataTable).focus()
         elif identifier == "ai-history-older":
             if self.selected_chat:
                 self.history_offset += 30
@@ -401,9 +504,13 @@ class AIWorkspaceScreen(WorkspaceScreen):
     def _open_chat(self, selected: dict[str, Any]) -> None:
         self.selected_chat = selected
         self.history_offset = 0
-        self.query_one("#ai-list-pane").display = False
+        self.query_one("#ai-main").display = False
         self.query_one("#ai-chat-pane").display = True
         self.query_one("#ai-chat-title", Static).update(str(selected.get("title") or "Диалог"))
+        # The list table is now hidden.  Without an explicit transfer, keyboard focus would
+        # disappear and the newly opened conversation would be unreachable without Tab.
+        self.query_one("#ai-message", TextArea).focus()
+        self.query_one("#workspace", VerticalScroll).scroll_home(animate=False)
         self.run_worker(self._load_history(), exit_on_error=False)
 
     async def _load_history(self) -> None:

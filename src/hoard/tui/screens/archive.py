@@ -19,6 +19,57 @@ from ..widgets import Panel
 from ..widgets.chrome import Hint
 from .base import WorkspaceScreen
 
+DOWNLOAD_COLUMNS = ("Дата", "Автор", "Источник", "Размер", "Кадры", "Статус")
+PROFILE_COLUMNS = (
+    "✓", "Имя", "Username", "TG ID", "Ист.", "Фото",
+    "Кружки", "Кадры", "Последнее",
+)
+JOB_COLUMNS = ("ID", "Тип", "Состояние", "Попытки", "Результат", "Обновлено")
+
+
+def _short_date(value: object) -> str:
+    text = str(value or "")
+    return text.replace("T", " ")[:16] if text else "—"
+
+
+def _fit_widths(weights: tuple[int, ...], table_width: int) -> tuple[int, ...]:
+    """Fit fixed column widths into the table without a horizontal scrollbar."""
+    available = max(len(weights), table_width - len(weights) * 2 - 1)
+    total = sum(weights)
+    widths = [max(1, available * weight // total) for weight in weights]
+    widest = max(range(len(widths)), key=widths.__getitem__)
+    widths[widest] += available - sum(widths)
+    return tuple(widths)
+
+
+def _archive_layout(
+    mode: str, *, compact: bool, narrow: bool, medium: bool, table_width: int
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    if mode == "downloads":
+        if compact:
+            keep, weights = (1, 4, 5), (20, 7, 8)
+        elif medium:
+            keep, weights = (1, 2, 4, 5), (18, 20, 7, 8)
+        else:
+            keep, weights = tuple(range(6)), (18, 20, 20, 7, 7, 9)
+    elif mode == "profiles":
+        if compact:
+            keep, weights = (0, 1, 2, 7), (1, 10, 7, 5)
+        elif narrow:
+            keep, weights = (0, 1, 2, 6, 7), (1, 16, 12, 6, 6)
+        elif medium:
+            keep, weights = (0, 1, 2, 5, 6, 7), (1, 20, 14, 5, 8, 11)
+        else:
+            keep, weights = (0, 1, 2, 3, 4, 5, 6, 7), (1, 18, 14, 10, 7, 5, 7, 8)
+    else:
+        if compact:
+            keep, weights = (0, 1, 2), (4, 11, 10)
+        elif medium:
+            keep, weights = (0, 1, 2, 4), (4, 16, 9, 28)
+        else:
+            keep, weights = tuple(range(6)), (5, 16, 10, 8, 28, 12)
+    return keep, _fit_widths(tuple(weights), table_width)
+
 
 class ArchiveScreen(WorkspaceScreen):
     section = "archive"
@@ -31,6 +82,9 @@ class ArchiveScreen(WorkspaceScreen):
     def __init__(self) -> None:
         super().__init__()
         self.mode = "downloads"
+        self._table_mode: str | None = None
+        self._table_layout: tuple[str, tuple[int, ...], tuple[int, ...]] | None = None
+        self._advanced_open = False
         self._job_ids: list[int] = []
         self._profile_ids: list[int] = []
         self._selected_profiles: set[int] = set()
@@ -49,25 +103,26 @@ class ArchiveScreen(WorkspaceScreen):
                 yield Button("Кружки", id="mode-downloads", variant="primary")
                 yield Button("Профили", id="mode-profiles")
                 yield Button("Задания", id="mode-jobs")
+                yield Button("Ещё…", id="archive-more")
             with Horizontal(classes="action-row", id="archive-actions"):
                 yield Button("Обновить HTML", id="catalog-build")
                 yield Button("Открыть HTML", id="catalog-open")
                 yield Button("Обновить профили", id="telegram-enrich")
                 yield Button("Повторить ошибку", id="job-retry")
-                yield Button("Анализировать профиль", id="telegram-ai")
-                yield Button("AI: кадры", id="telegram-ai-frames")
-                yield Button("AI: кадры + фото", id="telegram-ai-combined")
+                yield Button("Анализ профиля", id="telegram-ai")
                 yield Button("Выбрать / снять", id="profile-select")
-                yield Button("Анализировать выбранные", id="profiles-ai")
-                yield Button("Выбранные: кадры", id="profiles-ai-frames")
-                yield Button("Выбранные: кадры + фото", id="profiles-ai-combined")
-                yield Button("Открыть активную AI-группу", id="batch-reopen")
-            with Horizontal(classes="action-row", id="frame-actions"):
+                yield Button("Анализ выбранных", id="profiles-ai")
                 yield Button("Кадры кружка", id="frames-view")
                 yield Button("AI по кадрам", id="frames-ai")
-                yield Button("Обработать старые кружки", id="frames-backfill")
-                yield Button("Пауза очереди кадров", id="frames-backfill-pause")
-                yield Button("Повторить ошибки кадров", id="frames-retry")
+            with Horizontal(classes="action-row", id="archive-advanced"):
+                yield Button("AI: кадры", id="telegram-ai-frames")
+                yield Button("AI: кадры + фото", id="telegram-ai-combined")
+                yield Button("Выбранные: кадры", id="profiles-ai-frames")
+                yield Button("Выбранные: 3+фото", id="profiles-ai-combined")
+                yield Button("Активная AI-группа", id="batch-reopen")
+                yield Button("Старые кружки", id="frames-backfill")
+                yield Button("Пауза кадров", id="frames-backfill-pause")
+                yield Button("Повторить кадры", id="frames-retry")
             yield Select(
                 [("Все публикации", "")],
                 value="",
@@ -81,34 +136,79 @@ class ArchiveScreen(WorkspaceScreen):
             yield DataTable(id="archive-table", cursor_type="row")
 
     def on_mount(self) -> None:
+        self.query_one("#archive-advanced").display = False
         super().on_mount()
-        self.query_one("#archive-table", DataTable).focus()
+        self.call_after_refresh(
+            lambda: self.focus_working_surface(self.query_one("#archive-table", DataTable))
+        )
 
     def render_data(self, status: dict) -> None:
         stats = status.get("stats") or {}
-        text = Text()
-        for position, (label, key) in enumerate(
-            (("Кружки", "downloads"), ("Профили", "authors"), ("Фото профилей", "profile_photos"))
-        ):
-            if position:
-                text.append("   ·   ", style=MUTED)
-            text.append(f"{label} ", style=MUTED)
-            text.append(str(stats.get(key, 0)), style=f"bold {TEXT}")
         frame_stats = status.get("video_frames") or {}
-        text.append("\nКадры ", style=MUTED)
-        text.append(
-            f"{frame_stats.get('saved', 0)} готовы · "
-            f"{frame_stats.get('pending', 0)} в работе · "
-            f"{frame_stats.get('failed', 0)} ошибок · "
-            f"{frame_stats.get('missing', 0)} без набора",
-            style=TEXT,
-        )
-        backfill = " · сбор старых: " + (
-            "идёт"
-            if frame_stats.get("backfill_active")
-            else ("завершён" if frame_stats.get("backfill_complete") else "выключен")
-        )
-        text.append(backfill, style=MUTED)
+        text = Text()
+        narrow = self.hoard_app.has_class("narrow")
+        compact = self.hoard_app.has_class("compact")
+        if compact:
+            text.append(
+                f"Кружки {stats.get('downloads', 0)} · Профили {stats.get('authors', 0)}\n",
+                style=TEXT,
+            )
+            text.append(
+                f"Фото {stats.get('profile_photos', 0)} · Кадры {frame_stats.get('saved', 0)}\n",
+                style=MUTED,
+            )
+            text.append(
+                f"Ошибки {frame_stats.get('failed', 0)} · "
+                f"{frame_stats.get('missing', 0)} без набора",
+                style=MUTED,
+            )
+        else:
+            labels = (
+                ("Кружки", "downloads"),
+                ("Профили", "authors"),
+                ("Фото" if narrow else "Фото профилей", "profile_photos"),
+            )
+            for position, (label, key) in enumerate(labels):
+                if position:
+                    text.append("   ·   ", style=MUTED)
+                text.append(f"{label} ", style=MUTED)
+                text.append(str(stats.get(key, 0)), style=f"bold {TEXT}")
+            text.append("\nКадры ", style=MUTED)
+            backfill = (
+                "идёт"
+                if frame_stats.get("backfill_active")
+                else ("завершён" if frame_stats.get("backfill_complete") else "выкл.")
+            )
+            if narrow:
+                text.append(
+                    f"{frame_stats.get('saved', 0)} · "
+                    f"{frame_stats.get('failed', 0)} ошибок · "
+                    f"{frame_stats.get('missing', 0)} без набора",
+                    style=TEXT,
+                )
+            elif self.hoard_app.has_class("medium"):
+                text.append(
+                    f"{frame_stats.get('saved', 0)} готовы · "
+                    f"{frame_stats.get('pending', 0)} в работе · "
+                    f"{frame_stats.get('failed', 0)} ошибок · "
+                    f"{frame_stats.get('missing', 0)} без набора · старые: {backfill}",
+                    style=TEXT,
+                )
+            else:
+                text.append(
+                    f"{frame_stats.get('saved', 0)} готовы · "
+                    f"{frame_stats.get('pending', 0)} в работе · "
+                    f"{frame_stats.get('failed', 0)} ошибок · "
+                    f"{frame_stats.get('missing', 0)} без набора",
+                    style=TEXT,
+                )
+                text.append(
+                    " · сбор старых: " + (
+                        "идёт" if frame_stats.get("backfill_active")
+                        else ("завершён" if frame_stats.get("backfill_complete") else "выключен")
+                    ),
+                    style=MUTED,
+                )
         if not (status.get("integrations") or {}).get("ffmpeg", True):
             text.append(
                 "\nFFmpeg не найден; новые кадры не будут извлечены. "
@@ -133,15 +233,44 @@ class ArchiveScreen(WorkspaceScreen):
         selector.value = self._profile_source
         self._render_table(status)
 
+    @staticmethod
+    def _download_key(row: dict) -> tuple[int, int] | None:
+        try:
+            return int(row.get("source_id") or 0), int(row.get("message_id") or 0)
+        except (TypeError, ValueError):
+            return None
+
     def _render_table(self, status: dict) -> None:
         table = self.query_one("#archive-table", DataTable)
-        table.clear(columns=True)
+        # Status and notice updates repaint the current screen.  A full DataTable rebuild
+        # must not move the cursor back to the first row while the user is selecting rows.
+        preserve = self._table_mode == self.mode
+        old_row = table.cursor_row if preserve else 0
+        old_scroll = table.scroll_offset if preserve else None
+        old_download = (
+            self._download_key(self._downloads[old_row])
+            if preserve and self.mode == "downloads" and 0 <= old_row < len(self._downloads)
+            else None
+        )
+        old_profile = (
+            self._profile_ids[old_row]
+            if preserve and self.mode == "profiles" and 0 <= old_row < len(self._profile_ids)
+            else None
+        )
+        old_job = (
+            self._job_ids[old_row]
+            if preserve and self.mode == "jobs" and 0 <= old_row < len(self._job_ids)
+            else None
+        )
         self._job_ids = []
         self._profile_ids = []
+        cells_rows: list[tuple[str, ...]] = []
+        row_keys: list[str | None] = []
+        data_rows: list[dict] = []
         if self.mode == "downloads":
-            table.add_columns("Дата", "Автор", "Источник", "Размер", "Кадры", "Состояние")
-            rows = self._downloads
-            for row in rows:
+            columns = DOWNLOAD_COLUMNS
+            data_rows = self._downloads
+            for row in data_rows:
                 author = str(row.get("author_name") or row.get("author_username") or "—")
                 source = f"@{row.get('source_name', '—')}/{row.get('post_id', '—')}"
                 frame_label = {
@@ -152,57 +281,86 @@ class ArchiveScreen(WorkspaceScreen):
                     "stale": "устарели",
                     "missing": "—",
                 }.get(str(row.get("frame_status") or ""), "—")
-                table.add_row(
-                    str(row.get("date") or "—"),
-                    author,
-                    source,
-                    format_bytes(row.get("size")),
-                    frame_label,
-                    str(row.get("state") or "saved"),
+                cells_rows.append(
+                    (
+                        _short_date(row.get("date")),
+                        author,
+                        source,
+                        format_bytes(row.get("size")),
+                        frame_label,
+                        str(row.get("state") or "saved"),
+                    )
                 )
-            if not rows:
-                table.add_row("—", "Кружков пока нет", "—", "—", "—", "—")
+                row_keys.append(None)
+            if not data_rows:
+                cells_rows.append(("—", "Кружков пока нет", "—", "—", "—", "—"))
+                row_keys.append(None)
         elif self.mode == "profiles":
-            table.add_columns(
-                "✓", "Имя", "Username", "Telegram ID", "Источники", "Фото",
-                "Кружки", "Кадры", "Последнее"
-            )
-            rows = self._profile_items
-            for row in rows:
+            columns = PROFILE_COLUMNS
+            data_rows = self._profile_items
+            for row in data_rows:
                 self._profile_ids.append(int(row.get("author_id") or 0))
                 author_id = int(row.get("author_id") or 0)
-                table.add_row(
-                    "●" if author_id in self._selected_profiles else "○",
-                    str(row.get("display_name") or "—"),
-                    "@" + str(row.get("current_username") or "—"),
-                    str(row.get("author_id") or "—"),
-                    str(row.get("source_count") or 0),
-                    str(row.get("photo_count") or 0),
-                    str(row.get("video_count") or 0),
-                    str(row.get("frame_set_count") or 0),
-                    str(row.get("photo_error") or row.get("last_seen") or "—"),
+                cells_rows.append(
+                    (
+                        "●" if author_id in self._selected_profiles else "○",
+                        str(row.get("display_name") or "—"),
+                        "@" + str(row.get("current_username") or "—"),
+                        str(row.get("author_id") or "—"),
+                        str(row.get("source_count") or 0),
+                        str(row.get("photo_count") or 0),
+                        str(row.get("video_count") or 0),
+                        str(row.get("frame_set_count") or 0),
+                        str(row.get("photo_error") or row.get("last_seen") or "—"),
+                    )
                 )
-            if not rows:
-                table.add_row(
-                    "○", "Профилей пока нет", "—", "—", "0", "0", "0", "0", "—"
+                row_keys.append(None)
+            if not data_rows:
+                cells_rows.append(
+                    ("○", "Профилей пока нет", "—", "—", "0", "0", "0", "0", "—")
                 )
+                row_keys.append(None)
         else:
-            table.add_columns("ID", "Тип", "Состояние", "Попытки", "Результат", "Обновлено")
-            rows = status.get("jobs") or []
-            for row in rows:
+            columns = JOB_COLUMNS
+            data_rows = list(status.get("jobs") or [])
+            for row in data_rows:
                 job_id = int(row.get("id") or 0)
                 self._job_ids.append(job_id)
-                table.add_row(
-                    str(job_id),
-                    str(row.get("kind") or "—"),
-                    str(row.get("state") or "—"),
-                    str(row.get("attempts") or 0),
-                    str(row.get("result") or "—"),
-                    str(row.get("updated_at") or "—"),
-                    key=str(job_id),
+                cells_rows.append(
+                    (
+                        str(job_id),
+                        str(row.get("kind") or "—"),
+                        str(row.get("state") or "—"),
+                        str(row.get("attempts") or 0),
+                        str(row.get("result") or "—"),
+                        str(row.get("updated_at") or "—"),
+                    )
                 )
-            if not rows:
-                table.add_row("—", "Заданий пока нет", "—", "0", "—", "—")
+                row_keys.append(str(job_id))
+            if not data_rows:
+                cells_rows.append(("—", "Заданий пока нет", "—", "0", "—", "—"))
+                row_keys.append(None)
+        table_width = max(
+            20,
+            self.hoard_app.size.width
+            - (6 if self.hoard_app.has_class("sidebar-hidden") else 28),
+        )
+        keep, widths = _archive_layout(
+            self.mode,
+            compact=self.hoard_app.has_class("compact"),
+            narrow=self.hoard_app.has_class("narrow"),
+            medium=self.hoard_app.has_class("medium"),
+            table_width=table_width,
+        )
+        layout = (self.mode, keep, widths)
+        if layout != self._table_layout:
+            table.clear(columns=True)
+            for index, width in zip(keep, widths, strict=True):
+                table.add_column(columns[index], width=width)
+            self._table_layout = layout
+        table.clear()
+        for cells, key in zip(cells_rows, row_keys, strict=True):
+            table.add_row(*(cells[index] for index in keep), key=key)
         self.query_one("#job-retry", Button).display = self.mode == "jobs"
         for identifier in ("telegram-ai", "profile-select", "profiles-ai"):
             self.query_one(f"#{identifier}", Button).display = self.mode == "profiles"
@@ -214,19 +372,61 @@ class ArchiveScreen(WorkspaceScreen):
         self.query_one("#profile-source-filter", Select).display = self.mode == "profiles"
         self.query_one("#batch-reopen", Button).display = self.mode == "profiles"
         self.query_one("#profile-pages", Horizontal).display = self.mode == "profiles"
-        for identifier in (
-            "frames-view", "frames-ai", "frames-backfill",
-            "frames-backfill-pause", "frames-retry",
-        ):
+        for identifier in ("frames-view", "frames-ai"):
             self.query_one(f"#{identifier}", Button).display = self.mode == "downloads"
+        for identifier in ("frames-backfill", "frames-backfill-pause", "frames-retry"):
+            self.query_one(f"#{identifier}", Button).display = self.mode == "downloads"
+        more = self.query_one("#archive-more", Button)
+        more.display = self.mode in {"downloads", "profiles"}
+        more.label = "Скрыть" if self._advanced_open else "Ещё…"
         if self.mode == "profiles":
-            start = self._profile_offset + 1 if rows else 0
-            end = self._profile_offset + len(rows)
+            start = self._profile_offset + 1 if data_rows else 0
+            end = self._profile_offset + len(data_rows)
             self.query_one("#profiles-page-label", Static).update(
                 f"{start}–{end} из {self._profile_total}"
             )
             self.query_one("#profiles-previous", Button).disabled = self._profile_offset <= 0
             self.query_one("#profiles-next", Button).disabled = end >= self._profile_total
+        target = old_row
+        if preserve:
+            if self.mode == "downloads" and old_download is not None:
+                target = next(
+                    (
+                        index
+                        for index, item in enumerate(self._downloads)
+                        if self._download_key(item) == old_download
+                    ),
+                    old_row,
+                )
+            elif self.mode == "profiles" and old_profile is not None:
+                target = next(
+                    (
+                        index
+                        for index, item_id in enumerate(self._profile_ids)
+                        if item_id == old_profile
+                    ),
+                    old_row,
+                )
+            elif self.mode == "jobs" and old_job is not None:
+                target = next(
+                    (
+                        index
+                        for index, item_id in enumerate(self._job_ids)
+                        if item_id == old_job
+                    ),
+                    old_row,
+                )
+        if table.row_count:
+            table.move_cursor(row=min(max(0, target), table.row_count - 1), scroll=False)
+            if old_scroll is not None:
+                # Restore the exact viewport after the next layout pass; move_cursor() may
+                # otherwise force the selected row into the middle of the table.
+                self.call_after_refresh(
+                    lambda: table.scroll_to(
+                        x=old_scroll.x, y=old_scroll.y, animate=False
+                    )
+                )
+        self._table_mode = self.mode
 
     def on_select_changed(self, event: Select.Changed) -> None:
         if event.select.id != "profile-source-filter":
@@ -239,6 +439,8 @@ class ArchiveScreen(WorkspaceScreen):
         button_id = str(event.button.id)
         if button_id.startswith("mode-"):
             self.mode = button_id.removeprefix("mode-")
+            self._advanced_open = False
+            self.query_one("#archive-advanced").display = False
             for mode in ("downloads", "profiles", "jobs"):
                 self.query_one(f"#mode-{mode}", Button).variant = (
                     "primary" if mode == self.mode else "default"
@@ -246,6 +448,12 @@ class ArchiveScreen(WorkspaceScreen):
             self._render_table(self.hoard_app.status or {})
             if self.mode == "profiles":
                 self._load_profile_page()
+        elif button_id == "archive-more":
+            self._advanced_open = not self._advanced_open
+            self.query_one("#archive-advanced").display = self._advanced_open
+            self.query_one("#archive-more", Button).label = (
+                "Скрыть" if self._advanced_open else "Ещё…"
+            )
         elif button_id == "catalog-build":
             self._build_catalog()
         elif button_id == "catalog-open":

@@ -122,13 +122,19 @@ class Sidebar(Static):
         label.append(section.label, style="bold" if active else "")
         return label
 
-    def set_active(self, active: str) -> None:
-        self.active = active
+    def set_active(self, active: str, *, reset_highlight: bool = False) -> None:
+        # Status polling repeatedly renders the current screen.  Rebuilding an unchanged
+        # sidebar would reset the user's navigation highlight every poll (Home refreshes
+        # every 1.5 seconds).  Only page activation or an explicit reset may move it.
         navigation = self.query_one(OptionList)
-        for number, section in enumerate(SECTIONS, start=1):
-            index = navigation.get_option_index(section.key)
-            navigation.replace_option_prompt_at_index(index, self._label(section, number))
-        navigation.highlighted = self._index_of(active)
+        changed = active != self.active
+        if changed:
+            self.active = active
+            for number, section in enumerate(SECTIONS, start=1):
+                index = navigation.get_option_index(section.key)
+                navigation.replace_option_prompt_at_index(index, self._label(section, number))
+        if changed or reset_highlight:
+            navigation.highlighted = self._index_of(active)
 
     def move(self, direction: int) -> None:
         navigation = self.query_one(OptionList)

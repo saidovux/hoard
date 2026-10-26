@@ -74,6 +74,7 @@ def _help_text() -> Text:
                 ("[ ]", "предыдущий / следующий раздел"),
                 (f"1 – {min(9, len(SECTIONS))}", "перейти к разделу"),
                 ("tab  ⇧tab", "следующий / предыдущий элемент"),
+                ("ctrl+pgup/dn", "прокрутить страницу"),
             ),
         ),
         (
@@ -124,6 +125,7 @@ GLOBAL_ACTIONS = frozenset(
         "previous_section",
         "next_section",
         "goto_section",
+        "scroll_workspace",
     }
 )
 
@@ -154,6 +156,8 @@ class HoardApp(App[None]):
         Binding("]", "next_section", "Следующий раздел"),
         Binding(":", "palette", "Команды"),
         Binding("ctrl+k", "palette", "Команды", show=False),
+        Binding("ctrl+pageup", "scroll_workspace(-1)", "Страница вверх", show=False),
+        Binding("ctrl+pagedown", "scroll_workspace(1)", "Страница вниз", show=False),
         *(
             Binding(str(number), f"goto_section({number - 1})", show=False)
             for number in range(1, min(9, len(SECTIONS)) + 1)
@@ -520,6 +524,24 @@ class HoardApp(App[None]):
             return self.screen.query_one(Sidebar)
         return None
 
+    def _visible_sidebar(self) -> Sidebar | None:
+        sidebar = self._sidebar()
+        return sidebar if sidebar is not None and sidebar.display else None
+
+    def _focus_is_inside(self, widget: Widget | None, ancestor: Widget) -> bool:
+        return widget is not None and (widget is ancestor or ancestor in widget.ancestors)
+
+    def _repair_focus(self) -> None:
+        """Keep focus on a visible control when the responsive sidebar changes."""
+        sidebar = self._sidebar()
+        if sidebar is None:
+            return
+        if not sidebar.display:
+            if self._focus_is_inside(self.focused, sidebar):
+                self.set_focus(None)
+        elif self.focused is None:
+            sidebar.query_one(OptionList).focus()
+
     def action_nav_down(self) -> None:
         focused = self.focused
         if self._is_text_entry(focused):
@@ -528,7 +550,7 @@ class HoardApp(App[None]):
             focused.action_cursor_down()
         elif self._is_interactive(focused):
             self.screen.focus_next()
-        elif sidebar := self._sidebar():
+        elif sidebar := self._visible_sidebar():
             sidebar.move(1)
 
     def action_nav_up(self) -> None:
@@ -539,7 +561,7 @@ class HoardApp(App[None]):
             focused.action_cursor_up()
         elif self._is_interactive(focused):
             self.screen.focus_previous()
-        elif sidebar := self._sidebar():
+        elif sidebar := self._visible_sidebar():
             sidebar.move(-1)
 
     def action_open(self) -> None:
@@ -554,7 +576,7 @@ class HoardApp(App[None]):
             focused.action_select()
         elif isinstance(focused, Button):
             focused.action_press()
-        elif sidebar := self._sidebar():
+        elif sidebar := self._visible_sidebar():
             sidebar.choose()
 
     def action_back(self) -> None:
@@ -613,11 +635,21 @@ class HoardApp(App[None]):
     def action_sidebar(self) -> None:
         if not self._is_text_entry(self.focused):
             self.toggle_class("sidebar-hidden")
+            self.call_after_refresh(self._repair_focus)
 
     def _move_section(self, offset: int) -> None:
         current = getattr(self.screen, "section", "home")
         index = (section_index(current) + offset) % len(SECTIONS)
         self.open_section(SECTIONS[index].key)
+
+    def action_scroll_workspace(self, direction: int) -> None:
+        if not isinstance(self.screen, WorkspaceScreen):
+            return
+        workspace = self.screen.query_one("#workspace", VerticalScroll)
+        if direction < 0:
+            workspace.scroll_page_up(animate=False)
+        else:
+            workspace.scroll_page_down(animate=False)
 
     def action_previous_section(self) -> None:
         if not self._is_text_entry(self.focused):
@@ -637,6 +669,7 @@ class HoardApp(App[None]):
         self.set_class(event.size.width < 110, "medium")
         self.set_class(event.size.height < 30, "short")
         self.set_class(event.size.height < 22, "tiny")
+        self.call_after_refresh(self._repair_focus)
         if isinstance(self.screen, WorkspaceScreen) and self.screen.is_mounted:
             self.screen.call_after_refresh(self.screen.on_app_resize)
 

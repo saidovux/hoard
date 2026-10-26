@@ -8,7 +8,8 @@ from rich.text import Text
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import Screen
-from textual.widgets import Static
+from textual.widget import Widget
+from textual.widgets import OptionList, Static
 
 from ..colors import ACCENT, TEXT
 from ..widgets import HoardHeader, HoardStatusBar, Sidebar
@@ -44,15 +45,20 @@ class WorkspaceScreen(Screen):
         yield Static()
 
     def on_mount(self) -> None:
+        # A scroll container is not a meaningful Tab stop: it has no visible focus outline,
+        # and j/k are handled by the application as section navigation.  Keep wheel scrolling,
+        # but leave the keyboard focus chain to tables and buttons.
+        self.query_one("#workspace").can_focus = False
+        self.query_one(Sidebar).set_active(self.section, reset_highlight=True)
         self.render_status(self.hoard_app.status, self.hoard_app.status_error)
 
     def on_screen_resume(self) -> None:
+        self.query_one(Sidebar).set_active(self.section, reset_highlight=True)
         self.render_status(self.hoard_app.status, self.hoard_app.status_error)
 
     def render_status(self, status: dict | None, error: str | None = None) -> None:
         self.query_one(HoardHeader).show_status(status, error)
         self.query_one(HoardStatusBar).show_hints(self.HINTS)
-        self.query_one(Sidebar).set_active(self.section)
         error_view = self.query_one("#status-error", Static)
         if error:
             error_view.update(
@@ -87,6 +93,23 @@ class WorkspaceScreen(Screen):
         status = self.hoard_app.status
         if status is not None and self.is_mounted:
             self.render_data(status)
+
+    def focus_working_surface(self, table: Widget) -> None:
+        """Focus a table only when it is visible; otherwise keep the top of the page in view."""
+        workspace = self.query_one("#workspace", VerticalScroll)
+        if (
+            table.display
+            and table.region.width > 0
+            and table.region.y >= workspace.region.y
+            and table.region.bottom <= workspace.region.bottom
+        ):
+            table.focus()
+            return
+        sidebar = self.query_one(Sidebar)
+        if sidebar.display:
+            sidebar.query_one(OptionList).focus()
+        else:
+            self.set_focus(None)
 
     def on_sidebar_navigate(self, message: Sidebar.Navigate) -> None:
         self.hoard_app.open_section(message.section)

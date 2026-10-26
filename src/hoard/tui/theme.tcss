@@ -238,6 +238,10 @@ OptionList > .option-list--separator {
     min-height: 5;
 }
 
+.short #events-panel {
+    min-height: 3;
+}
+
 .tiny #events-panel {
     min-height: 3;
 }
@@ -277,11 +281,30 @@ OptionList > .option-list--separator {
     min-height: 3;
 }
 
+/* On short terminals the panel must grow with its controls; a 1fr panel clips the
+   table and lower action rows outside the scrollable workspace. */
+.short #archive-main {
+    height: auto;
+}
+
+.short #archive-table {
+    height: 4;
+}
+
+.tiny #archive-table {
+    height: 4;
+}
+
 #archive-summary, #ai-summary, #ai-statistics, #ai-history,
 #telegram-ai-photos, #telegram-ai-previous {
     height: auto;
     min-height: 1;
     margin-bottom: 1;
+}
+
+#archive-summary {
+    text-wrap: nowrap;
+    text-overflow: ellipsis;
 }
 
 .table-help {
@@ -361,7 +384,7 @@ Button:disabled {
     grid-size: 3;
 }
 
-#archive-actions, #ai-actions {
+#archive-actions, #archive-advanced, #frame-actions, #ai-actions {
     grid-size: 3;
 }
 
@@ -373,11 +396,16 @@ Button:disabled {
     grid-size: 3;
 }
 
+.narrow #source-actions {
+    grid-size: 2;
+}
+
 .medium #source-ai-actions {
     grid-size: 2;
 }
 
-.medium #archive-actions, .medium #ai-actions {
+.medium #archive-actions, .medium #archive-advanced, .medium #frame-actions,
+.medium #ai-actions {
     grid-size: 2;
 }
 
@@ -386,7 +414,8 @@ Button:disabled {
     grid-size: 2;
 }
 
-.compact #archive-actions, .compact #ai-actions {
+.compact #archive-actions, .compact #archive-advanced, .compact #frame-actions,
+.compact #ai-actions {
     grid-size: 1;
 }
 
@@ -417,11 +446,56 @@ Button:disabled {
     text-style: bold reverse;
 }
 
+#archive-more {
+    color: #888888;
+    margin-right: 0;
+}
+
 #profiles-page-label {
     width: auto;
     height: 1;
     margin-right: 2;
     color: #888888;
+}
+
+.compact #archive-modes {
+    layout: grid;
+    grid-size: 2;
+    grid-columns: 1fr 1fr;
+    height: auto;
+}
+
+.compact #archive-modes Button {
+    margin-right: 0;
+}
+
+.compact #profile-pages {
+    layout: grid;
+    grid-size: 3;
+    grid-columns: 1fr auto 1fr;
+    grid-gutter: 0 1;
+    height: auto;
+}
+
+.compact #profile-pages Button {
+    margin-right: 0;
+    width: auto;
+}
+
+.narrow .ai-mode-row Button {
+    margin-right: 1;
+}
+
+.compact .ai-mode-row {
+    layout: grid;
+    grid-size: 3;
+    grid-columns: 1fr 1fr 1fr;
+    grid-gutter: 0 1;
+    height: auto;
+}
+
+.compact .ai-mode-row Button {
+    margin-right: 0;
 }
 
 /* ── fields and tables ──────────────────────────────────────────────────── */
@@ -541,18 +615,26 @@ SelectOverlay > .option-list--option-hover {
     min-height: 10;
 }
 
+#ai-list-pane {
+    height: auto;
+}
+
 #ai-table {
     width: 100%;
     height: 16;
-    min-height: 6;
+    min-height: 4;
+}
+
+.medium #ai-table {
+    height: 12;
 }
 
 .short #ai-table {
-    height: 9;
+    height: 6;
 }
 
 .tiny #ai-table {
-    height: 6;
+    height: 4;
 }
 
 .ai-mode-row {

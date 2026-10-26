@@ -19,7 +19,7 @@ background service.
   reusable widgets and TCSS remain separate. The package imports neither storage nor Telethon, and
   never creates a Telegram client. See `docs/TUI.md`.
 - `ipc.py` starts the daemon detached when required and sends one JSON request per private
-  Unix-socket connection. Client and daemon must both report Hoard 0.7.2.2 and IPC protocol `1`.
+  Unix-socket connection. Client and daemon must both report Hoard 0.7.2.3 and IPC protocol `1`.
   A held instance lock with no ready socket means initialization is in progress, so the client
   waits for that owner instead of spawning a second daemon.
 - `service.py` owns the database, three independently limited job runners and the sole
@@ -91,10 +91,12 @@ backgrounds for containers, navigation components, focus/hover/selected states, 
 buttons, menus and modals. The workspace exposes **Главная**, **Архив**, **Telegram** and **AI**.
 Home merges the former Overview and Activity dashboards; Telegram contains both collector and
 sources and adds the separate Web process panel; Archive retains downloads, profiles, jobs,
-catalog and video-frame actions. The modular AI screen and dialogs expose only implemented IPC operations and never
-import storage, provider transports or Telegram. Every surface is a black framed-panel workspace
-with an orange focus border; tests enforce the palette, responsive classes and disabled/selected
-states.
+catalog and video-frame actions, with less frequent AI/frame commands behind a mode-specific
+**Ещё…** block. Tables fit or reduce their columns instead of scrolling sideways, and a table is
+auto-focused only when it is fully visible. The modular AI screen and dialogs expose only
+implemented IPC operations and never import storage, provider transports or Telegram. Every
+surface is a black framed-panel workspace with an orange focus border; tests enforce the palette,
+responsive classes, visible geometry and disabled/selected states.
 
 ## Telegram authorization
 
