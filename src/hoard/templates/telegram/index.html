@@ -11,43 +11,48 @@
   </style>
 </head>
 <body>
-  <header class="topbar shell">
-    <button class="brand plain-button" id="home" type="button" aria-label="К источникам">
-      hoard<span>.</span>
-    </button>
-    <div class="heading">
-      <h1 id="title">Telegram archive</h1>
-      <p id="summary" class="muted">Локальный каталог</p>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <button class="brand plain-button" id="home" type="button" aria-label="К источникам">
+        hoard<b>.</b><small>Telegram archive</small>
+      </button>
+      <nav class="mainnav" aria-label="Раздел каталога">
+        <button id="show-posts" class="active" type="button">Источники</button>
+        <button id="show-profiles" type="button">Все профили</button>
+      </nav>
+      <div class="top-end" id="top-end">
+        <span class="local-badge">Локальный архив</span>
+      </div>
     </div>
-    <nav class="switcher" aria-label="Раздел каталога">
-      <button id="show-posts" class="active" type="button">Источники</button>
-      <button id="show-profiles" type="button">Все профили</button>
-    </nav>
   </header>
 
-  <aside class="privacy shell" aria-label="Предупреждение о приватности">
-    Это локальный архив с персональными данными. Перед передачей файла или архива другим людям
-    проверьте его содержимое.
-  </aside>
-
   <main class="shell">
+    <div class="privacy" aria-label="Предупреждение о приватности">
+      Локальный архив с персональными данными. Перед передачей файла или архива другим людям
+      проверьте его содержимое.
+    </div>
     <noscript>Для просмотра локального каталога включите JavaScript.</noscript>
+
+    <div id="page-head"></div>
+
     <section class="toolbar" id="toolbar" aria-label="Поиск, фильтры и сортировка">
-      <label class="field search">
-        <span>Поиск</span>
-        <input id="query" type="search" placeholder="Имя, @username, ID, канал или пост"
-          autocomplete="off">
+      <label class="search">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+          aria-hidden="true"><circle cx="10.8" cy="10.8" r="7.1"/><path d="m16 16 5 5"/></svg>
+        <input id="query" type="search" placeholder="Название, @канал или текст публикации"
+          aria-label="Поиск" autocomplete="off">
       </label>
       <label class="field sort-field">
         <span>Сортировка</span>
-        <select id="sort"></select>
+        <select id="sort" aria-label="Сортировка"></select>
       </label>
       <button id="direction" class="direction" type="button" title="По убыванию"
         aria-label="Поменять направление сортировки">↓</button>
       <button id="reset" class="secondary" type="button">Сбросить</button>
 
       <details class="filters" id="profile-filters" hidden>
-        <summary>Фильтры профилей <span id="filter-count" class="filter-count"></span></summary>
+        <summary><span>Фильтры</span><span id="filter-count" class="filter-count"></span>
+          <span aria-hidden="true">▾</span></summary>
         <div class="filter-grid">
           <label class="field"><span>Источник</span><select id="filter-source"></select></label>
           <label class="field"><span>Фотографии</span><select id="filter-photos">
@@ -76,16 +81,17 @@
       </details>
     </section>
 
+    <div id="list-meta" class="list-meta" hidden></div>
     <div id="notice" class="notice" hidden></div>
-    <section id="content" aria-live="polite"></section>
-    <nav id="pager" class="pager" aria-label="Страницы" hidden>
-      <button id="previous" type="button">← Назад</button>
-      <span id="page-label"></span>
-      <button id="next" type="button">Дальше →</button>
-    </nav>
+    <section id="content"></section>
   </main>
 
-  <footer class="shell"><span id="generated"></span> · автономный локальный снимок</footer>
+  <footer class="shell">
+    <div class="footer-row">
+      <span id="summary"></span>
+      <span id="generated"></span>
+    </div>
+  </footer>
 
   <dialog id="viewer" class="viewer" aria-label="Просмотр медиа">
     <div class="viewer-bar">

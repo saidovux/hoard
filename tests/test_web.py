@@ -1000,3 +1000,69 @@ def test_chromium_displays_frame_thumbnails_and_frame_ai_action(tmp_path):
     assert detail.stdout.count('class="frame-thumb"') == 3
     assert "AI по кадрам" in detail.stdout
     assert "3 кадра одного видео" in detail.stdout
+
+
+@pytest.mark.skipif(shutil.which("chromium") is None, reason="Chromium is not installed")
+def test_interactive_list_uses_incremental_rendering_without_page_buttons(tmp_path):
+    archive = tmp_path / "archive"
+    archive.mkdir()
+    image = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAFElEQVR42mNk"
+        "+M9QzwAEYBxVSFUAANMCA/2BTpYAAAAASUVORK5CYII="
+    )
+    photo = archive / "avatar.png"
+    photo.write_bytes(image)
+    store = Store(tmp_path / "hoard.sqlite3")
+    source_id = store.add_source(Post("synthetic_list", 7), str(archive))
+    for index in range(60):
+        author_id = 500000 + index
+        store.telegram.observe_profile(
+            author_id=author_id,
+            username=f"person{index}",
+            display_name=f"Person {index}",
+            source_id=source_id,
+        )
+        store.telegram.record_profile_photo(
+            author_id,
+            f"photo-{index}",
+            file_path=str(photo),
+            size=len(image),
+            photo_date="2026-10-25",
+        )
+    catalog = build_catalog(store, archive_root=archive)
+    roots = tuple(store.telegram.allowed_media_roots(archive))
+    store.close()
+
+    state = WebState(catalog, allowed_media_roots=roots, requester=FakeDaemon())
+    server = create_web_server(state)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    profile = tmp_path / "chromium-incremental"
+    command = [
+        str(shutil.which("chromium")),
+        "--headless=new",
+        "--no-sandbox",
+        "--disable-gpu",
+        "--disable-background-networking",
+        f"--user-data-dir={profile}",
+        "--window-size=1440,900",
+        "--virtual-time-budget=6000",
+        "--dump-dom",
+    ]
+    try:
+        listing = subprocess.run(
+            [*command, state.start_url],
+            capture_output=True,
+            text=True,
+            timeout=40,
+            check=False,
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+    assert listing.returncode == 0, listing.stderr
+    assert listing.stdout.count('class="card person-card"') == 48
+    assert "Показано 48 из 60" in listing.stdout
+    assert "← Назад" not in listing.stdout
+    assert "Дальше →" not in listing.stdout

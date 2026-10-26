@@ -1,9 +1,19 @@
-# Hoard 0.7.2.4
+# Hoard 0.7.3.0
 
 Hoard is a local-first Linux and Windows archive for Telegram posts, profiles and video notes
 found in a channel post's comments. It uses Telethon, SQLite, an autonomous offline HTML catalog
 and terminal interfaces. A private background daemon performs all Telegram work; closing an
 interface does not stop downloads.
+
+The 0.7.3.0 release redesigns the explicit local Web client as **Black Archive 03**. It applies a
+compact black-and-orange workspace to the existing catalog: publication cards, the open
+publication, profile cards, the open profile with photos, video notes, ready frames, username
+history and PSL history, the media viewer and the existing AI preview. Lists and long detail
+sections now load incrementally while scrolling, preserving search, filters, loaded cards and
+scroll position across opening a profile or publication and returning. The autonomous
+`file://` catalog uses the same rendering and makes no extra HTTP requests. No Telegram,
+daemon, SQLite, AI protocol, FFmpeg or TUI behavior changed; video frames remain strictly
+manual and Web never starts extraction.
 
 This release adds one minimal AI workflow across the TUI and an explicit local browser client.
 It combines saved publications, profiles, photos, video notes, extracted video-note frames and
@@ -220,7 +230,7 @@ For development, install the test tools with `python -m pip install -e '.[dev]'`
 
 An upgrade keeps the existing XDG configuration, database, Telegram session and archive.
 If an older daemon is still running, execute `hoard shutdown` before starting the upgraded
-installation. The 0.7.2.4 client accepts only a daemon reporting the same application version and
+installation. The 0.7.3.0 client accepts only a daemon reporting the same application version and
 IPC protocol `1`; it reports the mismatch instead of starting a competing service. If a matching
 daemon already owns the service lock but is still initializing, clients wait for it and show a
 specific startup diagnostic.
@@ -329,10 +339,10 @@ photo/video availability, successful PSL, Raw/Boosted PSL and adult-age ranges. 
 ID, discovery/activity dates, media count and PSL fields are sortable; missing numeric values are
 always last. Post search and sorting remain available independently.
 
-Post and profile pages preserve list query, filters, sorting, pagination and scroll context.
+Post and profile pages preserve list query, filters, sorting, loaded batches and scroll context.
 Browser Back/Forward works through local hash history for `Источники → Пост → Профиль` and
-`Все профили → Профиль`. Photo galleries render one bounded page at a time, lazy-load images and
-open a keyboard-accessible viewer with arrow navigation and Escape. Video notes use HTML5
+`Все профили → Профиль`. Photo galleries append bounded batches while scrolling, lazy-load images
+and open a keyboard-accessible viewer with arrow navigation and Escape. Video notes use HTML5
 controls, never autoplay and retain `preload="none"`; their saved comment date and original
 Telegram link are shown. Missing or rejected local paths render an inert placeholder.
 
@@ -383,7 +393,7 @@ receives that token and has no server-stop route.
 
 While the browser is visible it polls a tiny published-catalog-version endpoint. It requests the
 new normalized snapshot only when the atomically replaced HTML changes, then updates collections,
-search indexes, counters and media allowlists in place. Existing filters, search, pagination,
+search indexes, counters and media allowlists in place. Existing filters, search, loaded batches,
 selection, route and scroll are retained; an open image viewer or playing video defers only the
 visual rebuild. New Telegram and completed AI data therefore appear without a page reload, even
 when the TUI is closed. The autonomous `file://` catalog remains independent and makes no local

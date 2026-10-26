@@ -693,3 +693,8 @@ def test_frontend_has_independent_list_state_local_history_and_bounded_media():
     assert 'photos: "yes"' in app
     assert 'const defaultView = interactiveEnabled ? "profiles" : "posts"' in app
     assert "profilePhotos(profile)" in app
+    assert "incrementalBlock" in app
+    assert "IntersectionObserver" in app
+    assert "load-area" in app
+    assert "Показано ${loaded} из ${items.length}" in app
+    assert "← Назад" not in app and "Дальше →" not in app

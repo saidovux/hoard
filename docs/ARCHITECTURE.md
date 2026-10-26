@@ -19,7 +19,7 @@ background service.
   reusable widgets and TCSS remain separate. The package imports neither storage nor Telethon, and
   never creates a Telegram client. See `docs/TUI.md`.
 - `ipc.py` starts the daemon detached when required and sends one JSON request per private
-  Unix-socket connection. Client and daemon must both report Hoard 0.7.2.4 and IPC protocol `1`.
+  Unix-socket connection. Client and daemon must both report Hoard 0.7.3.0 and IPC protocol `1`.
   A held instance lock with no ready socket means initialization is in progress, so the client
   waits for that owner instead of spawning a second daemon.
 - `service.py` owns the database, three independently limited job runners and the sole
@@ -289,11 +289,21 @@ place and remain available through validated paths.
 The browser uses DOM construction and `textContent`, never HTML interpolation. Original links are
 restricted to HTTPS `t.me`; local media URLs accept only traversal-free relative or `file:`
 references produced by the generator. Separate post/profile list state preserves queries,
-composable filters, sorting, pages and scroll positions. Local hash/history routes support browser
-Back/Forward without a server or router dependency. Lists and galleries are paginated, images are
+composable filters, sorting, loaded batches and scroll positions. Local hash/history routes support
+browser Back/Forward without a server or router dependency. Lists and galleries remain bounded, images are
 lazy, the lightbox creates one full-size node at a time, and videos use `preload=none` without
 autoplay. Missing round-six fields remain optional so an older normalized snapshot degrades to an
 unscored profile rather than breaking rendering.
+
+The 0.7.3.0 Web surface uses the same Black Archive 03 template for the autonomous `file://`
+snapshot and the explicit loopback client. Publication and profile lists, post sections and long
+profile galleries append bounded batches with `IntersectionObserver` instead of replacing the DOM
+through page buttons; the stored batch limits remain in force. A non-observer fallback exposes a
+local “Показать ещё” button. Search, filters, sorting, loaded batches and scroll are preserved when
+a profile or publication is opened and the browser returns, and a live catalog snapshot reuses the
+same loaded counts before restoring the scroll position. Media viewers, playing video and the
+existing AI preview are not replaced during a snapshot update. The UI renders only real catalog
+records and ready local frames; it does not start FFmpeg, invent statuses or add analysis data.
 
 ## Interactive loopback catalog
 
@@ -306,7 +316,7 @@ bootstrap object; without it the same JavaScript performs no HTTP request, prese
 The interactive initial route is the profile list with the readable-photo filter enabled, so the
 first page is an avatar catalog rather than a page of recently observed profiles without photos.
 Only photo rows whose file still passes the strict media URL/size validation count as visible;
-the profile detail reuses that same set for its paginated gallery. The autonomous `file://`
+the profile detail reuses that same set for its incrementally loaded gallery. The autonomous `file://`
 catalog retains its historical default route and unfiltered profile list.
 
 Browser writes map to a closed set of daemon IPC calls: key save, PSL preview, batch start and

@@ -24,6 +24,7 @@
   let profileSearchIndex = new Map();
   let postSearchIndex = new Map();
   const sectionPages = new Map();
+  const observers = [];
   const selectedProfiles = new Set();
   const validProfileId = (value) => Number.isSafeInteger(Number(value)) && Number(value) > 0;
   let currentRoute = null;
@@ -39,9 +40,9 @@
     rawMin: "", rawMax: "", boosted: "", ageMin: "", ageMax: "",
   });
   const lists = {
-    posts: {query: "", sort: "published", descending: true, page: 0},
+    posts: {query: "", sort: "published", descending: true, visible: PAGE_SIZE},
     profiles: {
-      query: "", sort: "last_active", descending: true, page: 0,
+      query: "", sort: "last_active", descending: true, visible: PAGE_SIZE,
       filters: interactiveEnabled ? {...emptyFilters(), photos: "yes"} : emptyFilters(),
     },
   };
@@ -57,7 +58,8 @@
         lists[view].query = String(source.query || "");
         lists[view].sort = String(source.sort || lists[view].sort);
         lists[view].descending = Boolean(source.descending);
-        lists[view].page = Math.max(0, Number(source.page || 0));
+        const restored = Number(source.visible ?? source.page ?? 0);
+        lists[view].visible = Math.max(PAGE_SIZE, Number.isFinite(restored) ? restored : PAGE_SIZE);
         if (view === "profiles" && source.filters) {
           lists.profiles.filters = {...emptyFilters(), ...source.filters};
         }
@@ -103,10 +105,67 @@
     return result || fallback;
   }
 
+  const SVG_NS = "http://www.w3.org/2000/svg";
+  function icon(name, size = 14) {
+    const svg = document.createElementNS(SVG_NS, "svg");
+    svg.setAttribute("viewBox", "0 0 24 24");
+    svg.setAttribute("width", String(size));
+    svg.setAttribute("height", String(size));
+    svg.setAttribute("fill", "none");
+    svg.setAttribute("stroke", "currentColor");
+    svg.setAttribute("stroke-width", "1.8");
+    svg.setAttribute("aria-hidden", "true");
+    const paths = {
+      photo: ["M3 3h18v18H3z", "M8 8h.01", "m3 17 5-5 4 4 4-6 5 7"],
+      video: ["M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18Z", "m10 8 6 4-6 4z"],
+      link: ["M10 13a5 5 0 0 0 7.5.5l3-3a5 5 0 0 0-7.1-7L12 5",
+        "M14 11a5 5 0 0 0-7.5-.5l-3 3a5 5 0 0 0 7.1 7L12 19"],
+      arrow: ["m14 5-7 7 7 7"],
+    };
+    (paths[name] || []).forEach((value) => {
+      const path = document.createElementNS(SVG_NS, "path");
+      path.setAttribute("d", value);
+      svg.append(path);
+    });
+    return svg;
+  }
+
+  function sectionBlock(title, count, body, note = "") {
+    const section = element("section", "section");
+    const head = element("div", "section-head");
+    head.append(element("h2", "", title));
+    if (count !== null && count !== undefined) {
+      head.append(element("span", "count", String(count)));
+    }
+    section.append(head);
+    if (note) section.append(element("p", "section-desc", note));
+    if (body) section.append(body);
+    return section;
+  }
+
+  function disconnectObservers() {
+    observers.splice(0).forEach((observer) => observer.disconnect());
+  }
+
   function dateText(value) {
     if (!value) return "—";
     const parsed = new Date(value);
     return Number.isNaN(parsed.getTime()) ? String(value) : parsed.toLocaleString("ru-RU");
+  }
+
+  function dayText(value) {
+    if (!value) return "—";
+    const parsed = new Date(value);
+    return Number.isNaN(parsed.getTime()) ? String(value) : parsed.toLocaleDateString("ru-RU");
+  }
+
+  function plural(value, forms) {
+    const number = Math.abs(Math.trunc(Number(value) || 0)) % 100;
+    const last = number % 10;
+    if (number > 10 && number < 20) return forms[2];
+    if (last === 1) return forms[0];
+    if (last >= 2 && last <= 4) return forms[1];
+    return forms[2];
   }
 
   function numberValue(value) {
@@ -171,8 +230,9 @@
     const dialog = element("dialog", "workflow-dialog");
     const bar = element("div", "workflow-head");
     bar.append(element("h2", "", title));
-    const close = element("button", "secondary", "Закрыть ×");
+    const close = element("button", "secondary", "×");
     close.type = "button";
+    close.setAttribute("aria-label", "Закрыть");
     close.addEventListener("click", () => dialog.close());
     bar.append(close);
     const body = element("div", "workflow-body");
@@ -344,34 +404,94 @@
     }
   }
 
+  function previewPhotoURL(authorId, photoId) {
+    const profile = profileMap.get(Number(authorId));
+    const photo = ((profile && profile.photos) || []).find((item) => (
+      String(item.photo_id) === String(photoId) && item.available && localMediaURL(item.url)
+    ));
+    return photo ? localMediaURL(photo.url) : "";
+  }
+
+  function previewFrameURL(image) {
+    const video = videoMap.get(String(image.video_id || ""));
+    if (!video) return "";
+    const position = Number(image.position || 0);
+    const frame = (video.frames || []).find((item) => (
+      Number(item.position || 0) === position && item.available && localMediaURL(item.url)
+    )) || (video.frames || [])[position - 1];
+    return frame && frame.available ? localMediaURL(frame.url) : "";
+  }
+
+  function previewTile(label, url) {
+    const tile = element("div", "preview-tile");
+    if (url) {
+      const image = element("img", "");
+      image.loading = "lazy";
+      image.decoding = "async";
+      image.alt = label;
+      image.src = url;
+      tile.append(image);
+    }
+    tile.append(element("span", "", label));
+    return tile;
+  }
+
   function analysisPreview(preview, selector) {
     const imageMode = String(preview.image_mode || selector.image_mode || "photos");
     const selectedKey = imageMode === "photos" ? "selected_photo_ids" : "selected_image_ids";
-    const {dialog, body} = modal(
-      preview.source ? "Профили публикации" :
-        (preview.selected_count === 1 ? "Анализ профиля" : "Анализ выбранных профилей"),
-    );
-    const modeLabel = imageMode === "frames" ? "3 кадра видеокружка" :
-      (imageMode === "combined" ? "3 кадра + фото профиля" : "фотографии профиля");
+    const title = preview.source
+      ? clean(preview.source.channel_title || preview.source.title, `@${preview.source.username}`)
+      : (preview.selected_count === 1
+        ? clean(preview.items?.[0]?.display_name || preview.items?.[0]?.username, "Сохранённый профиль")
+        : "Анализ выбранных профилей");
+    const {dialog, body} = modal("Telegram AI · Предпросмотр");
+    body.append(element("div", "kicker workflow-kicker", preview.source
+      ? "ПУБЛИКАЦИЯ / ЛОКАЛЬНЫЕ ИЗОБРАЖЕНИЯ"
+      : "ПРОФИЛЬ / ЛОКАЛЬНЫЕ ИЗОБРАЖЕНИЯ"));
+    body.append(element("div", "workflow-title", title));
     body.append(element(
-      "p", "workflow-summary",
-      `Выбрано ${preview.selected_count} · источник: ${modeLabel}. `
-        + "На этом шаге запрос в DeepSeek не выполняется.",
+      "p", "muted",
+      "Выбери уже сохранённые изображения. Предпросмотр не вызывает AI и не передаёт данные наружу.",
     ));
     if (preview.source) {
-      const source = preview.source;
       body.append(element(
         "p", "muted",
-        `${clean(source.channel_title || source.title, `@${source.username}`)} #${source.post_id}`,
+        `${clean(preview.source.channel_title || preview.source.title, `@${preview.source.username}`)} #${preview.source.post_id}`,
       ));
     }
-    if (imageMode !== "photos") {
-      body.append(element(
-        "p", "muted",
-        "Кадры передаются в одном запросе в порядке 20% · 50% · 80%. "
-          + "Другой видеокружок автора можно выбрать из его карточки.",
-      ));
-    }
+
+    const modeLabels = {
+      photos: "Фото профиля",
+      frames: "Кадры кружка",
+      combined: "3 кадра + фото",
+    };
+    const modeChips = element("div", "mode-chips");
+    ["photos", "frames", "combined"].forEach((mode) => {
+      const button = element("button", `mode${mode === imageMode ? " active" : ""}`, modeLabels[mode]);
+      button.type = "button";
+      button.setAttribute("aria-pressed", mode === imageMode ? "true" : "false");
+      button.addEventListener("click", () => {
+        if (mode === imageMode) return;
+        dialog.close();
+        const base = {...selector};
+        delete base.image_mode;
+        loadAnalysis(base, mode);
+      });
+      modeChips.append(button);
+    });
+    body.append(modeChips);
+    body.append(element(
+      "p", "workflow-note",
+      "Промпт: встроенный Telegram PSL. Модель и лимиты берутся из сохранённой конфигурации AI.",
+    ));
+
+    const modeLabel = modeLabels[imageMode] || "фотографии профиля";
+    body.append(element(
+      "p", "workflow-summary",
+      `Выбрано ${preview.selected_count} · источник изображений: ${modeLabel}. `
+        + "На этом шаге запрос к провайдеру не выполняется.",
+    ));
+
     const pageLimit = Number(preview.limit || 25);
     const pages = new Map([[Number(preview.offset || 0), preview]]);
     const photoIds = {};
@@ -381,6 +501,7 @@
     const videoIds = {};
     let current = preview;
     let photoInputs = [];
+    const tileStrip = element("div", "preview-strip");
     function ingest(page) {
       (page.items || []).forEach((item) => {
         if (!validProfileId(item.author_id)) return;
@@ -417,6 +538,7 @@
     function renderPreviewPage(page) {
       current = page;
       photoInputs = [];
+      tileStrip.replaceChildren();
       const rows = [];
       const reasons = new Map();
       (page.items || []).forEach((item) => {
@@ -429,34 +551,79 @@
           : `${item.frame_count || 0} кадров${imageMode === "combined" ? " + фото" : ""}`;
         row.append(element("span", "muted", `ID ${item.author_id} · ${countLabel}`));
         if (imageMode === "photos" && preview.selected_count === 1) {
-          const photos = element("div", "photo-choices");
+          const choices = element("div", "photo-choices");
           const defaults = new Set(photoIds[String(item.author_id)] || []);
           (item.photos || []).filter((photo) => photo.available).forEach((photo) => {
-            const label = element("label", "check-row");
+            const label = element("label", "photo-choice");
             const input = element("input", "");
             input.type = "checkbox";
             input.value = String(photo.photo_id);
             input.checked = defaults.has(String(photo.photo_id));
             photoInputs.push(input);
-            label.append(input, element("span", "", `${photo.photo_id} · ${dateText(photo.date)}`));
-            photos.append(label);
+            const url = previewPhotoURL(item.author_id, photo.photo_id);
+            if (url) {
+              const image = element("img", "");
+              image.loading = "lazy";
+              image.decoding = "async";
+              image.alt = `Фото ${photo.photo_id}`;
+              image.src = url;
+              label.append(image);
+            }
+            label.append(input, element("span", "", `Фото · ${dayText(photo.date)}`));
+            choices.append(label);
           });
-          row.append(photos);
+          row.append(choices);
         }
-        if (imageMode !== "photos" && item.video_id) {
-          const frames = (item.selected_images || [])
-            .filter((image) => image.kind === "frame")
-            .map((image) => `${Number(image.timestamp_seconds || 0).toFixed(2)} с`);
-          row.append(element(
-            "span", "muted",
-            `видео ${item.video_id}` + (frames.length ? ` · ${frames.join(" · ")}` : ""),
-          ));
+        if (imageMode !== "photos") {
+          if (item.video_id) {
+            const choices = Array.isArray(item.videos) ? item.videos : [];
+            if (preview.selected_count === 1 && choices.length > 1) {
+              const videoField = element("label", "field");
+              videoField.append(element("span", "", "Сохранённый видеокружок"));
+              const select = element("select", "");
+              choices.forEach((video) => {
+                const option = element("option", "", `Кружок · сообщение #${video.message_id}`);
+                option.value = String(video.video_id);
+                option.selected = String(video.video_id) === String(item.video_id);
+                select.append(option);
+              });
+              select.addEventListener("change", () => {
+                const base = {...selector};
+                delete base.image_mode;
+                base.video_ids = {...(selector.video_ids || {}), [String(item.author_id)]: select.value};
+                dialog.close();
+                loadAnalysis(base, imageMode);
+              });
+              videoField.append(select);
+              row.append(videoField);
+            }
+            const frames = (item.selected_images || [])
+              .filter((image) => image.kind === "frame")
+              .map((image) => `${Number(image.timestamp_seconds || 0).toFixed(2)} с`);
+            row.append(element(
+              "span", "muted",
+              `видео ${item.video_id}` + (frames.length ? ` · ${frames.join(" · ")}` : ""),
+            ));
+            (item.selected_images || []).filter((image) => image.kind === "frame").forEach((image) => {
+              if (preview.selected_count !== 1) return;
+              const url = previewFrameURL(image);
+              const label = `Кадр ${image.position} · ${Number(image.timestamp_seconds || 0).toFixed(2)} с`;
+              tileStrip.append(previewTile(label, url));
+            });
+            (item.selected_images || []).filter((image) => image.kind === "profile_photo").forEach((image) => {
+              if (preview.selected_count !== 1) return;
+              const url = previewPhotoURL(item.author_id, image.image_id);
+              tileStrip.append(previewTile("Фото профиля", url));
+            });
+          }
         }
         const previous = item.previous;
-        if (previous) row.append(element(
-          "span", "muted",
-          `Предыдущий: ${previous.result_status || previous.attempt_state || "—"}`,
-        ));
+        if (previous) {
+          row.append(element(
+            "span", "muted",
+            `Предыдущий результат: ${previous.result_status || previous.attempt_state || "—"}`,
+          ));
+        }
         if (!(item[selectedKey] || []).length) {
           const reason = item.reason || "Будет пропущен";
           reasons.set(reason, (reasons.get(reason) || 0) + 1);
@@ -469,6 +636,8 @@
       skippedSummary.textContent = [...reasons].map(([reason, count]) => `${reason}: ${count}`).join(" · ");
       previousPage.disabled = Number(page.offset || 0) <= 0;
       nextPage.disabled = !page.has_more;
+      pageActions.hidden = preview.selected_count <= pageLimit;
+      tileStrip.hidden = !tileStrip.childNodes.length;
     }
     previousPage.type = nextPage.type = "button";
     previousPage.addEventListener("click", async () => {
@@ -477,12 +646,15 @@
     nextPage.addEventListener("click", async () => {
       renderPreviewPage(await loadPage(Number(current.offset || 0) + pageLimit));
     });
-    const pageActions = element("div", "interactive-actions");
-    pageActions.append(previousPage, nextPage);
-    body.append(pageLabel, list, skippedSummary, pageActions);
+    const pageActions = element("div", "workflow-page-actions");
+    const pageNavigation = element("div", "interactive-actions");
+    pageNavigation.append(previousPage, nextPage);
+    pageActions.append(pageLabel, pageNavigation);
+    body.append(pageActions, list, skippedSummary, tileStrip);
     renderPreviewPage(preview);
+
     body.append(element(
-      "p", "muted",
+      "p", "workflow-note",
       "Возрастной допуск 18+ применяется автоматически. Будут отправлены только выбранные "
         + "локальные изображения; запрос DeepSeek может быть платным, автоматического повтора нет.",
     ));
@@ -491,8 +663,9 @@
       imageMode === "photos" ? preview.selected_photo_count : preview.selected_image_count
     );
     const noun = imageMode === "photos" ? "фото" : "изображений";
+    const footer = element("div", "workflow-footer");
     const start = element(
-      "button", "primary-action", `Отправить ${count} ${noun} в DeepSeek и запустить анализ`,
+      "button", "primary-action", `Запустить анализ · ${count} ${noun}`,
     );
     start.type = "button";
     start.addEventListener("click", async () => {
@@ -550,7 +723,9 @@
         start.disabled = false;
       }
     });
-    body.append(feedback, start);
+    feedback.addEventListener("click", () => { feedback.textContent = ""; });
+    footer.append(feedback, start);
+    body.append(footer);
   }
 
   async function loadAnalysis(selector, imageMode = "photos") {
@@ -605,9 +780,10 @@
     settings.addEventListener("click", () => ensureAI(() => {
       showNotice("Новый API-ключ сохранён; он проверится при следующем запросе.");
     }, true));
-    document.querySelector(".switcher").append(settings);
-    const footer = document.querySelector("footer");
-    if (footer) footer.append(" · интерактивный localhost-режим");
+    const topEnd = byId("top-end");
+    if (topEnd) topEnd.append(settings);
+    const footer = document.querySelector("footer .footer-row");
+    if (footer) footer.append(element("span", "", "интерактивный localhost-режим"));
     api("/api/config").then((config) => {
       const labels = {
         not_configured: "Добавить API-ключ",
@@ -626,7 +802,7 @@
   }
 
   function selectionControls(profile) {
-    const actions = element("div", "interactive-actions");
+    const actions = element("div", "interactive-actions selection-row");
     if (!validProfileId(profile.author_id)) return actions;
     const label = element("label", "check-row");
     const checkbox = element("input", "");
@@ -639,13 +815,13 @@
       else selectedProfiles.delete(id);
       saveInteractiveState();
       const global = byId("analyze-selected");
-      if (global) global.textContent = `Анализировать выбранные (${selectedProfiles.size})`;
+      if (global) {
+        global.textContent = `Анализировать выбранные (${selectedProfiles.size})`;
+        global.hidden = !selectedProfiles.size;
+      }
     });
     label.append(checkbox, element("span", "", "Выбрать"));
-    const analyze = element("button", "secondary", "Анализировать профиль");
-    analyze.type = "button";
-    analyze.addEventListener("click", () => beginAnalysis({author_ids: [Number(profile.author_id)]}));
-    actions.append(label, analyze);
+    actions.append(label);
     return actions;
   }
 
@@ -690,8 +866,9 @@
 
   function avatar(profile, large = false) {
     const photo = profilePhotos(profile)[0];
-    if (!photo) return element("div", `avatar initials${large ? " large" : ""}`, initials(profile));
-    const image = element("img", "avatar");
+    const className = `avatar${large ? " large" : ""}`;
+    if (!photo) return element("div", `${className} initials`, initials(profile));
+    const image = element("img", className);
     image.loading = "lazy";
     image.decoding = "async";
     image.alt = "";
@@ -861,6 +1038,14 @@
     history[method]({hoard: true, route, depth, scrollY: 0}, "", destination);
     renderRoute(route);
     window.scrollTo(0, 0);
+    focusTitle();
+  }
+
+  function focusTitle() {
+    const title = byId("title");
+    if (!title || typeof title.focus !== "function") return;
+    title.tabIndex = -1;
+    title.focus({preventScroll: true});
   }
 
   function goBack(fallback) {
@@ -919,7 +1104,7 @@
       image.src = url;
       stage.append(image);
     }
-    byId("viewer-label").textContent = viewerState.label;
+    byId("viewer-label").textContent = `Просмотр · ${viewerState.label}`;
     byId("viewer-position").textContent = `${viewerState.index + 1} / ${viewerState.items.length}`;
     byId("viewer-previous").disabled = viewerState.items.length < 2;
     byId("viewer-next").disabled = viewerState.items.length < 2;
@@ -1065,85 +1250,101 @@
   }
 
   function profileCard(profile, origin) {
-    const card = element("article", "card profile-card");
-    const button = element("button", "card-action");
+    const card = element("article", "card person-card");
+    const button = element("button", "person-main");
     button.type = "button";
-    const body = element("div", "card-body");
-    body.append(avatar(profile));
-    const copy = element("div", "profile-copy");
-    copy.append(element("div", "card-title", clean(profile.display_name, `ID ${profile.author_id}`)));
-    copy.append(element("div", "eyebrow", profile.username ? `@${profile.username}` : "без username"));
-    copy.append(meta([
-      `ID ${profile.author_id}`,
-      `${profilePhotos(profile).length} фото`,
-      `${(profile.video_ids || []).length} кружков`,
-      `${(profile.post_ids || []).length} источников`,
-      `активность: ${dateText(profile.last_activity || profile.last_seen)}`,
-    ]));
+    const head = element("div", "person-head");
+    head.append(avatar(profile));
+    const info = element("div", "person-info");
+    info.append(element("div", "person-name", clean(profile.display_name, `ID ${profile.author_id}`)));
+    info.append(element("div", "person-handle", profile.username ? `@${profile.username}` : "без username"));
+    info.append(element(
+      "div", "person-id mono", `ID ${profile.author_id}`,
+    ));
+    head.append(info);
     const psl = latestPSL(profile);
-    if (psl) copy.append(element("span", "psl-badge", `PSL ${scoreText(psl.raw_psl_min)}–${scoreText(psl.raw_psl_max)}`));
-    body.append(copy);
-    button.append(body);
+    if (psl) head.append(element("span", "mini-psl", `PSL ${scoreText(psl.raw_psl_min)}–${scoreText(psl.raw_psl_max)}`));
+    const stats = element("div", "person-stats");
+    [
+      ["photo", `${profilePhotos(profile).length} ${plural(profilePhotos(profile).length, ["фото", "фото", "фото"])}`],
+      ["video", `${(profile.video_ids || []).length} ${plural((profile.video_ids || []).length, ["кружок", "кружка", "кружков"])}`],
+      ["link", `${(profile.post_ids || []).length} ${plural((profile.post_ids || []).length, ["источник", "источника", "источников"])}`],
+    ].forEach(([name, text]) => {
+      const item = element("span", "person-stat");
+      item.append(icon(name), element("span", "", text));
+      stats.append(item);
+    });
+    const date = element("div", "person-date");
+    date.append(
+      element("em", "", `Активность: ${dateText(profile.last_activity || profile.last_seen)}`),
+      element("span", "", "Открыть →"),
+    );
+    button.append(head, stats, date);
     button.addEventListener("click", () => navigate({type: "profile", id: Number(profile.author_id), origin}));
     card.append(button);
     if (interactiveEnabled) card.append(selectionControls(profile));
     return card;
   }
 
-  function postPreview(post, container) {
+  function postPreview(post) {
     const item = (post.media || []).find(available);
-    if (!item) return;
-    const preview = element("div", "card-preview");
-    const isVideo = isVideoItem(item);
-    if (isVideo) {
-      preview.append(element("div", "video-placeholder", "Видео · откройте публикацию"));
+    if (!item) return null;
+    const cover = element("div", "source-cover");
+    if (isVideoItem(item)) {
+      cover.append(element("div", "video-placeholder", "▶ Видео"));
     } else {
-      const button = element("button", "media-button");
-      button.type = "button";
-      button.setAttribute("aria-label", "Открыть изображение публикации");
       const image = element("img", "");
       image.loading = "lazy";
       image.decoding = "async";
       image.alt = "Медиа публикации";
       image.src = localMediaURL(item.url);
-      button.append(image);
-      button.addEventListener("click", () => openViewer(post.media || [], (post.media || []).indexOf(item), "Медиа публикации"));
-      preview.append(button);
+      cover.append(image);
     }
-    container.append(preview);
+    cover.append(element("span", "source-id", `#${post.post_id}`));
+    return cover;
   }
 
   function postCard(post) {
-    const card = element("article", "card post-card");
-    const button = element("button", "card-action");
+    const card = element("article", "source-card");
+    const button = element("button", "source-main");
     button.type = "button";
-    const body = element("div", "card-body");
-    body.append(element("div", "eyebrow", post.channel_username ? `@${post.channel_username}` : "Telegram"));
-    body.append(element("div", "card-title", clean(post.channel_title, `Пост #${post.post_id}`)));
-    if (post.text) body.append(element("div", "excerpt", post.text));
-    body.append(meta([
-      `пост ${post.post_id}`,
-      `опубликован: ${dateText(post.published_at)}`,
-      `проверен: ${dateText(post.last_checked_at)}`,
-    ]));
-    const metrics = element("div", "metrics");
-    metrics.append(
-      element("span", "metric", `${post.author_count || 0} профилей`),
-      element("span", "metric", `${post.video_note_count || 0} кружков`),
+    const preview = postPreview(post);
+    if (preview) button.append(preview);
+    const copy = element("div", "");
+    const handle = [
+      post.channel_username ? `@${post.channel_username}` : "Telegram",
+      `#${post.post_id}`,
+    ].join(" · ");
+    copy.append(element("div", "source-handle", handle));
+    copy.append(element("div", "source-title", clean(post.channel_title, `Пост #${post.post_id}`)));
+    copy.append(element(
+      "div", "excerpt source-desc",
+      post.text || "Текст публикации не сохранён.",
+    ));
+    const stats = element("div", "source-stat");
+    stats.append(
+      element("span", "", `${post.author_count || 0} ${plural(post.author_count || 0, ["профиль", "профиля", "профилей"])}`),
+      element("span", "", `${post.video_note_count || 0} ${plural(post.video_note_count || 0, ["кружок", "кружка", "кружков"])}`),
+      element("span", "source-time", dateText(post.published_at)),
     );
-    body.append(metrics);
-    button.append(body);
+    copy.append(stats);
+    button.append(copy);
     button.addEventListener("click", () => navigate({type: "post", id: Number(post.source_id)}));
     card.append(button);
-    postPreview(post, card);
+    const action = element("div", "source-action");
     if (interactiveEnabled) {
-      const actions = element("div", "interactive-actions");
-      const analyze = element("button", "secondary", "Анализировать профили");
+      const analyze = element("button", "source-ai", "Анализировать профили");
       analyze.type = "button";
       analyze.addEventListener("click", () => beginAnalysis({source_id: Number(post.source_id)}));
-      actions.append(analyze);
-      card.append(actions);
+      action.append(analyze);
+    } else {
+      action.append(element("span", "", "Сохранённая публикация"));
     }
+    const open = element("button", "source-open", "Открыть →");
+    open.type = "button";
+    open.addEventListener("click", () => navigate({type: "post", id: Number(post.source_id)}));
+    action.append(open);
+    card.append(action);
     return card;
   }
 
@@ -1152,11 +1353,20 @@
     return Object.values(filters).filter((value) => value && value !== "any").length;
   }
 
+  function setNavActive(view) {
+    byId("show-posts").classList.toggle("active", view === "posts");
+    byId("show-profiles").classList.toggle("active", view === "profiles");
+    byId("show-posts").setAttribute("aria-current", view === "posts" ? "page" : "false");
+    byId("show-profiles").setAttribute("aria-current", view === "profiles" ? "page" : "false");
+  }
+
   function syncToolbar(view) {
     toolbar.hidden = false;
     profileFilters.hidden = view !== "profiles";
-    byId("show-posts").classList.toggle("active", view === "posts");
-    byId("show-profiles").classList.toggle("active", view === "profiles");
+    setNavActive(view);
+    queryInput.placeholder = view === "profiles"
+      ? "Имя, @username, Telegram ID или источник"
+      : "Название, @канал или текст публикации";
     const list = lists[view];
     if (queryInput.value !== list.query) queryInput.value = list.query;
     const choices = view === "profiles" ? profileSorts : postSorts;
@@ -1182,18 +1392,66 @@
       const count = activeFilterCount();
       byId("filter-count").textContent = count ? `· ${count}` : "";
     }
+    const analyzeSelected = byId("analyze-selected");
+    if (analyzeSelected) {
+      analyzeSelected.hidden = view !== "profiles" || !selectedProfiles.size;
+    }
   }
 
-  function updatePager(items, view) {
-    const list = lists[view];
-    const pages = Math.max(1, Math.ceil(items.length / PAGE_SIZE));
-    list.page = Math.max(0, Math.min(list.page, pages - 1));
-    const pager = byId("pager");
-    pager.hidden = items.length <= PAGE_SIZE;
-    byId("page-label").textContent = `${list.page + 1} / ${pages}`;
-    byId("previous").disabled = list.page === 0;
-    byId("next").disabled = list.page >= pages - 1;
-    return items.slice(list.page * PAGE_SIZE, (list.page + 1) * PAGE_SIZE);
+  function incrementalBlock(items, pageSize, initial, onLoaded, renderItem, gridClass) {
+    const root = element("div", "incremental-block");
+    const grid = element("div", gridClass);
+    const marker = element("div", "load-marker");
+    const area = element("div", "load-area");
+    area.setAttribute("aria-live", "polite");
+    let loaded = Math.max(0, Math.min(items.length, Math.trunc(initial) || 0));
+    if (!loaded && items.length) loaded = Math.min(items.length, pageSize);
+    const draw = (from, to) => {
+      for (let index = from; index < to; index += 1) {
+        grid.append(renderItem(items[index], index));
+      }
+    };
+    const fallback = element("button", "secondary load-more", "Показать ещё");
+    fallback.type = "button";
+    fallback.addEventListener("click", () => loadMore());
+    const update = () => {
+      onLoaded(loaded);
+      area.replaceChildren();
+      if (loaded < items.length) {
+        area.append(
+          element("div", "", "Подгружаем записи по мере прокрутки"),
+          element("div", "sub", `Показано ${loaded} из ${items.length}`),
+        );
+        if (!("IntersectionObserver" in window)) area.append(fallback);
+        marker.hidden = false;
+      } else {
+        area.append(
+          element("div", "", `Показано ${items.length} записей`),
+          element("div", "sub", "Конец списка"),
+        );
+        marker.hidden = true;
+      }
+    };
+    const loadMore = () => {
+      if (loaded >= items.length) return;
+      const next = Math.min(items.length, loaded + pageSize);
+      draw(loaded, next);
+      loaded = next;
+      update();
+    };
+    draw(0, loaded);
+    update();
+    if (loaded < items.length) {
+      if ("IntersectionObserver" in window) {
+        const observer = new IntersectionObserver((entries) => {
+          if (entries.some((entry) => entry.isIntersecting)) loadMore();
+        }, {rootMargin: "600px 0px"});
+        observer.observe(marker);
+        observers.push(observer);
+      }
+    }
+    root.append(grid, marker, area);
+    return root;
   }
 
   function emptyState(label, allowReset) {
@@ -1211,98 +1469,181 @@
   function renderList(view) {
     currentRoute = listRoute(view);
     saveInteractiveState();
+    disconnectObservers();
     syncToolbar(view);
+    byId("list-meta").hidden = false;
     const analyzeSelected = byId("analyze-selected");
-    if (analyzeSelected) analyzeSelected.hidden = view !== "profiles";
-    byId("title").textContent = view === "posts" ? "Сохранённые публикации" : "Все профили";
+    if (analyzeSelected) analyzeSelected.hidden = view !== "profiles" || !selectedProfiles.size;
+    const titleText = view === "posts" ? "Источники" : "Все профили";
     const source = view === "profiles" ? filteredProfiles() : filteredPosts();
     const items = sorted(source, view);
+    const h1 = element("h1", "", titleText);
+    h1.id = "title";
+    const titleLine = element("div", "title-line");
+    titleLine.append(h1, element("span", "number", String(items.length)));
+    const head = element("div", "headrow");
+    const left = element("div", "head-left");
+    left.append(
+      element("div", "kicker", "TELEGRAM / АРХИВ"),
+      titleLine,
+      element(
+        "p", "head-sub",
+        view === "profiles"
+          ? "Сохранённые профили, локальные фотографии и видеокружки"
+          : "Публикации, по которым Hoard сохраняет локальные материалы",
+      ),
+    );
+    head.append(left);
+    byId("page-head").replaceChildren(head);
+    const listMeta = byId("list-meta");
+    listMeta.replaceChildren(
+      element("strong", "", `${view === "profiles" ? "Профили" : "Сохранённые публикации"} · ${items.length}`),
+      element("span", "", "Локальные данные"),
+    );
     if (!items.length) {
-      byId("pager").hidden = true;
       const filtered = lists[view].query || (view === "profiles" && activeFilterCount());
       emptyState(filtered ? "Ничего не найдено" : "Каталог пока пуст", Boolean(filtered));
       return;
     }
-    const grid = element("div", "card-grid");
     const origin = listRoute("profiles");
-    updatePager(items, view).forEach((item) => {
-      grid.append(view === "profiles" ? profileCard(item, origin) : postCard(item));
-    });
-    content.replaceChildren(grid);
+    const root = incrementalBlock(
+      items,
+      PAGE_SIZE,
+      lists[view].visible,
+      (loaded) => { lists[view].visible = loaded; saveInteractiveState(); },
+      (item) => (view === "profiles" ? profileCard(item, origin) : postCard(item)),
+      view === "profiles" ? "person-grid" : "source-grid",
+    );
+    content.replaceChildren(root);
   }
 
-  function localPager(items, pageSize, key, renderItem, gridClass = "media-grid") {
-    const root = element("div", "");
-    const render = (requested) => {
-      const pages = Math.max(1, Math.ceil(items.length / pageSize));
-      const selected = Math.max(0, Math.min(requested, pages - 1));
-      sectionPages.set(key, selected);
-      const grid = element("div", gridClass);
-      items.slice(selected * pageSize, (selected + 1) * pageSize)
-        .forEach((item, offset) => grid.append(renderItem(item, selected * pageSize + offset)));
-      const nodes = [grid];
-      if (pages > 1) {
-        const controls = element("nav", "pager");
-        controls.setAttribute("aria-label", "Страницы раздела");
-        const previous = element("button", "", "← Назад");
-        const next = element("button", "", "Дальше →");
-        previous.disabled = selected === 0;
-        next.disabled = selected >= pages - 1;
-        previous.addEventListener("click", () => render(selected - 1));
-        next.addEventListener("click", () => render(selected + 1));
-        controls.append(previous, element("span", "", `${selected + 1} / ${pages}`), next);
-        nodes.push(controls);
-      }
-      root.replaceChildren(...nodes);
-    };
-    render(sectionPages.get(key) || 0);
-    return root;
+  function incrementalSection(items, pageSize, key, renderItem, gridClass = "media-grid") {
+    const saved = Number(sectionPages.get(key) || 0);
+    return incrementalBlock(
+      items,
+      pageSize,
+      saved || pageSize,
+      (loaded) => sectionPages.set(key, loaded),
+      renderItem,
+      gridClass,
+    );
+  }
+
+  function frameStatusMessage(video, frameCount) {
+    const status = clean(video.frame_status, "missing");
+    if (status === "running") return ["Обработка запущена вручную", ""];
+    if (status === "pending") return ["Ожидает ручной обработки", ""];
+    if (status === "failed") {
+      return [video.frame_error || "Кадры не извлечены; требуется ручной повтор", "error"];
+    }
+    if (status === "stale") {
+      return [
+        video.frame_error || "Кадры неполные или изменились; требуется повторное извлечение",
+        "error",
+      ];
+    }
+    if (status === "missing") return ["Кадры не извлечены", ""];
+    if (status === "saved" && !frameCount) return ["Кадры недоступны; требуется повторное извлечение", "error"];
+    return ["", ""];
   }
 
   function videoCard(video, gallery, index) {
-    const card = element("div", "media-card");
-    card.append(mediaNode(video, "video", "Видеокружок", gallery, index));
-    const frames = (video.frames || []).filter((frame) => frame && frame.available);
-    const frameStatus = clean(video.frame_status, "missing");
+    const card = element("article", "video-card");
+    const preview = element("div", "video-preview");
+    preview.append(mediaNode(video, "video", "Видеокружок", gallery, index));
+    card.append(preview);
+    const seconds = numberValue(video.frame_duration);
+    const duration = seconds && seconds > 0
+      ? `${String(Math.floor(seconds / 60)).padStart(2, "0")}:${String(Math.round(seconds % 60)).padStart(2, "0")}`
+      : "";
+    const label = element("div", "video-label");
+    label.append(
+      element("span", "", `Кружок · комментарий #${video.message_id}`),
+      element("span", "", duration || dateText(video.message_date)),
+    );
+    card.append(label);
+    const frames = (video.frames || []).filter((frame) => frame && frame.available && localMediaURL(frame.url));
+    const [statusText, statusClass] = frameStatusMessage(video, frames.length);
     if (frames.length) {
       const strip = element("div", "frame-strip");
       frames.forEach((frame, frameIndex) => {
+        const button = element("button", "frame");
+        button.type = "button";
         const image = element("img", "frame-thumb");
         image.loading = "lazy";
         image.decoding = "async";
         image.alt = `Кадр ${frame.position}`;
         image.src = localMediaURL(frame.url);
-        image.title = `Кадр ${frame.position} · ${Number(frame.timestamp_seconds || 0).toFixed(2)} с`;
-        image.addEventListener("click", () => openViewer(frames, frameIndex, `Кадр ${frame.position}`));
-        strip.append(image);
+        button.append(image);
+        const percent = [20, 50, 80][Number(frame.position) - 1] || "";
+        button.append(element("span", "frame-percent", `${percent}%`));
+        button.title = `Кадр ${frame.position} · ${Number(frame.timestamp_seconds || 0).toFixed(2)} с`;
+        button.addEventListener("click", () => openViewer(frames, frameIndex, `Кадр ${frame.position}`));
+        strip.append(button);
       });
       card.append(strip);
-      card.append(element("span", "muted", "3 кадра одного видео: 20% · 50% · 80%"));
-    } else if (frameStatus === "failed" || frameStatus === "stale") {
-      card.append(element(
-        "span", "workflow-reason",
-        frameStatus === "stale"
-          ? "Кадры изменились или неполные; нужно повторное извлечение"
-          : (video.frame_error || "Кадры не извлечены"),
-      ));
-    } else if (frameStatus === "pending" || frameStatus === "running") {
-      card.append(element("span", "muted", "Кадры извлекаются локально…"));
+      card.append(element("span", "video-status", "3 кадра одного видео: 20% · 50% · 80%"));
+    } else if (statusText) {
+      card.append(element("span", `video-status${statusClass ? " error" : ""}`, statusText));
     }
+    const actions = element("div", "video-actions");
+    const view = element("button", "secondary", "Просмотр");
+    view.type = "button";
+    view.addEventListener("click", () => openViewer(gallery, index, "Видеокружок"));
+    actions.append(view);
     if (interactiveEnabled && validProfileId(video.author_id)) {
-      const actions = element("div", "detail-actions");
-      const analyze = element("button", "secondary", "AI по кадрам");
+      const analyze = element("button", "ai-action", "AI по кадрам");
       analyze.type = "button";
       analyze.disabled = frames.length !== 3;
+      analyze.title = frames.length === 3
+        ? "Отправить три готовых кадра в существующий AI-предпросмотр"
+        : "AI по кадрам доступен только для готового набора из трёх кадров";
       analyze.addEventListener("click", () => beginAnalysis(
         {author_ids: [Number(video.author_id)], video_ids: {[String(video.author_id)]: video.video_id}},
         "frames",
       ));
       actions.append(analyze);
-      card.append(actions);
     }
-    card.append(meta([`комментарий ${video.message_id}`, dateText(video.message_date)]));
-    card.append(originalLink(video.comment_url, "Исходный комментарий"));
+    card.append(actions);
+    const footer = element("div", "meta");
+    footer.append(
+      element("span", "", dateText(video.message_date)),
+      originalLink(video.comment_url, "Исходный комментарий"),
+    );
+    card.append(footer);
     return card;
+  }
+
+  function prepareDetail() {
+    disconnectObservers();
+    toolbar.hidden = true;
+    profileFilters.hidden = true;
+    byId("list-meta").hidden = true;
+    byId("page-head").replaceChildren();
+  }
+
+  function detailHero(kicker, title, subtitle, actions, metrics, intro) {
+    const hero = element("div", "detail-hero");
+    hero.append(element("div", "kicker", kicker));
+    const top = element("div", "detail-top");
+    const identity = element("div", "detail-identity");
+    const h1 = element("h1", "detail-name", title);
+    h1.id = "title";
+    identity.append(h1);
+    if (subtitle) identity.append(element("div", "detail-handle", subtitle));
+    top.append(identity);
+    if (actions) top.append(actions);
+    hero.append(top);
+    if (intro) hero.append(element("p", "post-intro", intro));
+    if (metrics) hero.append(metrics);
+    return hero;
+  }
+
+  function metricChip(label, value) {
+    const chip = element("span", "metric");
+    if (value !== undefined) chip.append(element("b", "", String(value)));
+    chip.append(document.createTextNode(label));
+    return chip;
   }
 
   function showPost(sourceId) {
@@ -1312,82 +1653,159 @@
       return;
     }
     currentRoute = {type: "post", id: Number(sourceId)};
-    toolbar.hidden = true;
-    byId("pager").hidden = true;
-    byId("title").textContent = clean(post.channel_title, `@${post.channel_username}`);
+    prepareDetail();
+    setNavActive("posts");
     const root = element("div", "detail");
     root.append(backButton(listRoute("posts"), "к источникам"));
-    const heading = element("div", "detail-head");
-    const body = element("div", "profile-copy");
-    body.append(element("div", "eyebrow", post.channel_username ? `@${post.channel_username}` : "Telegram"));
-    body.append(originalLink(post.url, `Открыть исходный пост #${post.post_id}`));
-    if (post.text) body.append(element("p", "excerpt", post.text));
-    body.append(meta([
-      `опубликован: ${dateText(post.published_at)}`,
-      `проверен: ${dateText(post.last_checked_at)}`,
-      `${post.video_note_count || 0} кружков`,
-      `${post.author_count || 0} профилей`,
-      clean(post.last_error || post.last_result, post.enabled ? "ожидает проверки" : "источник отключён"),
-    ]));
-    heading.append(body);
-    root.append(heading);
+
+    const actions = element("div", "detail-actions");
     if (interactiveEnabled) {
-      const actions = element("div", "detail-actions");
-      const analyzeAll = element("button", "primary-action", "Анализировать все локальные профили публикации");
+      const analyzeAll = element("button", "primary-action", "Анализировать профили");
       analyzeAll.type = "button";
+      analyzeAll.setAttribute("aria-label", "Анализировать все локальные профили публикации");
       analyzeAll.addEventListener("click", () => beginAnalysis({source_id: Number(sourceId)}));
-      const analyzeSelected = element("button", "secondary", "Анализировать выбранные");
-      analyzeSelected.type = "button";
-      analyzeSelected.addEventListener("click", () => {
+      actions.append(analyzeAll);
+    }
+    const metrics = element("div", "detail-metrics");
+    metrics.append(
+      metricChip(` ${plural(post.author_count || 0, ["профиль", "профиля", "профилей"])}`, post.author_count || 0),
+      metricChip(` ${plural(post.video_note_count || 0, ["кружок", "кружка", "кружков"])}`, post.video_note_count || 0),
+    );
+    const checked = element("span", "metric");
+    checked.append(document.createTextNode("Проверено: "), element("b", "", dateText(post.last_checked_at)));
+    metrics.append(checked);
+    if (post.published_at) {
+      const published = element("span", "metric");
+      published.append(document.createTextNode("Опубликовано: "), element("b", "", dateText(post.published_at)));
+      metrics.append(published);
+    }
+    const subtitleParts = [post.channel_username ? `@${post.channel_username}` : "", `публикация #${post.post_id}`].filter(Boolean);
+    root.append(detailHero(
+      "TELEGRAM / СОХРАНЁННАЯ ПУБЛИКАЦИЯ",
+      clean(post.channel_title, `Пост #${post.post_id}`),
+      subtitleParts.join(" · "),
+      actions,
+      metrics,
+      post.text || "",
+    ));
+
+    const columns = element("div", "detail-columns");
+    const main = element("div", "detail-main");
+    const aside = element("div", "detail-aside");
+
+    const media = (post.media || []).filter(available);
+    if (media.length) {
+      const body = incrementalSection(
+        media, MEDIA_PAGE_SIZE, `post-media:${sourceId}`,
+        (item, index) => mediaNode(item, item.kind, "Медиа публикации", media, index),
+        "media-grid",
+      );
+      main.append(sectionBlock("Медиа публикации", `${media.length} ${plural(media.length, ["файл", "файла", "файлов"])}`, body, ""));
+    }
+
+    const postVideos = (post.video_ids || []).map((id) => videoMap.get(String(id))).filter(Boolean);
+    const videosBody = postVideos.length
+      ? incrementalSection(
+        postVideos, VIDEO_PAGE_SIZE, `post-videos:${sourceId}`,
+        (video, index) => videoCard(video, postVideos, index),
+        "note-grid",
+      )
+      : element("p", "muted", "Видеокружков пока нет");
+    main.append(sectionBlock(
+      "Видеокружки",
+      `${postVideos.length} ${plural(postVideos.length, ["кружок", "кружка", "кружков"])}`,
+      videosBody,
+      "Готовые кадры из локально сохранённых MP4; извлечение запускается вручную в TUI.",
+    ));
+
+    const related = (post.profile_ids || []).map((id) => profileMap.get(Number(id))).filter(Boolean);
+    const relatedBody = related.length
+      ? incrementalSection(
+        related, PAGE_SIZE, `post-profiles:${sourceId}`,
+        (profile) => profileCard(profile, {type: "post", id: Number(sourceId)}),
+        "source-profile-grid",
+      )
+      : element("p", "muted", "Профили пока не найдены");
+    main.append(sectionBlock(
+      "Связанные профили",
+      `${related.length} ${plural(related.length, ["профиль", "профиля", "профилей"])} в архиве`,
+      relatedBody,
+      "Профили, сохранённые из комментариев этой публикации",
+    ));
+    columns.append(main);
+
+    const sourceInfo = element("div", "properties aside-box");
+    sourceInfo.append(element("div", "prop-heading", "Информация об источнике"));
+    const list = element("dl", "");
+    const rows = [
+      ["Канал", post.channel_username ? `@${post.channel_username}` : "—"],
+      ["ID публикации", String(post.post_id)],
+      ["Профили", String(post.author_count || 0)],
+      ["Видеокружки", String(post.video_note_count || 0)],
+      ["Последняя проверка", dateText(post.last_checked_at)],
+      ["Статус", clean(post.last_error || post.last_result, post.enabled ? "ожидает проверки" : "источник отключён")],
+    ];
+    rows.forEach(([label, value]) => {
+      const row = element("div", "prop-row");
+      row.append(element("dt", "", label), element("dd", "", value));
+      list.append(row);
+    });
+    sourceInfo.append(list);
+    if (post.url) sourceInfo.append(originalLink(post.url, `Открыть пост #${post.post_id}`));
+    aside.append(sourceInfo);
+
+    if (interactiveEnabled) {
+      const analysis = element("div", "properties aside-box");
+      analysis.append(element("div", "prop-heading", "Анализ публикации"));
+      analysis.append(element(
+        "p", "muted",
+        "Выбор сохранённых профилей и локальных изображений перед AI-запросом. "
+          + "Предпросмотр не отправляет данные провайдеру.",
+      ));
+      const open = element("button", "primary-action", "Открыть предпросмотр");
+      open.type = "button";
+      open.style.width = "100%";
+      open.style.marginTop = ".7rem";
+      open.addEventListener("click", () => beginAnalysis({source_id: Number(sourceId)}));
+      analysis.append(open);
+      const selected = element("button", "secondary", "Анализировать выбранные");
+      selected.type = "button";
+      selected.style.width = "100%";
+      selected.style.marginTop = ".4rem";
+      selected.addEventListener("click", () => {
         const relatedIds = new Set((post.profile_ids || []).map(Number));
         const ids = [...selectedProfiles].filter((id) => relatedIds.has(id));
         if (!ids.length) showNotice("Сначала выбери профили этой публикации.", true);
         else beginAnalysis({author_ids: ids});
       });
-      actions.append(analyzeAll, analyzeSelected);
-      root.append(actions);
+      analysis.append(selected);
+      aside.append(analysis);
     }
+    columns.append(aside);
 
-    if ((post.media || []).length) {
-      root.append(element("h2", "section-title", "Медиа публикации"));
-      root.append(localPager(post.media, MEDIA_PAGE_SIZE, `post-media:${sourceId}`, (item, index) => (
-        mediaNode(item, item.kind, "Медиа публикации", post.media || [], index)
-      )));
-    }
-
-    const postVideos = (post.video_ids || []).map((id) => videoMap.get(String(id))).filter(Boolean);
-    root.append(element("h2", "section-title", "Видеокружки"));
-    if (!postVideos.length) root.append(element("p", "muted", "Видеокружков пока нет"));
-    else root.append(localPager(postVideos, VIDEO_PAGE_SIZE, `post-videos:${sourceId}`, (video, index) => (
-      videoCard(video, postVideos, index)
-    )));
-
-    const related = (post.profile_ids || []).map((id) => profileMap.get(Number(id))).filter(Boolean);
-    root.append(element("h2", "section-title", "Связанные профили"));
-    if (!related.length) root.append(element("p", "muted", "Профили пока не найдены"));
-    else root.append(localPager(
-      related,
-      PAGE_SIZE,
-      `post-profiles:${sourceId}`,
-      (profile) => profileCard(profile, {type: "post", id: Number(sourceId)}),
-      "card-grid",
-    ));
+    root.append(columns);
     content.replaceChildren(root);
   }
 
   function linkedPosts(profile) {
-    const root = element("div", "detail-links");
-    (profile.post_ids || []).forEach((id) => {
-      const post = postMap.get(Number(id));
-      if (!post) return;
-      const row = element("div", "detail-link");
-      const button = element("button", "", `${clean(post.channel_title, post.channel_username)} #${post.post_id}`);
+    const postsForProfile = (profile.post_ids || [])
+      .map((id) => postMap.get(Number(id)))
+      .filter(Boolean);
+    if (!postsForProfile.length) return element("p", "muted", "Связанные публикации не сохранены");
+    const root = element("div", "inline-list");
+    postsForProfile.forEach((post) => {
+      const button = element("button", "inline-item");
       button.type = "button";
+      const copy = element("span", "");
+      copy.append(
+        element("strong", "", clean(post.channel_title, post.channel_username)),
+        element("small", "", post.channel_username ? `@${post.channel_username} · #${post.post_id}` : `#${post.post_id}`),
+      );
+      button.append(copy, element("span", "", "↗"));
       button.addEventListener("click", () => navigate({type: "post", id: Number(post.source_id)}));
-      row.append(button, originalLink(post.url, "Оригинал"));
-      root.append(row);
+      root.append(button);
     });
-    return root.childNodes.length ? root : element("p", "muted", "Связанные публикации не сохранены");
+    return root;
   }
 
   function pslMetrics(item) {
@@ -1429,36 +1847,19 @@
     }
     const fallback = origin?.type === "post" ? origin : listRoute("profiles");
     currentRoute = {type: "profile", id: Number(authorId), origin: fallback};
-    toolbar.hidden = true;
-    byId("pager").hidden = true;
-    byId("title").textContent = clean(profile.display_name, `ID ${profile.author_id}`);
+    prepareDetail();
+    setNavActive("profiles");
     const root = element("div", "detail");
     root.append(backButton(fallback, fallback.type === "post" ? "к публикации" : "ко всем профилям"));
-    const heading = element("div", "detail-head");
-    heading.append(avatar(profile, true));
-    const identity = element("div", "profile-copy");
-    identity.append(element("div", "card-title", clean(profile.display_name, "Имя не сохранено")));
-    identity.append(element("div", "eyebrow", profile.username ? `@${profile.username}` : "username не задан"));
-    identity.append(meta([
-      `Telegram ID ${profile.author_id}`,
-      `впервые: ${dateText(profile.first_seen)}`,
-      `активность: ${dateText(profile.last_activity || profile.last_seen)}`,
-      `${profilePhotos(profile).length} фото`,
-      `${(profile.video_ids || []).length} кружков`,
-      `${(profile.post_ids || []).length} источников`,
-    ]));
-    const latest = latestPSL(profile);
-    if (latest) identity.append(element("span", "psl-badge", `PSL ${scoreText(latest.raw_psl_min)}–${scoreText(latest.raw_psl_max)}`));
-    heading.append(identity);
-    root.append(heading);
+
+    const actions = element("div", "detail-actions");
     if (interactiveEnabled && validProfileId(authorId)) {
-      const actions = element("div", "detail-actions");
-      const analyze = element("button", "primary-action", "Анализировать фото профиля");
+      const analyze = element("button", "primary-action", "AI по фото");
       analyze.type = "button";
       analyze.addEventListener("click", () => beginAnalysis({author_ids: [Number(authorId)]}));
       actions.append(analyze);
       if ((profile.video_ids || []).length) {
-        const frameAnalyze = element("button", "secondary", "Анализировать по кадрам");
+        const frameAnalyze = element("button", "secondary", "AI по кадрам");
         frameAnalyze.type = "button";
         frameAnalyze.addEventListener(
           "click", () => beginAnalysis({author_ids: [Number(authorId)]}, "frames")
@@ -1473,65 +1874,163 @@
           actions.append(combined);
         }
       }
-      root.append(actions);
     }
-
-    root.append(element("h2", "section-title", "История username"));
-    const usernames = profile.username_history || [];
-    if (!usernames.length) root.append(element("p", "muted", "Username не наблюдался"));
-    else {
-      const history = element("ul", "history");
-      usernames.forEach((item) => history.append(element(
-        "li", "", `@${item.username} · ${dateText(item.first_seen)} — ${dateText(item.last_seen)}`,
-      )));
-      root.append(history);
+    const latest = latestPSL(profile);
+    const metrics = element("div", "detail-metrics");
+    metrics.append(
+      metricChip(` ${plural(profilePhotos(profile).length, ["фото", "фото", "фото"])}`, profilePhotos(profile).length),
+      metricChip(` ${plural((profile.video_ids || []).length, ["кружок", "кружка", "кружков"])}`, (profile.video_ids || []).length),
+      metricChip(` ${plural((profile.post_ids || []).length, ["источник", "источника", "источников"])}`, (profile.post_ids || []).length),
+    );
+    if (latest) {
+      const badge = element("span", "psl-badge", `PSL ${scoreText(latest.raw_psl_min)}–${scoreText(latest.raw_psl_max)}`);
+      metrics.append(badge);
     }
-
-    root.append(element("h2", "section-title", "Связанные публикации"), linkedPosts(profile));
-
-    root.append(element("h2", "section-title", "Фотографии"));
-    const photos = profilePhotos(profile);
-    if (!photos.length) root.append(element(
-      "p", "muted", profile.photo_error || "Доступных локальных фотографий нет",
+    const hero = element("div", "detail-hero");
+    hero.append(element("div", "kicker", "TELEGRAM / СОХРАНЁННЫЙ ПРОФИЛЬ"));
+    const top = element("div", "detail-top");
+    const identity = element("div", "detail-identity");
+    const h1 = element("h1", "detail-name", clean(profile.display_name, `ID ${profile.author_id}`));
+    h1.id = "title";
+    identity.append(h1);
+    identity.append(element(
+      "div", "detail-handle",
+      `${profile.username ? `@${profile.username}` : "username не задан"} · ID ${profile.author_id}`,
     ));
-    else root.append(localPager(photos, MEDIA_PAGE_SIZE, `profile-photos:${authorId}`, (photo, index) => (
-      mediaNode(photo, "image", "Фото профиля", photos, index)
-    )));
+    top.append(avatar(profile, true), identity, actions);
+    hero.append(top, metrics);
+    root.append(hero);
 
-    root.append(element("h2", "section-title", "Видеокружки"));
+    const columns = element("div", "detail-columns");
+    const main = element("div", "detail-main");
+    const aside = element("div", "detail-aside");
+
+    const photos = profilePhotos(profile);
+    const photosBody = photos.length
+      ? incrementalSection(
+        photos, MEDIA_PAGE_SIZE, `profile-photos:${authorId}`,
+        (photo, index) => mediaNode(photo, "image", "Фото профиля", photos, index),
+        "photo-grid",
+      )
+      : element("p", "muted", profile.photo_error || "Доступных локальных фотографий нет");
+    main.append(sectionBlock(
+      "Фотографии",
+      `${photos.length} ${plural(photos.length, ["фото", "фото", "фото"])}`,
+      photosBody,
+      "Локально сохранённые фотографии профиля",
+    ));
+
     const profileVideos = (profile.video_ids || []).map((id) => videoMap.get(String(id))).filter(Boolean);
-    if (!profileVideos.length) root.append(element("p", "muted", "Видеокружков нет"));
-    else root.append(localPager(profileVideos, VIDEO_PAGE_SIZE, `profile-videos:${authorId}`, (video, index) => (
-      videoCard(video, profileVideos, index)
-    )));
+    const videosBody = profileVideos.length
+      ? incrementalSection(
+        profileVideos, VIDEO_PAGE_SIZE, `profile-videos:${authorId}`,
+        (video, index) => videoCard(video, profileVideos, index),
+        "note-grid",
+      )
+      : element("p", "muted", "Сохранённых видеокружков нет");
+    main.append(sectionBlock(
+      "Видеокружки",
+      `${profileVideos.length} ${plural(profileVideos.length, ["кружок", "кружка", "кружков"])}`,
+      videosBody,
+      "Готовые кадры: 20% / 50% / 80%. Извлечение запускается вручную в TUI.",
+    ));
 
-    root.append(element("h2", "section-title", "PSL-анализ"));
-    root.append(element(
+    const usernames = profile.username_history || [];
+    const historyBody = usernames.length
+      ? (() => {
+        const table = element("table", "history-table");
+        const tbody = element("tbody", "");
+        usernames.forEach((item) => {
+          const row = element("tr", "");
+          row.append(
+            element("td", "", `@${item.username}`),
+            element("td", "", item.username === profile.username ? "Текущий" : `Ранее · ${dateText(item.last_seen)}`),
+          );
+          tbody.append(row);
+        });
+        table.append(tbody);
+        return table;
+      })()
+      : element("p", "muted", "Username не наблюдался");
+    main.append(sectionBlock("История username", null, historyBody, ""));
+
+    const analyses = Array.isArray(profile.psl_history) ? profile.psl_history : [];
+    const pslBody = element("div", "");
+    pslBody.append(element(
       "p", "subjective",
       "PSL — субъективная, ненаучная визуальная оценка. Она не является фактом или объективным измерением.",
     ));
     if (latest) {
       const latestBlock = element("div", "psl-latest");
       latestBlock.append(element("div", "card-title", "Последняя допустимая оценка"));
+      latestBlock.append(element("div", "psl-value", `${scoreText(latest.raw_psl_min)}–${scoreText(latest.raw_psl_max)}`));
       latestBlock.append(pslMetrics(latest));
       latestBlock.append(meta([
         dateText(latest.analyzed_at),
         latest.actual_model ? `модель: ${latest.actual_model}` : "",
         latest.prompt_version_id ? `prompt: ${latest.prompt_version_id}` : "",
       ]));
-      root.append(latestBlock);
-    } else root.append(element("p", "muted", "Допустимой завершённой оценки нет"));
+      pslBody.append(latestBlock);
+    } else {
+      pslBody.append(element("p", "muted", "Допустимой завершённой оценки нет"));
+    }
+    pslBody.append(element("h3", "section-title", "История анализов"));
+    if (!analyses.length) pslBody.append(element("p", "muted", "Анализы ещё не запускались"));
+    else {
+      pslBody.append(incrementalSection(
+        analyses, HISTORY_PAGE_SIZE, `profile-psl:${authorId}`, pslHistoryEntry, "psl-history",
+      ));
+    }
+    main.append(sectionBlock("История PSL-анализа", null, pslBody, ""));
+    columns.append(main);
 
-    const analyses = Array.isArray(profile.psl_history) ? profile.psl_history : [];
-    root.append(element("h3", "section-title", "История анализов"));
-    if (!analyses.length) root.append(element("p", "muted", "Анализы ещё не запускались"));
-    else root.append(localPager(
-      analyses, HISTORY_PAGE_SIZE, `profile-psl:${authorId}`, pslHistoryEntry, "psl-history",
-    ));
+    const properties = element("div", "properties aside-box");
+    properties.append(element("div", "prop-heading", "Сведения о профиле"));
+    const info = element("dl", "");
+    [
+      ["Telegram ID", String(profile.author_id)],
+      ["Username", profile.username ? `@${profile.username}` : "—"],
+      ["Последняя активность", dateText(profile.last_activity || profile.last_seen)],
+      ["Впервые", dateText(profile.first_seen)],
+      ["Фотографии", String(photos.length)],
+      ["Видеокружки", String(profileVideos.length)],
+      ["Источники", String((profile.post_ids || []).length)],
+    ].forEach(([label, value]) => {
+      const row = element("div", "prop-row");
+      row.append(element("dt", "", label), element("dd", "", value));
+      info.append(row);
+    });
+    properties.append(info);
+    aside.append(properties);
+
+    const related = element("div", "aside-box");
+    related.append(element("div", "prop-heading", "Связанные публикации"));
+    related.append(linkedPosts(profile));
+    aside.append(related);
+
+    if (interactiveEnabled) {
+      const aiBox = element("div", "properties aside-box");
+      aiBox.append(element("div", "prop-heading", "AI по сохранённым данным"));
+      aiBox.append(element(
+        "p", "muted",
+        "Фото профиля, три кадра видеокружка или 3 кадра + фото — только после явного запуска.",
+      ));
+      const combined = element("button", "secondary", "Открыть AI-предпросмотр");
+      combined.type = "button";
+      combined.style.width = "100%";
+      combined.style.marginTop = ".7rem";
+      combined.disabled = !photos.length && !profileVideos.length;
+      combined.addEventListener("click", () => beginAnalysis({author_ids: [Number(authorId)]}));
+      aiBox.append(combined);
+      aside.append(aiBox);
+    }
+    columns.append(aside);
+    root.append(columns);
     content.replaceChildren(root);
   }
 
   function renderRoute(route = parseRoute()) {
+    disconnectObservers();
     if (route.type === "post") showPost(route.id);
     else if (route.type === "profile") showProfile(route.id, route.origin);
     else renderList(route.view);
@@ -1540,7 +2039,7 @@
   function resetCurrentList() {
     const view = currentRoute?.type === "list" ? currentRoute.view : "posts";
     lists[view].query = "";
-    lists[view].page = 0;
+    lists[view].visible = PAGE_SIZE;
     lists[view].descending = true;
     lists[view].sort = view === "profiles" ? "last_active" : "published";
     if (view === "profiles") lists.profiles.filters = emptyFilters();
@@ -1577,39 +2076,27 @@
     if (currentRoute?.type !== "list") return;
     const view = currentRoute.view;
     lists[view].query = queryInput.value;
-    lists[view].page = 0;
+    lists[view].visible = PAGE_SIZE;
     delayedListRender(view);
   });
   sortInput.addEventListener("change", () => {
     if (currentRoute?.type !== "list") return;
     const list = lists[currentRoute.view];
     list.sort = sortInput.value;
-    list.page = 0;
+    list.visible = PAGE_SIZE;
     renderList(currentRoute.view);
   });
   direction.addEventListener("click", () => {
     if (currentRoute?.type !== "list") return;
     const list = lists[currentRoute.view];
     list.descending = !list.descending;
-    list.page = 0;
+    list.visible = PAGE_SIZE;
     renderList(currentRoute.view);
   });
   byId("reset").addEventListener("click", resetCurrentList);
   byId("show-posts").addEventListener("click", () => navigate(listRoute("posts")));
   byId("show-profiles").addEventListener("click", () => navigate(listRoute("profiles")));
   byId("home").addEventListener("click", () => navigate(listRoute("posts")));
-  byId("previous").addEventListener("click", () => {
-    if (currentRoute?.type !== "list") return;
-    lists[currentRoute.view].page -= 1;
-    renderList(currentRoute.view);
-    window.scrollTo(0, 0);
-  });
-  byId("next").addEventListener("click", () => {
-    if (currentRoute?.type !== "list") return;
-    lists[currentRoute.view].page += 1;
-    renderList(currentRoute.view);
-    window.scrollTo(0, 0);
-  });
 
   const filterBindings = [
     ["filter-source", "source"], ["filter-photos", "photos"],
@@ -1623,7 +2110,7 @@
     const eventName = node.tagName === "INPUT" ? "input" : "change";
     node.addEventListener(eventName, () => {
       lists.profiles.filters[key] = node.value;
-      lists.profiles.page = 0;
+      lists.profiles.visible = PAGE_SIZE;
       if (eventName === "input") delayedListRender("profiles");
       else renderList("profiles");
     });
@@ -1645,10 +2132,14 @@
     const route = event.state?.route || parseRoute();
     renderRoute(route);
     window.requestAnimationFrame(() => window.scrollTo(0, Number(event.state?.scrollY || 0)));
+    focusTitle();
   });
   window.addEventListener("hashchange", () => {
     const parsed = parseRoute();
-    if (!currentRoute || routeHash(parsed) !== routeHash(currentRoute)) renderRoute(parsed);
+    if (!currentRoute || routeHash(parsed) !== routeHash(currentRoute)) {
+      renderRoute(parsed);
+      focusTitle();
+    }
   });
   window.addEventListener("beforeunload", rememberScroll);
   document.addEventListener("ended", flushPendingCatalog, true);
