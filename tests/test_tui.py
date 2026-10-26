@@ -185,6 +185,9 @@ class FakeAPI:
         finally:
             self.active_calls -= 1
 
+    async def status_brief(self) -> dict:
+        return await self.status()
+
     async def auth_begin(self) -> dict:
         return await self._operation("auth_begin", default={"state": self.result["telegram"]})
 
@@ -259,6 +262,11 @@ class FakeAPI:
 
     async def retry_job(self, job_id: int) -> dict:
         return await self._operation("retry_job", {"id": job_id})
+
+    async def telegram_call(
+        self, method: str, args: dict[str, Any] | None = None
+    ) -> dict:
+        return await self._operation(method, args)
 
     async def web_status(self) -> dict:
         self.calls.append(("web_status", {}))
@@ -1860,6 +1868,8 @@ async def test_archive_frame_controls_open_local_set_and_start_backfill():
         "failed": 0,
         "pending": 0,
         "missing": 0,
+        "actionable": 1,
+        "processing": 0,
         "backfill_active": False,
         "backfill_complete": False,
     }
@@ -1926,7 +1936,16 @@ async def test_archive_frame_controls_open_local_set_and_start_backfill():
         await pilot.press("escape")
         await pilot.pause()
 
+        screen.query_one("#frames-process").press()
+        await wait_for_condition(
+            pilot,
+            lambda: any(name == "telegram_frames_process" for name, _ in api.calls),
+        )
+
         screen.query_one("#frames-backfill").press()
+        await wait_for_condition(pilot, lambda: isinstance(app.screen, ConfirmDialog))
+        assert "нагружает CPU" in str(app.screen.query_one(".dialog-message", Static).content)
+        app.screen.query_one("#confirm").press()
         await wait_for_condition(
             pilot,
             lambda: any(

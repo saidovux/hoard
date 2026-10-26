@@ -282,7 +282,9 @@ class Store:
                     )
                     if needs_frames:
                         self.telegram._enqueue_frame_job_sql(
-                            int(payload["source_id"]), int(payload["message_id"])
+                            int(payload["source_id"]),
+                            int(payload["message_id"]),
+                            authorized=False,
                         )
                 self.telegram._set_dirty_sql()
             if advance:
@@ -408,7 +410,7 @@ class Store:
                 parameters,
             )
 
-    def retry_job(self, jid: int) -> int:
+    def retry_job(self, jid: int, *, target_state: str = "queued") -> int:
         """Requeue a failed job without violating the active unique key.
 
         Returns the id of the job that is now responsible for the logical work.
@@ -416,6 +418,8 @@ class Store:
         job is returned instead of creating a duplicate or raising
         ``IntegrityError`` from the partial unique index.
         """
+        if target_state not in {"queued", "waiting"}:
+            raise ValueError("Invalid retry target state")
         with self.db:
             row = self.db.execute(
                 "SELECT unique_key FROM jobs WHERE id=? AND state='failed'",
@@ -425,17 +429,29 @@ class Store:
                 raise ValueError("Нужна существующая задача со статусом failed")
             unique_key = row["unique_key"]
             if unique_key is not None:
+                states = ("queued", "running", "waiting") if target_state == "waiting" else (
+                    "queued",
+                    "running",
+                )
+                placeholders = ",".join("?" for _ in states)
                 active = self.db.execute(
-                    """SELECT id FROM jobs WHERE unique_key=?
-                    AND state IN ('queued','running') LIMIT 1""",
-                    (str(unique_key),),
+                    f"""SELECT id FROM jobs WHERE unique_key=?
+                    AND state IN ({placeholders}) LIMIT 1""",
+                    (str(unique_key), *states),
                 ).fetchone()
                 if active is not None:
                     return int(active["id"])
             try:
                 cur = self.db.execute(
-                    "UPDATE jobs SET state='queued',result='' WHERE id=? AND state='failed'",
-                    (int(jid),),
+                    """UPDATE jobs SET state=?,result=?,updated_at=datetime('now')
+                    WHERE id=? AND state='failed'""",
+                    (
+                        target_state,
+                        "Ожидает явного запуска обработки кадров"
+                        if target_state == "waiting"
+                        else "",
+                        int(jid),
+                    ),
                 )
             except sqlite3.IntegrityError:
                 # A concurrent enqueue created the active owner between the

@@ -113,6 +113,7 @@ class ArchiveScreen(WorkspaceScreen):
                 yield Button("Выбрать / снять", id="profile-select")
                 yield Button("Анализ выбранных", id="profiles-ai")
                 yield Button("Кадры кружка", id="frames-view")
+                yield Button("Извлечь кадры", id="frames-process")
                 yield Button("AI по кадрам", id="frames-ai")
             with Horizontal(classes="action-row", id="archive-advanced"):
                 yield Button("AI: кадры", id="telegram-ai-frames")
@@ -120,9 +121,9 @@ class ArchiveScreen(WorkspaceScreen):
                 yield Button("Выбранные: кадры", id="profiles-ai-frames")
                 yield Button("Выбранные: 3+фото", id="profiles-ai-combined")
                 yield Button("Активная AI-группа", id="batch-reopen")
-                yield Button("Старые кружки", id="frames-backfill")
-                yield Button("Пауза кадров", id="frames-backfill-pause")
-                yield Button("Повторить кадры", id="frames-retry")
+                yield Button("Обработать ожидающие", id="frames-backfill")
+                yield Button("Остановить обработку", id="frames-backfill-pause")
+                yield Button("Повторить ошибки", id="frames-retry")
             yield Select(
                 [("Все публикации", "")],
                 value="",
@@ -158,8 +159,8 @@ class ArchiveScreen(WorkspaceScreen):
                 style=MUTED,
             )
             text.append(
-                f"Ошибки {frame_stats.get('failed', 0)} · "
-                f"{frame_stats.get('missing', 0)} без набора",
+                f"Ожидают {frame_stats.get('actionable', 0)} · "
+                f"Ошибки {frame_stats.get('failed', 0)}",
                 style=MUTED,
             )
         else:
@@ -182,22 +183,25 @@ class ArchiveScreen(WorkspaceScreen):
             if narrow:
                 text.append(
                     f"{frame_stats.get('saved', 0)} · "
+                    f"{frame_stats.get('actionable', 0)} ждут · "
                     f"{frame_stats.get('failed', 0)} ошибок · "
-                    f"{frame_stats.get('missing', 0)} без набора",
+                    f"{frame_stats.get('processing', 0)} в работе",
                     style=TEXT,
                 )
             elif self.hoard_app.has_class("medium"):
                 text.append(
                     f"{frame_stats.get('saved', 0)} готовы · "
-                    f"{frame_stats.get('pending', 0)} в работе · "
+                    f"{frame_stats.get('actionable', 0)} ожидают · "
+                    f"{frame_stats.get('processing', 0)} в работе · "
                     f"{frame_stats.get('failed', 0)} ошибок · "
-                    f"{frame_stats.get('missing', 0)} без набора · старые: {backfill}",
+                    f"старые: {backfill}",
                     style=TEXT,
                 )
             else:
                 text.append(
                     f"{frame_stats.get('saved', 0)} готовы · "
-                    f"{frame_stats.get('pending', 0)} в работе · "
+                    f"{frame_stats.get('actionable', 0)} ожидают · "
+                    f"{frame_stats.get('processing', 0)} в работе · "
                     f"{frame_stats.get('failed', 0)} ошибок · "
                     f"{frame_stats.get('missing', 0)} без набора",
                     style=TEXT,
@@ -212,7 +216,7 @@ class ArchiveScreen(WorkspaceScreen):
         if not (status.get("integrations") or {}).get("ffmpeg", True):
             text.append(
                 "\nFFmpeg не найден; новые кадры не будут извлечены. "
-                "Установи FFmpeg и нажми «Повторить ошибки кадров».",
+                "Установи FFmpeg и повтори ручную обработку.",
                 style=ACCENT,
             )
         text.append("\nHTML  ", style=MUTED)
@@ -372,7 +376,7 @@ class ArchiveScreen(WorkspaceScreen):
         self.query_one("#profile-source-filter", Select).display = self.mode == "profiles"
         self.query_one("#batch-reopen", Button).display = self.mode == "profiles"
         self.query_one("#profile-pages", Horizontal).display = self.mode == "profiles"
-        for identifier in ("frames-view", "frames-ai"):
+        for identifier in ("frames-view", "frames-process", "frames-ai"):
             self.query_one(f"#{identifier}", Button).display = self.mode == "downloads"
         for identifier in ("frames-backfill", "frames-backfill-pause", "frames-retry"):
             self.query_one(f"#{identifier}", Button).display = self.mode == "downloads"
@@ -470,14 +474,16 @@ class ArchiveScreen(WorkspaceScreen):
             self._open_profile_frames("combined")
         elif button_id == "frames-view":
             self._open_selected_frames()
+        elif button_id == "frames-process":
+            self._process_selected_frames()
         elif button_id == "frames-ai":
             self._analyze_selected_frames()
         elif button_id == "frames-backfill":
-            self._frames_backfill("telegram_frames_backfill_start")
+            self._confirm_frames_bulk(retry_failed=False)
         elif button_id == "frames-backfill-pause":
-            self._frames_backfill("telegram_frames_backfill_pause")
+            self._frames_action("telegram_frames_backfill_pause")
         elif button_id == "frames-retry":
-            self._frames_backfill("telegram_frames_retry_failed")
+            self._confirm_frames_bulk(retry_failed=True)
         elif button_id == "profiles-ai-frames":
             self._analyze_selected_profiles("frames")
         elif button_id == "profiles-ai-combined":
@@ -640,7 +646,7 @@ class ArchiveScreen(WorkspaceScreen):
         source_id = int(row.get("source_id") or 0)
         message_id = int(row.get("message_id") or 0)
         try:
-            result = await self.hoard_app.api.ai_call(
+            result = await self.hoard_app.api.telegram_call(
                 "telegram_frames_get", {"source_id": source_id, "message_id": message_id}
             )
         except Exception as exc:
@@ -703,14 +709,62 @@ class ArchiveScreen(WorkspaceScreen):
             {"author_ids": [author_id], "image_mode": mode}
         )
 
-    def _frames_backfill(self, method: str) -> None:
+    def _process_selected_frames(self) -> None:
+        row = self._selected_download()
+        if row is None:
+            return
+        source_id = int(row.get("source_id") or 0)
+        message_id = int(row.get("message_id") or 0)
         self.run_worker(
-            self._run_frames_action(method), name="frames-backfill", exit_on_error=False
+            self.hoard_app.execute(
+                f"frames-process:{source_id}:{message_id}",
+                lambda: self.hoard_app.api.telegram_call(
+                    "telegram_frames_process",
+                    {"source_id": source_id, "message_id": message_id},
+                ),
+                pending="Запускаем FFmpeg для выбранного кружка…",
+            ),
+            name="frames-process",
+            exit_on_error=False,
         )
 
-    async def _run_frames_action(self, method: str) -> None:
+    def _confirm_frames_bulk(self, *, retry_failed: bool) -> None:
+        stats = (self.hoard_app.status or {}).get("video_frames") or {}
+        amount = int(stats.get("failed" if retry_failed else "actionable") or 0)
+        if amount <= 0:
+            self.hoard_app.set_notice(
+                "Ошибок кадров нет" if retry_failed else "Ожидающих кружков нет"
+            )
+            return
+        title = "Повторить ошибки кадров?" if retry_failed else "Обработать ожидающие кружки?"
+        self.app.push_screen(
+            ConfirmDialog(
+                title,
+                f"Будет обработано до {amount} наборов. FFmpeg заметно нагружает CPU и "
+                "работает только при остановленном Telegram-сборщике. Закрытие TUI не "
+                "останавливает демон; для остановки используй кнопку в Архиве.",
+                confirm_label="Запустить FFmpeg",
+            ),
+            lambda confirmed: self._frames_action(
+                "telegram_frames_retry_failed"
+                if retry_failed
+                else "telegram_frames_backfill_start",
+                {"confirmed": True},
+            )
+            if confirmed
+            else None,
+        )
+
+    def _frames_action(self, method: str, args: dict[str, Any] | None = None) -> None:
+        self.run_worker(
+            self._run_frames_action(method, args or {}),
+            name="frames-backfill",
+            exit_on_error=False,
+        )
+
+    async def _run_frames_action(self, method: str, args: dict[str, Any]) -> None:
         try:
-            result = await self.hoard_app.api.ai_call(method, {})
+            result = await self.hoard_app.api.telegram_call(method, args)
         except Exception as exc:
             self.hoard_app.set_notice(str(exc), error=True)
             return

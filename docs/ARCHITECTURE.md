@@ -19,14 +19,15 @@ background service.
   reusable widgets and TCSS remain separate. The package imports neither storage nor Telethon, and
   never creates a Telegram client. See `docs/TUI.md`.
 - `ipc.py` starts the daemon detached when required and sends one JSON request per private
-  Unix-socket connection. Client and daemon must both report Hoard 0.7.2.3 and IPC protocol `1`.
+  Unix-socket connection. Client and daemon must both report Hoard 0.7.2.4 and IPC protocol `1`.
   A held instance lock with no ready socket means initialization is in progress, so the client
   waits for that owner instead of spawning a second daemon.
 - `service.py` owns the database, three independently limited job runners and the sole
-  `TelegramEngine`: the Telegram/collector runner, the paid-AI runner and a one-slot media runner
-  for local FFmpeg frame extraction. An asyncio lock
-  serializes login, validation, scans and enrichment so one Telethon session is never opened by
-  competing clients.
+  `TelegramEngine`: the Telegram/collector runner, the paid-AI runner and a dormant one-slot media
+  runner that exists only for an explicitly authorized local FFmpeg frame session. A mode lock makes
+  Telegram work and FFmpeg mutually exclusive; an explicit Telegram start hard-stops and awaits the
+  media runner before receiving priority. A separate asyncio lock serializes login, validation,
+  scans and enrichment so one Telethon session is never opened by competing clients.
 - `ai/` is provider-neutral and has no Telegram dependency. It defines requests, responses,
   stable errors, configuration, response validation and the provider contract; `deepseek.py`
   implements the first provider over outbound HTTPS. `storage.py`, `chat_service.py`,
@@ -76,15 +77,19 @@ management. The AI runner follows the daemon rather than the collector and uses 
 concurrency limit. Each runner selects only its registered job kinds, so a long AI request
 cannot take a Telegram slot or acquire the Telegram lock. Interrupted AI jobs become `failed` and
 require an explicit retry because a cancelled paid request may already have reached the provider.
-Shutdown closes the Telegram, AI and media runners, the Telegram client, database and socket.
+Shutdown closes the Telegram, AI and any manually active media runner, the Telegram client,
+database and socket.
 Menu keybindings are defined once for arrow and `h/j/k/l` navigation. Telegram IPC failures render
 network/VPN guidance inside the active Textual modal while the daemon owns the actual client.
 
 The Textual client is the sole interactive presentation and may enter application mode. Only the
-visible Home screen owns the moderate 1.5-second status timer; the app's async lock drops
-overlapping ticks. Screen suspension, unmount and app exit stop the timer. IPC startup and request errors render inside the stable black
-workspace so a slow or unavailable daemon never produces an unexplained empty screen. Exiting the
-client sends no collector, shutdown or Telegram command; a previously started Web stays alive.
+visible Home screen owns the moderate 1.5-second timer; it requests a bounded `status_brief`
+snapshot and the app's async lock drops overlapping ticks and skips unchanged redraws. Archive and
+Telegram request detailed status only when opened; recent collections are bounded and an oversized
+compatibility response is explicitly truncated before the 64 KiB IPC boundary. Screen suspension, unmount and app exit
+stop the timer. IPC startup and request errors render inside the stable black workspace so a slow
+or unavailable daemon never produces an unexplained empty screen. Exiting the client sends no
+collector, frame-stop, shutdown or Telegram command; previously started frame/Web work stays alive.
 
 The Textual theme sets background, surface and panel to `#000000`; TCSS also fixes computed
 backgrounds for containers, navigation components, focus/hover/selected states, inputs, tables,
@@ -162,27 +167,32 @@ leaves files and `sources.last_id` untouched. Unique constraints make the operat
 Old media may stay outside `telegram/`; the report emits a relative path or a `file:` URI when
 Windows drives differ. It never creates an implicit second media archive.
 
-Every successful video-note checkpoint writes a `tg_video_frame_sets` row and one
-`telegram.video_frames` job in the same SQLite transaction. The one-slot media runner is started
-with the daemon independently of the Telegram collector. It uses FFprobe to read the real
-duration and runs at most one FFmpeg process; three frames at 20/50/80 percent are written to a
-temporary directory beside the MP4, checked for unique decodable JPEG content, then atomically
-installed as `<message>_frames/frame_01.jpg`...`frame_03.jpg`. The source MP4 is never modified.
-Temporary files are removed on failure; a cancelled job is returned to the durable queue. FFmpeg
-absence is a terminal per-set diagnostic, not an installation or daemon failure.
+Every successful video-note checkpoint writes a `tg_video_frame_sets` row and one durable
+`telegram.video_frames` job in state `waiting` in the same SQLite transaction. Waiting records show
+what still needs work but carry no permission to execute. Daemon/TUI startup, download completion,
+restart and generic `job_retry` do not start the media runner; construction of a new service also
+demotes legacy `queued`/`running` frame work to `waiting` and resets an interrupted frame set to
+`pending`. Only **Извлечь кадры** for one selected video or a confirmed bulk action grants
+process-local permission for the current session.
 
-Previously saved MP4s are intentionally not discovered as automatic jobs. The explicit old-archive
-action starts a durable cursor and the media scheduler adds work only into free slots of an
-eight-job queued/running budget while one FFmpeg process runs. New download frame jobs keep their
-immediate enqueue path and are never delayed by old work. The cursor advances across scanned
-records; when the backfill budget is exhausted the loop stops before the next unscanned row, so no
-video is lost. Failed/stale records
-do not stall the traversal. Pause is soft: it stops new backfill scheduling but does not cancel the
-current FFmpeg process or already queued work. Successful
-sets are skipped on resume. Failed and stale sets require the explicit retry action. Catalog
-changes made by frame completion use the same catalog dirty/revision and atomic publication path;
-if the Telegram runner is stopped, a bounded deferred task performs the existing report through
-the report lock.
+An authorized session uses FFprobe for real duration and at most one FFmpeg process with one decode
+and filter thread. On Linux the process gets a best-effort lower priority. Three frames at
+20/50/80 percent are written to a temporary directory beside the MP4, checked for unique decodable
+JPEG content, then atomically installed as
+`<message>_frames/frame_01.jpg`...`frame_03.jpg`; the source MP4 is never modified. A hard stop
+revokes permission before cancelling the runner, terminates and reaps the subprocess with a bounded
+TERM/KILL fallback, removes unpublished temporary files and returns unfinished work to `waiting`.
+Saved MP4s and valid published frames are retained. Missing FFmpeg/FFprobe is an actionable manual
+error, not an installation, download or daemon failure.
+
+The confirmed old-archive action starts a durable cursor and authorizes work only into free slots of
+an eight-job queued/running budget while the one-slot media runner drains it. The cursor advances
+across scanned records and stops before the next unscanned row when capacity is exhausted, so a
+large archive is never loaded into memory. Successful sets are skipped; failed/stale sets require
+the confirmed retry action. Closing the TUI does not stop an authorized daemon session, while
+**Остановить обработку** performs the hard stop above and restart never resumes it automatically.
+Frame completion is coalesced into the existing catalog dirty/revision and atomic publication path;
+after a manual session ends, a bounded deferred report publishes if the Telegram runner is stopped.
 
 Enabled sources become unique `telegram.scan` jobs when due. Telegram jobs remain serialized by
 the global session lock, while one scan uses the same authorized client for a bounded set of video
@@ -454,8 +464,8 @@ only the current batch ID in `sessionStorage` to resume polling without reloadin
 
 ## Current scope
 
-The product includes the Telegram archive, autonomous static catalog, automatic local frame
-extraction for new video notes, an explicit resumable old-frame backfill, an explicit short-lived
+The product includes the Telegram archive, autonomous static catalog, explicit local frame
+extraction for selected or confirmed batches of video notes, a resumable old-frame backfill, an explicit short-lived
 loopback browser client, AI chats and manually initiated Telegram PSL from profile photos or one
 video-note frame set for one, selected or publication-linked local profiles. Optional media/rclone adapters remain dormant code paths and
 are not presented as user-facing tools. There is no persistent browser service, remote access,

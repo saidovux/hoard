@@ -46,7 +46,7 @@ async def test_existing_incompatible_daemon_is_not_replaced(monkeypatch):
     started = False
 
     async def old_status(method, args=None, timeout=12):
-        assert method == "status"
+        assert method == "status_brief"
         return {"version": "0.7.0", "protocol": IPC_PROTOCOL}
 
     def unexpected_start(*args, **kwargs):
@@ -67,6 +67,20 @@ async def test_current_daemon_version_and_protocol_are_accepted(monkeypatch):
 
     monkeypatch.setattr("hoard.ipc.request", current_status)
     await ensure_daemon()
+
+
+async def test_legacy_daemon_probe_falls_back_to_full_status(monkeypatch):
+    methods: list[str] = []
+
+    async def legacy_status(method, args=None, timeout=12):
+        methods.append(method)
+        if method == "status_brief":
+            raise RuntimeError("Неизвестная команда: status_brief")
+        return {"version": __version__, "protocol": IPC_PROTOCOL}
+
+    monkeypatch.setattr("hoard.ipc.request", legacy_status)
+    await ensure_daemon()
+    assert methods == ["status_brief", "status"]
 
 
 async def test_invalid_download_limit_is_reported_before_daemon_detaches(tmp_path, monkeypatch):
@@ -90,7 +104,7 @@ async def test_initializing_daemon_is_waited_for_without_starting_a_second_proce
 
     async def becoming_ready(method, args=None, timeout=12):
         nonlocal calls
-        assert method == "status"
+        assert method == "status_brief"
         calls += 1
         if calls == 1:
             raise OSError("socket not ready")

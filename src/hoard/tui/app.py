@@ -190,19 +190,29 @@ class HoardApp(App[None]):
             self._render_current()
             return
         self._startup_complete = True
-        await self.refresh_status()
+        await self.refresh_status(brief=True)
 
-    async def refresh_status(self) -> bool:
+    async def refresh_status(self, *, brief: bool = False, wait: bool = False) -> bool:
         """Perform at most one status request at a time."""
-        if self._refresh_lock.locked():
+        if self._refresh_lock.locked() and not wait:
             return False
         async with self._refresh_lock:
             try:
-                status = await self.api.status()
+                status = (
+                    await self.api.status_brief()
+                    if brief
+                    else await self.api.status()
+                )
             except Exception as exc:  # UI must stay responsive when IPC/network work fails.
                 self.status_error = str(exc) or type(exc).__name__
             else:
-                self.status = status
+                if brief and self.status is not None:
+                    changed = any(self.status.get(key) != value for key, value in status.items())
+                    if not changed and self.status_error is None:
+                        return True
+                    self.status = {**self.status, **status}
+                else:
+                    self.status = status
                 self.status_error = None
             self._render_current()
         return True
@@ -251,6 +261,12 @@ class HoardApp(App[None]):
         current = getattr(self.screen, "section", None)
         if current != section:
             self.switch_screen(section)
+            if section in {"archive", "telegram"}:
+                self.run_worker(
+                    self.refresh_status(wait=True),
+                    name=f"{section}-details",
+                    exit_on_error=False,
+                )
 
     def open_auth(self, on_authorized: Callable[[], None] | None = None) -> None:
         def complete(authorized: bool | None) -> None:

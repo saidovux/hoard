@@ -723,6 +723,14 @@ async def test_full_synthetic_mp4_to_saved_ai_result_acceptance(tmp_path):
     )
     try:
         await service.start_background()
+        await asyncio.sleep(0.05)
+        assert store.db.execute(
+            "SELECT state FROM jobs WHERE kind='telegram.video_frames'"
+        ).fetchone()[0] == "waiting"
+        await service.handle(
+            "telegram_frames_process",
+            {"source_id": source_id, "message_id": 11},
+        )
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
             details = store.telegram.frame_details(source_id, 11)

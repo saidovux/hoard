@@ -73,9 +73,19 @@ async def request(method: str, args: dict | None = None, timeout: float = 12) ->
         await writer.wait_closed()
 
 
+async def _daemon_status(*, timeout: float) -> dict:
+    """Use the bounded probe, while still identifying pre-migration daemons."""
+    try:
+        return await request("status_brief", timeout=timeout)
+    except RuntimeError as exc:
+        if "Неизвестная команда" not in str(exc):
+            raise
+        return await request("status", timeout=timeout)
+
+
 async def ensure_daemon() -> None:
     try:
-        status = await request("status", timeout=1)
+        status = await _daemon_status(timeout=1)
         validate_daemon_status(status)
         return
     except DaemonCompatibilityError:
@@ -89,7 +99,7 @@ async def ensure_daemon() -> None:
         for _ in range(100):
             await asyncio.sleep(0.12)
             try:
-                status = await request("status", timeout=1)
+                status = await _daemon_status(timeout=1)
                 validate_daemon_status(status)
                 return
             except DaemonCompatibilityError:
@@ -122,7 +132,7 @@ async def ensure_daemon() -> None:
         if process.poll() is not None:
             raise RuntimeError(f"Процесс daemon завершился при запуске; проверь {log}")
         try:
-            status = await request("status", timeout=1)
+            status = await _daemon_status(timeout=1)
             validate_daemon_status(status)
             return
         except DaemonCompatibilityError:

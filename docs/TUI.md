@@ -40,7 +40,7 @@ now **Главная**, and *Источники* lives on the **Telegram** page.
 | Page | Contents |
 | --- | --- |
 | **Главная** | the HOARD wordmark with the daemon state; panels *Сейчас* (current task + progress), *Очередь*, *Архив*, *Инструменты* (one line per tool) and *События* |
-| **Архив** | Кружки / Профили / Задания, catalogue actions, frame inspection and the bounded old-archive frame backfill; less frequent frame/profile AI commands sit behind **Ещё…** |
+| **Архив** | Кружки / Профили / Задания, catalogue actions, manual selected-frame extraction, confirmed bounded batch processing and hard stop; less frequent frame/profile AI commands sit behind **Ещё…** |
 | **Telegram** | panels *Сборщик* (account and collector control), *Web* (separate loopback process) and *Источники* (table + add / edit / toggle / scan / frame AI) |
 | **AI** | provider settings, record list and chat |
 
@@ -74,7 +74,9 @@ Archive page. No old functional control was removed.
   table or the sidebar owns the keyboard.
 * When the sidebar is hidden by the responsive breakpoint, focus is moved out of it. It must not
   keep receiving `j`/`k` while invisible.
-* Status polling updates data but must not rebuild the sidebar or move the navigation highlight.
+* Home polls only bounded `status_brief` data, keeps one request in flight and skips unchanged
+  redraws. Detailed Archive/Telegram data is loaded on entry; polling must not rebuild the sidebar
+  or move the navigation highlight.
 * Opening an AI conversation hides the list workspace, gives the message field focus and scrolls
   the conversation to its top. Returning restores the list and focus.
 * Archive and Telegram tables preserve the selected record across status refreshes, terminal

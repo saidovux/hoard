@@ -31,6 +31,8 @@ class HoardAPI(Protocol):
 
     async def status(self) -> dict[str, Any]: ...
 
+    async def status_brief(self) -> dict[str, Any]: ...
+
     async def auth_begin(self) -> AuthResult: ...
 
     async def save_credentials(self, api_id: int, api_hash: str) -> dict[str, Any]: ...
@@ -67,6 +69,10 @@ class HoardAPI(Protocol):
 
     async def retry_job(self, job_id: int) -> dict[str, Any]: ...
 
+    async def telegram_call(
+        self, method: str, args: dict[str, Any] | None = None
+    ) -> dict[str, Any]: ...
+
     async def web_status(self) -> dict[str, Any]: ...
 
     async def start_web(self) -> dict[str, Any]: ...
@@ -97,6 +103,9 @@ class IPCStatusAPI:
 
     async def status(self) -> dict[str, Any]:
         return await request("status", timeout=self.STATUS_TIMEOUT)
+
+    async def status_brief(self) -> dict[str, Any]:
+        return await request("status_brief", timeout=self.STATUS_TIMEOUT)
 
     async def auth_begin(self) -> AuthResult:
         return await request("auth_begin", timeout=self.NETWORK_TIMEOUT)
@@ -168,6 +177,18 @@ class IPCStatusAPI:
 
     async def retry_job(self, job_id: int) -> dict[str, Any]:
         return await request("job_retry", {"id": job_id}, timeout=self.CONTROL_TIMEOUT)
+
+    async def telegram_call(
+        self, method: str, args: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        if not method.startswith("telegram_"):
+            raise ValueError("Telegram IPC method must start with telegram_")
+        timeout = (
+            self.NETWORK_TIMEOUT
+            if method == "telegram_frames_process"
+            else self.CONTROL_TIMEOUT
+        )
+        return await request(method, args or {}, timeout=timeout)
 
     async def web_status(self) -> dict[str, Any]:
         from hoard.web import web_status

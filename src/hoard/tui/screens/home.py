@@ -130,7 +130,7 @@ class HomeScreen(WorkspaceScreen):
         self.stop_polling()
 
     async def _poll(self) -> None:
-        await self.hoard_app.refresh_status()
+        await self.hoard_app.refresh_status(brief=True)
 
     def stop_polling(self) -> None:
         if self.poll_timer is not None:

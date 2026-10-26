@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -167,3 +168,57 @@ async def test_missing_ffmpeg_is_reported_without_touching_source(tmp_path, monk
     assert caught.value.code in {"ffmpeg_missing", "invalid_video", "no_video_stream"}
     assert video.read_bytes() == b"synthetic"
     assert not (tmp_path / "frames" / "frame_01.jpg").exists()
+
+
+async def test_ffmpeg_uses_one_decode_and_filter_thread(tmp_path, monkeypatch):
+    calls: list[list[str]] = []
+
+    async def fake_run(arguments, *, timeout, code):
+        calls.append(list(arguments))
+        Path(arguments[-1]).write_bytes(b"\xff\xd8\xff" + b"x" * 128)
+        return 0, b"", b""
+
+    monkeypatch.setattr(video_frames, "_run", fake_run)
+    await video_frames._extract_one(
+        "ffmpeg",
+        tmp_path / "source.mp4",
+        tmp_path / "frame.jpg",
+        1.5,
+        timeout=10,
+    )
+
+    command = calls[0]
+    input_index = command.index("-i")
+    assert command[command.index("-threads") + 1] == "1"
+    assert command[command.index("-filter_threads") + 1] == "1"
+    assert command.index("-threads") < input_index
+    assert command.index("-filter_threads") < input_index
+    assert command[input_index + 1] == str(tmp_path / "source.mp4")
+
+
+async def test_cancelling_subprocess_waits_until_process_is_reaped(monkeypatch):
+    original_create = asyncio.create_subprocess_exec
+    started = asyncio.Event()
+    processes: list[asyncio.subprocess.Process] = []
+
+    async def recording_create(*arguments, **options):
+        process = await original_create(*arguments, **options)
+        processes.append(process)
+        started.set()
+        return process
+
+    monkeypatch.setattr(video_frames.asyncio, "create_subprocess_exec", recording_create)
+    task = asyncio.create_task(
+        video_frames._run(
+            [sys.executable, "-c", "import time; time.sleep(60)"],
+            timeout=60,
+            code="test",
+        )
+    )
+    await asyncio.wait_for(started.wait(), timeout=3)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert len(processes) == 1
+    assert processes[0].returncode is not None

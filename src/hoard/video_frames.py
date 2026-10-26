@@ -11,6 +11,9 @@ import hashlib
 import json
 import os
 import shutil
+import signal
+import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -19,6 +22,7 @@ FRAME_ALGORITHM_VERSION = 1
 FRAME_POSITIONS = (0.20, 0.50, 0.80)
 DEFAULT_FRAME_TIMEOUT = 60.0
 _MAX_DETAIL = 500
+_PROCESS_STOP_TIMEOUT = 3.0
 _SCALE_FILTER = (
     "scale=w='min(1280,iw)':h='min(1280,ih)':force_original_aspect_ratio=decrease"
 )
@@ -83,8 +87,31 @@ def _binary(name: str) -> str:
 async def _terminate_process(process: asyncio.subprocess.Process) -> None:
     if process.returncode is not None:
         return
-    process.kill()
-    await process.wait()
+    try:
+        if os.name == "nt":
+            process.terminate()
+        else:
+            os.killpg(process.pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        pass
+    try:
+        await asyncio.wait_for(process.wait(), timeout=_PROCESS_STOP_TIMEOUT)
+        return
+    except TimeoutError:
+        pass
+    try:
+        if os.name == "nt":
+            process.kill()
+        else:
+            os.killpg(process.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    try:
+        await asyncio.wait_for(process.wait(), timeout=_PROCESS_STOP_TIMEOUT)
+    except TimeoutError:
+        # There is nothing else the daemon can safely do cross-platform.  The
+        # process handle remains reaped by asyncio if the OS reports exit later.
+        pass
 
 
 async def _run(
@@ -100,6 +127,8 @@ async def _run(
     }
     if os.name != "nt":
         options["start_new_session"] = True
+    else:
+        options["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
     try:
         process = await asyncio.create_subprocess_exec(*arguments, **options)
     except FileNotFoundError as exc:
@@ -108,6 +137,13 @@ async def _run(
             f"{Path(arguments[0]).name} не найден; установи FFmpeg и повтори обработку",
             retryable=True,
         ) from exc
+    if sys.platform.startswith("linux") and hasattr(os, "setpriority"):
+        try:
+            os.setpriority(os.PRIO_PROCESS, process.pid, 10)
+        except (OSError, PermissionError):
+            # Nice priority is a best-effort resource guard, never a reason to
+            # make optional local frame extraction unavailable.
+            pass
     try:
         stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
     except asyncio.CancelledError:
@@ -222,6 +258,10 @@ async def _extract_one(
             "error",
             "-nostdin",
             "-y",
+            "-threads",
+            "1",
+            "-filter_threads",
+            "1",
             "-i",
             str(video),
             "-ss",
@@ -229,6 +269,8 @@ async def _extract_one(
             "-map",
             "0:v:0",
             "-frames:v",
+            "1",
+            "-threads",
             "1",
             "-an",
             "-sn",

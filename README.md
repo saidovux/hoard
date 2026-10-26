@@ -1,4 +1,4 @@
-# Hoard 0.7.2.3
+# Hoard 0.7.2.4
 
 Hoard is a local-first Linux and Windows archive for Telegram posts, profiles and video notes
 found in a channel post's comments. It uses Telethon, SQLite, an autonomous offline HTML catalog
@@ -11,6 +11,23 @@ explicitly requested PSL history. The portable `telegram_archive.html` remains f
 network requests. `hoard web` is a separate, short-lived loopback client; AI analysis is never
 started automatically. The project has no persistent or remotely accessible web service, Redis,
 Docker or Electron.
+
+The 0.7.2.4 patch makes video-frame extraction strictly manual and removes the largest measured
+TUI polling costs. New and interrupted frame jobs remain visibly `waiting`; FFmpeg/FFprobe start
+only from **Извлечь кадры** or a confirmed **Обработать ожидающие** / **Повторить ошибки** action.
+Restart and generic job retry never preserve execution permission. Telegram collection and FFmpeg
+are mutually exclusive: a frame action asks the user to pause Telegram, while an explicit Telegram
+start hard-stops and awaits frame processing before downloads resume. **Остановить обработку**
+terminates the current subprocess, removes unpublished temporary frames and preserves the MP4,
+completed frames and resumable cursor. Closing only the TUI still leaves an explicitly started
+daemon-side frame session running.
+
+Home now polls a compact `status_brief` snapshot, skips unchanged redraws and loads detailed archive
+data only when a relevant page opens. The full `hoard status` contract remains available with
+bounded recent records. Frame statistics use one aggregate query, idle frame scheduling performs no
+database work, and recent profile summaries aggregate only the requested rows. Frame controls use a
+dedicated Telegram IPC call instead of the AI-only boundary. FFmpeg runs with one decode/filter
+thread and a best-effort lower Linux priority.
 
 The 0.7.1.1 patch makes `hoard web` open directly on profiles that have readable local photos.
 Their newest available photo is shown as the card avatar; opening a profile shows its complete
@@ -124,13 +141,14 @@ only across scanned records, stops before unscanned work when the budget is full
 failed or already-ready records from stalling the traversal. Its pause is explicitly soft:
 new backfill work stops, while the current FFmpeg process and already queued jobs finish normally.
 
-The 0.7.2.0 release adds automatic local frame extraction for every newly saved Telegram
+The 0.7.2.0 release originally added automatic local frame extraction for every newly saved Telegram
 video note. A separate media job runs at most one FFmpeg process, writes three JPEG frames at
 20%, 50% and 80% of the real duration, and never delays the Telegram download path. A failed or
 cancelled extraction keeps the source MP4 and remains retryable. FFmpeg and FFprobe are optional
 runtime tools: without them the rest of Hoard continues to work and the UI explains how to
 retry after installation. Previously saved video notes are not mass-processed on upgrade; the
-Archive screen has an explicit resumable **Обработать старые кружки** action.
+Archive screen has an explicit resumable **Обработать старые кружки** action. Version 0.7.2.4
+supersedes the automatic-start and soft-pause policy with the manual policy described above.
 
 Frames are stored next to their MP4, represented in SQLite, and published through the existing
 atomic catalog path, so an open Telegram Web receives them without a page reload. The TUI and
@@ -162,7 +180,9 @@ Archive page keeps downloads, profiles, jobs, catalog actions and the video-fram
 Telegram keeps login including 2FA, collector start/pause/stop, source validation and editing,
 selected-source or global scans, and Web start/open/stop. All operations use the private daemon
 IPC layer; the TUI never opens SQLite or creates a Telegram client. Only the visible Home screen
-polls, with one status request in flight at a time. See `docs/TUI.md` for the design contract.
+polls a compact status, with one request in flight at a time and no redraw when its data did not
+change; detailed Archive/Telegram data is fetched on entry. See `docs/TUI.md` for the design
+contract.
 
 The interface keeps the entire Textual surface, including navigation, focus, hover, palette and
 help modal states, on `#000000`. Text is white, secondary text `#888888`, frames `#7B4B23`,
@@ -200,7 +220,7 @@ For development, install the test tools with `python -m pip install -e '.[dev]'`
 
 An upgrade keeps the existing XDG configuration, database, Telegram session and archive.
 If an older daemon is still running, execute `hoard shutdown` before starting the upgraded
-installation. The 0.7.2.3 client accepts only a daemon reporting the same application version and
+installation. The 0.7.2.4 client accepts only a daemon reporting the same application version and
 IPC protocol `1`; it reports the mismatch instead of starting a competing service. If a matching
 daemon already owns the service lock but is still initializing, clients wait for it and show a
 specific startup diagnostic.
@@ -390,10 +410,14 @@ extracted frames; the frame-specific AI action uses that exact local set.
 
 ## Video-note frames and FFmpeg
 
-Each newly downloaded video note gets a durable local job. A separate one-slot media runner uses
+Each newly downloaded video note gets a durable local `waiting` record, not execution permission.
+Daemon/TUI startup, a download, restart and generic job retry never start FFmpeg or FFprobe. In
+**Архив → Кружки**, use **Извлечь кадры** for the selected video or confirm
+**Обработать ожидающие** for a bounded resumable batch. A separate one-slot media runner then uses
 system `ffprobe` to read the actual duration and `ffmpeg` to save three JPEG frames at 20%, 50%
-and 80%. FFmpeg never runs inside the Telegram event loop, never modifies the MP4 and never starts
-an AI request. Frames live next to their source as
+and 80%. It uses one decode and filter thread, gets a best-effort lower priority on Linux, never
+runs inside the Telegram event loop, never modifies the MP4 and never starts an AI request. Frames
+live next to their source as
 `hoard_objects/video_notes/source_N/author_ID/message_M_frames/frame_01.jpg` through
 `frame_03.jpg`; SQLite stores their positions, timestamps, sizes, SHA-256 values and the source
 fingerprint. If three distinct decodable frames cannot be produced, the set is marked failed
@@ -407,14 +431,17 @@ sudo pacman -S ffmpeg
 # Windows: winget install Gyan.FFmpeg
 ```
 
-Existing video notes are not mass-processed after an upgrade. In **Архив → Кружки** choose
-**Обработать старые кружки** to start the bounded resumable backfill; **Пауза очереди кадров**
-is a soft pause: it stops placing new backfill jobs, while the current FFmpeg process and already
-queued jobs finish. **Повторить ошибки кадров** retries failed/stale sets after fixing the
-dependency. Processing continues in the daemon when the TUI or Web is closed and does not
-download the MP4 again. Frame completion marks the catalog dirty; an open Web receives the new
-frames without a reload. The autonomous `file://` catalog also displays frames when their files
-remain inside the archive.
+Existing video notes are not mass-processed after an upgrade. **Обработать ожидающие** requires a
+confirmation that shows the pending count and CPU warning; **Повторить ошибки** does the same for
+failed/stale sets after fixing the dependency. **Остановить обработку** revokes the current manual
+permission, terminates and reaps FFmpeg/FFprobe, removes unpublished temporary files and returns
+unfinished jobs to `waiting` without rewinding the durable cursor. No frame session resumes after a
+daemon restart. Telegram collection and FFmpeg cannot be active together; starting Telegram has
+priority and first completes that hard stop. Processing continues in the daemon when only the TUI
+or Web is closed and does not download the MP4 again. Frame completion marks the catalog dirty;
+publication is coalesced for a manual batch, and an open Web receives the new frames without a
+reload. The autonomous `file://` catalog also displays frames when their files remain inside the
+archive.
 
 Optional enrichment obtains post text/media and up to 30 latest profile photos visible to the
 authorized account:

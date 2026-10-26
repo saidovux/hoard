@@ -91,7 +91,7 @@ def create_download(store: Store, source_id: int, message_id: int, video: Path) 
     )
 
 
-def test_checkpoint_creates_one_durable_frame_job_and_no_ai_job(tmp_path):
+def test_checkpoint_creates_one_waiting_frame_job_and_no_ai_job(tmp_path):
     store = Store(tmp_path / "db.sqlite")
     source_id = store.add_source(Post("channelx", 7), str(tmp_path / "archive"))
     video = tmp_path / "archive" / "video.mp4"
@@ -105,7 +105,7 @@ def test_checkpoint_creates_one_durable_frame_job_and_no_ai_job(tmp_path):
         "SELECT kind,state FROM jobs WHERE kind='telegram.video_frames'"
     ).fetchall()
     assert len(jobs) == 1
-    assert jobs[0]["state"] == "queued"
+    assert jobs[0]["state"] == "waiting"
     assert store.db.execute("SELECT COUNT(*) FROM jobs WHERE kind='ai.chat'").fetchone()[0] == 0
     row = store.db.execute(
         "SELECT status,video_path,video_size FROM tg_video_frame_sets"
@@ -259,8 +259,9 @@ async def test_backfill_queues_bounded_old_archive_and_can_pause_resume(tmp_path
             )
     service = make_service(store)
     try:
-        started = await service.handle("telegram_frames_backfill_start", {})
-        assert started["stats"]["backfill_active"] is True
+        service._frame_mode = "bulk"
+        started = store.telegram.start_frame_backfill()
+        assert started["backfill_active"] is True
         service._enqueue_frame_backfill()
         jobs = store.db.execute(
             "SELECT COUNT(*) FROM jobs WHERE kind='telegram.video_frames'"
@@ -269,8 +270,13 @@ async def test_backfill_queues_bounded_old_archive_and_can_pause_resume(tmp_path
         assert store.db.execute("SELECT COUNT(*) FROM tg_video_frame_sets").fetchone()[0] == 3
         paused = await service.handle("telegram_frames_backfill_pause", {})
         assert paused["stats"]["backfill_active"] is False
-        resumed = await service.handle("telegram_frames_backfill_start", {})
-        assert resumed["stats"]["backfill_active"] is True
+        assert store.db.execute(
+            """SELECT COUNT(*) FROM jobs WHERE kind='telegram.video_frames'
+            AND state='waiting'"""
+        ).fetchone()[0] == 3
+        service._frame_mode = "bulk"
+        resumed = store.telegram.start_frame_backfill()
+        assert resumed["backfill_active"] is True
         service._enqueue_frame_backfill()
         assert store.db.execute(
             "SELECT COUNT(*) FROM jobs WHERE kind='telegram.video_frames'"
@@ -284,7 +290,7 @@ async def test_backfill_queues_bounded_old_archive_and_can_pause_resume(tmp_path
     shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None,
     reason="FFmpeg is not installed",
 )
-async def test_queued_frame_job_recovers_after_daemon_restart(tmp_path):
+async def test_waiting_frame_job_requires_manual_run_after_daemon_restart(tmp_path):
     archive = tmp_path / "archive"
     archive.mkdir()
     filename = tmp_path / "db.sqlite"
@@ -299,6 +305,12 @@ async def test_queued_frame_job_recovers_after_daemon_restart(tmp_path):
     service = make_service(second)
     try:
         await service.start_background()
+        await asyncio.sleep(0.1)
+        assert second.telegram.frame_details(source_id, 11)["status"] == "pending"
+        assert service.media_runner.running is False
+        await service.handle(
+            "telegram_frames_process", {"source_id": source_id, "message_id": 11}
+        )
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
             details = second.telegram.frame_details(source_id, 11)
@@ -388,7 +400,8 @@ async def test_backfill_never_fills_more_than_eight_slots_and_resumes_without_lo
             )
     service = make_service(store)
     try:
-        await service.handle("telegram_frames_backfill_start", {})
+        service._frame_mode = "bulk"
+        store.telegram.start_frame_backfill()
         service._enqueue_frame_backfill()
         active = store.db.execute(
             """SELECT COUNT(*) FROM jobs WHERE kind='telegram.video_frames'
@@ -422,6 +435,8 @@ async def test_backfill_never_fills_more_than_eight_slots_and_resumes_without_lo
                 WHERE message_id BETWEEN 3 AND 6)"""
             )
         service2 = make_service(store)
+        service2._frame_mode = "bulk"
+        store.telegram.start_frame_backfill()
         service2._enqueue_frame_backfill()
         assert store.db.execute(
             """SELECT COUNT(*) FROM jobs WHERE kind='telegram.video_frames'
@@ -433,7 +448,7 @@ async def test_backfill_never_fills_more_than_eight_slots_and_resumes_without_lo
         with store.db:
             store.db.execute(
                 """UPDATE jobs SET state='done' WHERE kind='telegram.video_frames'
-                AND state='queued'"""
+                AND state='waiting'"""
             )
             store.db.execute(
                 "UPDATE tg_video_frame_sets SET status='saved' WHERE status='pending'"
@@ -444,7 +459,8 @@ async def test_backfill_never_fills_more_than_eight_slots_and_resumes_without_lo
             AND state IN ('queued','running')"""
         ).fetchone()[0] == 0
 
-        await service2.handle("telegram_frames_backfill_start", {})
+        service2._frame_mode = "bulk"
+        store.telegram.start_frame_backfill()
         while True:
             service2._enqueue_frame_backfill()
             active = store.db.execute(
@@ -510,7 +526,8 @@ async def test_backfill_coexists_with_new_download_and_refills_only_free_slots(t
             )
     service = make_service(store)
     try:
-        await service.handle("telegram_frames_backfill_start", {})
+        service._frame_mode = "bulk"
+        store.telegram.start_frame_backfill()
         service._enqueue_frame_backfill()
         assert store.db.execute(
             """SELECT COUNT(*) FROM jobs WHERE kind='telegram.video_frames'
@@ -522,14 +539,17 @@ async def test_backfill_coexists_with_new_download_and_refills_only_free_slots(t
         create_download(store, source_id, 100, new_video)
         new_job = store.db.execute(
             """SELECT 1 FROM jobs WHERE kind='telegram.video_frames'
-            AND unique_key=? AND state IN ('queued','running')""",
+            AND unique_key=? AND state='waiting'""",
             (f"video-frames:{source_id}:100",),
         ).fetchone()
         assert new_job is not None
         assert store.db.execute(
             """SELECT COUNT(*) FROM jobs WHERE kind='telegram.video_frames'
             AND state IN ('queued','running')"""
-        ).fetchone()[0] == 9
+        ).fetchone()[0] == 8
+        assert store.db.execute(
+            "SELECT COUNT(*) FROM jobs WHERE kind='telegram.video_frames' AND state='waiting'"
+        ).fetchone()[0] == 1
 
         with store.db:
             store.db.execute(
@@ -561,7 +581,8 @@ async def test_backfill_coexists_with_new_download_and_refills_only_free_slots(t
             AND state IN ('queued','running')"""
         ).fetchone()[0] == 0
 
-        await service.handle("telegram_frames_backfill_start", {})
+        service._frame_mode = "bulk"
+        store.telegram.start_frame_backfill()
         while True:
             service._enqueue_frame_backfill()
             active = store.db.execute(

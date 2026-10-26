@@ -438,21 +438,35 @@ class TelegramStorage:
             separators=(",", ":"),
         )
 
-    def _enqueue_frame_job_sql(self, source_id: int, message_id: int) -> int | None:
+    def _enqueue_frame_job_sql(
+        self,
+        source_id: int,
+        message_id: int,
+        *,
+        authorized: bool = False,
+    ) -> int | None:
         unique_key = f"video-frames:{int(source_id)}:{int(message_id)}"
         active = self.db.execute(
-            """SELECT id FROM jobs WHERE unique_key=? AND state IN ('queued','running')
-            LIMIT 1""",
+            """SELECT id,state FROM jobs WHERE unique_key=?
+            AND state IN ('waiting','queued','running') ORDER BY id DESC LIMIT 1""",
             (unique_key,),
         ).fetchone()
         if active is not None:
+            if authorized and str(active["state"]) == "waiting":
+                self.db.execute(
+                    """UPDATE jobs SET state='queued',result='',updated_at=datetime('now')
+                    WHERE id=? AND state='waiting'""",
+                    (int(active["id"]),),
+                )
             return int(active["id"])
         cursor = self.db.execute(
-            """INSERT OR IGNORE INTO jobs(kind,payload,unique_key)
-            VALUES('telegram.video_frames',?,?)""",
+            """INSERT OR IGNORE INTO jobs(kind,payload,unique_key,state,result)
+            VALUES('telegram.video_frames',?,?,?,?)""",
             (
                 self._frame_job_payload(source_id, message_id),
                 unique_key,
+                "queued" if authorized else "waiting",
+                "" if authorized else "Ожидает явного запуска обработки кадров",
             ),
         )
         return int(cursor.lastrowid) if cursor.rowcount else None
@@ -463,6 +477,7 @@ class TelegramStorage:
         message_id: int,
         *,
         reset_failed: bool = False,
+        authorized: bool = False,
     ) -> int | None:
         """Durably enqueue extraction for one existing download."""
         row = self.db.execute(
@@ -499,9 +514,14 @@ class TelegramStorage:
                 size=stat.st_size,
                 mtime_ns=stat.st_mtime_ns,
             )
-            if not needs and not reset_failed:
+            frame_status = str(row["frame_status"] or "")
+            if not needs and frame_status == "saved":
                 return None
-            return self._enqueue_frame_job_sql(int(source_id), int(message_id))
+            if not needs and frame_status in {"failed", "stale"} and not reset_failed:
+                return None
+            return self._enqueue_frame_job_sql(
+                int(source_id), int(message_id), authorized=authorized
+            )
 
     def mark_frame_running(self, source_id: int, message_id: int) -> None:
         with self.db:
@@ -598,6 +618,11 @@ class TelegramStorage:
                         str(item["sha256"]),
                     ),
                 )
+            self.db.execute(
+                """UPDATE jobs SET state='done',result='Кадры уже готовы',
+                updated_at=datetime('now') WHERE unique_key=? AND state='waiting'""",
+                (f"video-frames:{int(source_id)}:{int(message_id)}",),
+            )
             self._set_dirty_sql()
 
     def _frame_set_is_valid(
@@ -756,38 +781,119 @@ class TelegramStorage:
         return details, frame
 
     def frame_stats(self) -> dict[str, Any]:
-        counts = {
-            str(row["status"]): int(row["amount"])
-            for row in self.db.execute(
-                "SELECT status,COUNT(*) AS amount FROM tg_video_frame_sets GROUP BY status"
+        row = self.db.execute(
+            """WITH download_counts AS (
+                SELECT COUNT(*) AS total FROM downloads
+            ), frame_counts AS (
+                SELECT COUNT(*) AS amount,
+                  COALESCE(SUM(status='saved'),0) AS saved,
+                  COALESCE(SUM(status='failed'),0) AS failed,
+                  COALESCE(SUM(status='stale'),0) AS stale,
+                  COALESCE(SUM(status='pending'),0) AS pending,
+                  COALESCE(SUM(status='running'),0) AS running
+                FROM tg_video_frame_sets
+            ), job_counts AS (
+                SELECT COALESCE(SUM(state='waiting'),0) AS waiting,
+                  COALESCE(SUM(state='queued'),0) AS queued,
+                  COALESCE(SUM(state='running'),0) AS processing
+                FROM jobs WHERE kind='telegram.video_frames'
+            ), setting_values AS (
+                SELECT MAX(CASE WHEN key='frames_backfill_active' THEN value END) AS active,
+                  MAX(CASE WHEN key='frames_backfill_complete' THEN value END) AS complete,
+                  MAX(CASE WHEN key='frames_backfill_cursor' THEN value END) AS cursor
+                FROM tg_settings WHERE key IN (
+                  'frames_backfill_active','frames_backfill_complete','frames_backfill_cursor'
+                )
             )
+            SELECT download_counts.total AS total,
+              MAX(download_counts.total-frame_counts.amount,0) AS missing,
+              frame_counts.*,job_counts.*,setting_values.*
+            FROM download_counts,frame_counts,job_counts,setting_values"""
+        ).fetchone()
+        assert row is not None
+        counts = {
+            "saved": int(row["saved"] or 0),
+            "failed": int(row["failed"] or 0),
+            "stale": int(row["stale"] or 0),
+            "pending": int(row["pending"] or 0),
+            "running": int(row["running"] or 0),
         }
-        total = int(self.db.execute("SELECT COUNT(*) FROM downloads").fetchone()[0])
-        missing = int(
-            self.db.execute(
-                """SELECT COUNT(*) FROM downloads d LEFT JOIN tg_video_frame_sets s
-                ON s.source_id=d.source_id AND s.message_id=d.message_id
-                WHERE s.source_id IS NULL"""
-            ).fetchone()[0]
-        )
-        queued = int(
-            self.db.execute(
-                """SELECT COUNT(*) FROM jobs WHERE kind='telegram.video_frames'
-                AND state IN ('queued','running')"""
-            ).fetchone()[0]
-        )
+        waiting = int(row["waiting"] or 0)
+        missing = int(row["missing"] or 0)
         return {
-            "total": total,
+            "total": int(row["total"] or 0),
             "saved": counts.get("saved", 0),
             "failed": counts.get("failed", 0) + counts.get("stale", 0),
             "pending": counts.get("pending", 0) + counts.get("running", 0),
             "missing": missing,
-            "queued": queued,
+            "waiting": waiting,
+            "queued": int(row["queued"] or 0) + int(row["processing"] or 0),
+            "processing": int(row["processing"] or 0),
+            "actionable": waiting + missing,
             "statuses": counts,
-            "backfill_active": self.get_setting("frames_backfill_active", "0") == "1",
-            "backfill_complete": self.get_setting("frames_backfill_complete", "0") == "1",
-            "backfill_cursor": int(self.get_setting("frames_backfill_cursor", "0") or 0),
+            "backfill_active": str(row["active"] or "0") == "1",
+            "backfill_complete": str(row["complete"] or "0") == "1",
+            "backfill_cursor": int(row["cursor"] or 0),
         }
+
+    def frame_backfill_active(self) -> bool:
+        return self.get_setting("frames_backfill_active", "0") == "1"
+
+    def frame_work_state(self) -> dict[str, int | bool]:
+        row = self.db.execute(
+            """SELECT
+            COALESCE(SUM(state='waiting'),0) AS waiting,
+            COALESCE(SUM(state='queued'),0) AS queued,
+            COALESCE(SUM(state='running'),0) AS running,
+            (SELECT value FROM tg_settings WHERE key='frames_backfill_complete') AS complete
+            FROM jobs WHERE kind='telegram.video_frames'"""
+        ).fetchone()
+        assert row is not None
+        return {
+            "waiting": int(row["waiting"] or 0),
+            "queued": int(row["queued"] or 0),
+            "running": int(row["running"] or 0),
+            "backfill_complete": str(row["complete"] or "0") == "1",
+        }
+
+    def authorize_waiting_frame_jobs(self, limit: int) -> int:
+        identifiers = [
+            int(row["id"])
+            for row in self.db.execute(
+                """SELECT id FROM jobs WHERE kind='telegram.video_frames'
+                AND state='waiting' ORDER BY id LIMIT ?""",
+                (max(0, int(limit)),),
+            )
+        ]
+        if not identifiers:
+            return 0
+        placeholders = ",".join("?" for _ in identifiers)
+        with self.db:
+            cursor = self.db.execute(
+                f"""UPDATE jobs SET state='queued',result='',updated_at=datetime('now')
+                WHERE state='waiting' AND id IN ({placeholders})""",
+                identifiers,
+            )
+        return int(cursor.rowcount)
+
+    def disable_frame_processing(self) -> None:
+        """Revoke process-local execution permission while retaining durable work."""
+        with self.db:
+            self._set_setting_sql("frames_backfill_active", "0")
+            self._set_setting_sql("frames_backfill_updated_at", utc_now())
+            self.db.execute(
+                """UPDATE jobs SET state='waiting',
+                result='Ожидает явного запуска обработки кадров',updated_at=datetime('now')
+                WHERE kind='telegram.video_frames' AND state IN ('queued','running')"""
+            )
+            changed = self.db.execute(
+                """UPDATE tg_video_frame_sets SET status='pending',
+                error='Обработка остановлена; требуется ручной запуск',error_code='',updated_at=?
+                WHERE status='running'""",
+                (utc_now(),),
+            ).rowcount
+            if changed:
+                self._set_dirty_sql()
 
     def start_frame_backfill(self) -> dict[str, Any]:
         complete = self.get_setting("frames_backfill_complete", "0") == "1"
@@ -826,7 +932,9 @@ class TelegramStorage:
                 self._set_setting_sql("frames_backfill_active", "0")
                 self._set_setting_sql("frames_backfill_complete", "1")
 
-    def retry_failed_frames(self, *, limit: int = 100) -> dict[str, Any]:
+    def retry_failed_frames(
+        self, *, limit: int = 100, authorized: bool = False
+    ) -> dict[str, Any]:
         rows = list(
             self.db.execute(
                 """SELECT source_id,message_id FROM tg_video_frame_sets
@@ -838,7 +946,10 @@ class TelegramStorage:
         for row in rows:
             try:
                 if self.queue_frame_job(
-                    int(row["source_id"]), int(row["message_id"]), reset_failed=True
+                    int(row["source_id"]),
+                    int(row["message_id"]),
+                    reset_failed=True,
+                    authorized=authorized,
                 ) is not None:
                     queued += 1
             except ValueError:
@@ -1274,15 +1385,13 @@ class TelegramStorage:
         result = []
         for row in self.db.execute(
                 """SELECT profiles.*,
-                COUNT(DISTINCT photos.photo_id) AS photo_count,
-                COUNT(DISTINCT links.source_id) AS source_count,
-                GROUP_CONCAT(DISTINCT links.source_id) AS source_ids_text
+                (SELECT COUNT(*) FROM tg_profile_photos AS photos
+                  WHERE photos.author_id=profiles.author_id) AS photo_count,
+                (SELECT COUNT(*) FROM tg_profile_sources AS links
+                  WHERE links.author_id=profiles.author_id) AS source_count,
+                (SELECT GROUP_CONCAT(links.source_id) FROM tg_profile_sources AS links
+                  WHERE links.author_id=profiles.author_id) AS source_ids_text
                 FROM tg_profiles AS profiles
-                LEFT JOIN tg_profile_photos AS photos
-                  ON photos.author_id=profiles.author_id
-                LEFT JOIN tg_profile_sources AS links
-                  ON links.author_id=profiles.author_id
-                GROUP BY profiles.author_id
                 ORDER BY profiles.last_seen DESC, profiles.author_id
                 LIMIT ?""",
                 (max(1, int(count)),),

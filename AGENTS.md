@@ -24,20 +24,27 @@ Local-first Telegram archive and extensible small-tool core, Python >=3.11. Keep
   tokens are short-lived, one-use and issued through the authenticated control channel.
 - Web updates use the existing `catalog_dirty`/atomic HTML publication. Do not treat a database
   revision as published readiness and do not rebuild the catalog from the version-check endpoint.
-- Video-note frame extraction is local and automatic after a successful download, but never on the
-  Telegram event loop. Keep the dedicated media runner at one FFmpeg process unless measured evidence
-  justifies more. Store frames under the archive next to the MP4, never in profile-photo rows, and
-  never fabricate a third image from a duplicate frame. FFmpeg/FFprobe are optional runtime tools;
-  their absence must not break installation, downloads, TUI, Web or photo-only AI.
+- Video-note frame extraction is local and manual. A download may register durable waiting work,
+  but daemon/TUI startup, download completion, restart and generic job retry must never authorize or
+  start FFmpeg/FFprobe. Permission is process-local to one explicit selected or confirmed bulk action
+  and is always revoked on restart. Keep the dedicated media runner at one FFmpeg process. Store
+  frames under the archive next to the MP4, never in profile-photo rows, and never fabricate a third
+  image from a duplicate frame. FFmpeg/FFprobe are optional runtime tools; their absence must not
+  break installation, downloads, TUI, Web or photo-only AI.
 - Frames enter AI only after an explicit user action. Send the three frames of one video in one
   request (and at most one same-author profile photo in combined mode); never mix authors, never send
   separate paid requests per frame, and keep preview fingerprints and operation-key idempotency.
 - Existing MP4s are not mass-processed on upgrade. The explicit old-archive action must remain
-  resumable, bounded and independent of new Telegram jobs. It may fill only free slots in the
-  eight-job frame queue; never append a fixed-size batch past that limit. Advance the durable
-  cursor only over scanned records and stop before unscanned work when capacity is exhausted.
-  Its pause is soft: stop scheduling new backfill jobs, but let the current FFmpeg process and
-  already queued jobs finish.
+  confirmed, resumable and bounded. It may authorize only free slots in the eight-job frame queue;
+  never append a fixed-size batch past that limit. Advance the durable cursor only over scanned
+  records and stop before unscanned work when capacity is exhausted. Stop is hard: revoke permission,
+  cancel and reap the current FFmpeg/FFprobe process, remove unpublished temporary files, return
+  unfinished jobs to waiting and preserve the cursor. Closing the TUI alone leaves an explicitly
+  started daemon-side frame session running.
+- Telegram collection and FFmpeg are mutually exclusive at the service boundary. A frame action
+  conflicts while Telegram is active; an explicit Telegram start has priority, first hard-stops and
+  awaits frame processing, then starts the existing concurrent Telegram downloads. Protect both
+  transitions against simultaneous IPC requests.
 - A publication-scoped Telegram AI analysis must pass that `source_id` into frame selection during
   preview, queueing and durable batch resume. A profile-only analysis may choose frames from any
   of that profile's saved sources. Never fall back to a newer video from another publication.

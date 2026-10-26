@@ -53,6 +53,7 @@ class Service:
         self._telegram_lock = asyncio.Lock()
         self._report_lock = asyncio.Lock()
         self._stop_lock = asyncio.Lock()
+        self._mode_lock = asyncio.Lock()
         self.engine = engine or TelegramEngine(self.store, self._progress)
         self.runner = JobRunner(
             self.store,
@@ -100,6 +101,11 @@ class Service:
             name="media",
             scheduler=self._enqueue_frame_backfill,
         )
+        # Frame jobs are durable, but permission to execute them is deliberately
+        # process-local.  A new daemon always revokes an interrupted permission.
+        self.store.telegram.disable_frame_processing()
+        self._frame_mode = "off"
+        self._frame_session_task: asyncio.Task | None = None
         self._catalog_task: asyncio.Task | None = None
         self.stop_requested = asyncio.Event()
         self.collector_state = "stopped"
@@ -209,15 +215,13 @@ class Service:
     def _enqueue_frame_backfill(self) -> None:
         """Feed a bounded old-archive backfill without touching the Telegram path."""
         telegram = self.store.telegram
-        if not telegram.frame_stats()["backfill_active"]:
+        if self._frame_mode != "bulk" or not telegram.frame_backfill_active():
             return
-        queued = int(
-            self.store.db.execute(
-                """SELECT COUNT(*) FROM jobs WHERE kind='telegram.video_frames'
-                AND state IN ('queued','running')"""
-            ).fetchone()[0]
-        )
-        slots = max(0, 8 - queued)
+        work = telegram.frame_work_state()
+        slots = max(0, 8 - int(work["queued"]) - int(work["running"]))
+        if slots == 0:
+            return
+        slots -= telegram.authorize_waiting_frame_jobs(slots)
         if slots == 0:
             return
         cursor = int(telegram.get_setting("frames_backfill_cursor", "0") or 0)
@@ -229,7 +233,7 @@ class Service:
         stopped_for_capacity = False
         for row in rows:
             status = str(row.get("frame_status") or "")
-            if status in {"saved", "pending", "running", "failed", "stale"}:
+            if status in {"saved", "running", "failed", "stale"}:
                 last_processed = int(row["cursor_rowid"])
                 continue
             if slots <= 0:
@@ -237,7 +241,9 @@ class Service:
                 break
             try:
                 telegram.queue_frame_job(
-                    int(row["source_id"]), int(row["message_id"])
+                    int(row["source_id"]),
+                    int(row["message_id"]),
+                    authorized=True,
                 )
             except ValueError:
                 # A missing/corrupt old MP4 is recorded by its status and must
@@ -249,6 +255,159 @@ class Service:
             last_processed,
             complete=(not stopped_for_capacity and len(rows) < 50),
         )
+
+    def _require_frame_tools(self) -> None:
+        missing = [name for name in ("ffmpeg", "ffprobe") if shutil.which(name) is None]
+        if missing:
+            raise RuntimeError(
+                f"Не найден {', '.join(missing)}; установи FFmpeg и повтори ручной запуск"
+            )
+
+    def _ensure_frames_can_start_locked(self) -> None:
+        if self.runner.running or self._telegram_lock.locked():
+            raise RuntimeError(
+                "Сначала приостанови Telegram-сборщик и дождись завершения текущей "
+                "Telegram-операции"
+            )
+        if self._frame_mode != "off" or self.media_runner.running:
+            raise RuntimeError("Обработка кадров уже выполняется")
+        self._require_frame_tools()
+
+    async def _begin_frame_session_locked(self, mode: str, job_id: int | None = None) -> None:
+        self._frame_mode = mode
+        await self.media_runner.start()
+        self.media_runner.wakeup()
+        self._frame_session_task = asyncio.create_task(
+            self._monitor_frame_session(mode, job_id),
+            name=f"hoard-frame-session-{mode}",
+        )
+
+    async def _start_single_frame_processing(
+        self, source_id: int, message_id: int
+    ) -> dict:
+        details = self.store.telegram.frame_details(source_id, message_id)
+        if details is not None and details.get("valid"):
+            return {
+                "message": "Кадры уже готовы и прошли локальную проверку",
+                "job_id": None,
+            }
+        async with self._mode_lock:
+            self._ensure_frames_can_start_locked()
+            job_id = self.store.telegram.queue_frame_job(
+                source_id,
+                message_id,
+                reset_failed=True,
+                authorized=True,
+            )
+            if job_id is None:
+                return {
+                    "message": "Кадры уже готовы и прошли локальную проверку",
+                    "job_id": None,
+                }
+            await self._begin_frame_session_locked("single", job_id)
+            return {
+                "message": f"Извлекаем кадры выбранного кружка: задание #{job_id}",
+                "job_id": job_id,
+            }
+
+    async def _start_bulk_frame_processing(self, *, retry_failed: bool = False) -> dict:
+        async with self._mode_lock:
+            self._ensure_frames_can_start_locked()
+            if retry_failed:
+                self.store.telegram.retry_failed_frames(limit=1000, authorized=False)
+            stats = self.store.telegram.frame_stats()
+            if int(stats.get("actionable") or 0) == 0:
+                return {
+                    "message": "Ожидающих обработки кружков нет",
+                    "stats": stats,
+                }
+            self.store.telegram.start_frame_backfill()
+            await self._begin_frame_session_locked("bulk")
+            stats = self.store.telegram.frame_stats()
+            return {
+                "message": (
+                    "Ручная обработка запущена. Закрытие TUI не остановит демон; "
+                    "используй «Остановить обработку», чтобы завершить FFmpeg."
+                ),
+                "stats": stats,
+            }
+
+    async def _monitor_frame_session(self, mode: str, job_id: int | None) -> None:
+        try:
+            while self._frame_mode == mode:
+                await asyncio.sleep(0.1)
+                if mode == "single":
+                    row = self.store.db.execute(
+                        "SELECT state FROM jobs WHERE id=?", (int(job_id or 0),)
+                    ).fetchone()
+                    finished = row is None or str(row["state"]) in {"done", "failed", "waiting"}
+                else:
+                    state = self.store.telegram.frame_work_state()
+                    finished = bool(state["backfill_complete"]) and not any(
+                        int(state[key]) for key in ("waiting", "queued", "running")
+                    )
+                if finished:
+                    break
+        except asyncio.CancelledError:
+            raise
+        else:
+            async with self._mode_lock:
+                if self._frame_session_task is not asyncio.current_task():
+                    return
+                await self.media_runner.stop()
+                self.store.telegram.pause_frame_backfill()
+                self._frame_mode = "off"
+                self._frame_session_task = None
+                self._schedule_catalog_publish()
+
+    async def _stop_frame_processing_locked(
+        self, *, reason: str, publish: bool = True
+    ) -> bool:
+        was_active = self._frame_mode != "off" or self.media_runner.running
+        task = self._frame_session_task
+        self._frame_session_task = None
+        self._frame_mode = "stopping" if was_active else "off"
+        if task is not None and task is not asyncio.current_task() and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        await self.media_runner.stop()
+        self.store.telegram.disable_frame_processing()
+        self._frame_mode = "off"
+        if was_active:
+            self.store.event("info", reason)
+        if publish:
+            self._schedule_catalog_publish()
+        return was_active
+
+    async def _stop_frame_processing(self) -> bool:
+        async with self._mode_lock:
+            return await self._stop_frame_processing_locked(
+                reason="Обработка кадров остановлена пользователем"
+            )
+
+    @contextlib.asynccontextmanager
+    async def _telegram_operation(self):
+        """Give an explicit Telegram operation priority over local FFmpeg work."""
+        switched = False
+        async with self._mode_lock:
+            if self._frame_mode != "off" or self.media_runner.running:
+                switched = await self._stop_frame_processing_locked(
+                    reason="Обработка кадров остановлена: Telegram получил приоритет",
+                    publish=False,
+                )
+            await self._telegram_lock.acquire()
+        try:
+            yield switched
+        finally:
+            self._telegram_lock.release()
+            if switched:
+                self._schedule_catalog_publish()
+
+    def _schedule_frame_catalog_publish(self) -> None:
+        # A manual bulk run may complete many sets.  Publish once when its
+        # session ends instead of competing with FFmpeg after every frame set.
+        if self._frame_mode == "off":
+            self._schedule_catalog_publish()
 
     async def _telegram_video_frames(self, payload: dict) -> str:
         source_id = int(payload.get("source_id") or 0)
@@ -332,11 +491,13 @@ class Service:
                 "ok",
                 f"Кадры видеокружка {source_id}:{message_id} готовы",
             )
-            self._schedule_catalog_publish()
+            self._schedule_frame_catalog_publish()
             return "Извлечено три кадра"
         except asyncio.CancelledError:
             self.store.telegram.mark_frame_pending(
-                source_id, message_id, error="Обработка прервана; повторится после запуска"
+                source_id,
+                message_id,
+                error="Обработка остановлена; требуется ручной запуск",
             )
             raise
         except FrameExtractionError as exc:
@@ -351,7 +512,7 @@ class Service:
                 "error",
                 f"Кадры видеокружка {source_id}:{message_id} не созданы: {exc}",
             )
-            self._schedule_catalog_publish()
+            self._schedule_frame_catalog_publish()
             raise RuntimeError(f"Не удалось извлечь кадры: {exc}") from exc
         except Exception as exc:
             self.store.telegram.mark_frame_failed(
@@ -361,7 +522,7 @@ class Service:
                 error_code="internal_error",
                 retry_after=0,
             )
-            self._schedule_catalog_publish()
+            self._schedule_frame_catalog_publish()
             raise
         finally:
             shutil.rmtree(temp_dir, ignore_errors=True)
@@ -416,7 +577,7 @@ class Service:
         if source is None or not source["enabled"]:
             return "Источник отключён"
         try:
-            async with self._telegram_lock:
+            async with self._telegram_operation():
                 checked, saved = await self.engine.scan(source)
         except asyncio.CancelledError:
             raise
@@ -451,7 +612,7 @@ class Service:
         if source is None:
             return "Источник не найден"
         try:
-            async with self._telegram_lock:
+            async with self._telegram_operation():
                 return await self.engine.enrich_source(source)
         finally:
             if self.store.telegram.catalog_dirty():
@@ -462,7 +623,7 @@ class Service:
         if source is None:
             return "Источник не найден"
         try:
-            async with self._telegram_lock:
+            async with self._telegram_operation():
                 return await self.engine.download_post_media(source)
         finally:
             if self.store.telegram.catalog_dirty():
@@ -471,7 +632,7 @@ class Service:
     async def _telegram_profile_photos(self, payload: dict) -> str:
         author_id = int(payload["author_id"])
         try:
-            async with self._telegram_lock:
+            async with self._telegram_operation():
                 return await self.engine.refresh_profile_photos(author_id)
         finally:
             if self.store.telegram.catalog_dirty():
@@ -576,27 +737,40 @@ class Service:
         async with self._stop_lock:
             if self.running:
                 return "Обработчик задач уже работает"
-            await self.runner.start()
-            was_paused = self.collector_state == "paused"
-            self.collector_state = "running"
-            return "Сборщик продолжил работу" if was_paused else "Сборщик запущен"
+            async with self._mode_lock:
+                switched = False
+                if self._frame_mode != "off" or self.media_runner.running:
+                    switched = await self._stop_frame_processing_locked(
+                        reason="Обработка кадров остановлена: Telegram получил приоритет",
+                        publish=False,
+                    )
+                await self.runner.start()
+                was_paused = self.collector_state == "paused"
+                self.collector_state = "running"
+            message = "Сборщик продолжил работу" if was_paused else "Сборщик запущен"
+            if switched:
+                message = "Обработка кадров остановлена; " + message.lower()
+            return message
 
     async def start_background(self) -> None:
-        """Start local AI and bounded media work owned by the daemon."""
+        """Start daemon-owned AI work; frame execution always requires a user action."""
         if not self.ai_runner.running:
             self.ai_service.register_interrupted_legacy_attempts()
             self.store.ai.recover_interrupted_attempts()
             await self.ai_service.resume_pending_telegram_batches()
         await self.ai_runner.start()
-        await self.media_runner.start()
 
     async def stop_background(self) -> None:
+        async with self._mode_lock:
+            await self._stop_frame_processing_locked(
+                reason="Обработка кадров остановлена вместе со службой",
+                publish=False,
+            )
         task = self._catalog_task
         if task is not None and not task.done():
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
         self._catalog_task = None
-        await self.media_runner.stop()
         await self.ai_runner.stop()
 
     async def stop(self, *, paused: bool = False) -> str:
@@ -632,6 +806,90 @@ class Service:
                 "error_code": exc.code,
                 "retryable": exc.retryable,
             }
+
+    def _status_snapshot(self, *, detailed: bool) -> dict:
+        configured = read_credentials() is not None
+        auth_state = self.engine.authorization_step
+        if not configured:
+            auth_state = AuthState.API_REQUIRED
+        result = {
+            "version": __version__,
+            "protocol": IPC_PROTOCOL,
+            "running": self.running,
+            "collector_state": self.collector_state,
+            "telegram": str(auth_state),
+            "configured": configured,
+            "progress": self.progress.copy(),
+            "stats": self.store.stats(),
+            "queue": self.store.queue_stats(),
+            "media_running": self.media_runner.running,
+            "frame_processing_mode": self._frame_mode,
+            "events": self.store.recent_events(12 if not detailed else 20),
+            "integrations": {
+                "telegram": True,
+                "rclone": shutil.which("rclone") is not None,
+                "yt_dlp": shutil.which("yt-dlp") is not None,
+                "ffmpeg": (
+                    shutil.which("ffmpeg") is not None
+                    and shutil.which("ffprobe") is not None
+                ),
+                "browser": False,
+                "ai": self.ai_core.is_configured(),
+            },
+        }
+        if not detailed:
+            return result
+        archive_root = self.store.telegram.archive_root()
+        result.update(
+            {
+                "sources": self.store.sources(),
+                "downloads": self.store.recent_downloads(),
+                # Profiles have their own paginated IPC API.  This bounded
+                # compatibility sample keeps `status` below the 64 KiB boundary.
+                "profiles": self.store.telegram.recent_profiles(20),
+                "video_frames": {
+                    **self.store.telegram.frame_stats(),
+                    "processing_mode": self._frame_mode,
+                },
+                "jobs": self.store.recent_jobs(40),
+                "archive_root": str(archive_root),
+                "catalog": str(telegram_catalog_file(archive_root)),
+            }
+        )
+        self._bound_detailed_status(result)
+        return result
+
+    @staticmethod
+    def _bound_detailed_status(result: dict) -> None:
+        """Retain the public shape while guaranteeing one IPC-sized response."""
+        envelope = {"ok": True, "data": result}
+        try:
+            encode_ipc_message(envelope)
+            return
+        except ValueError:
+            pass
+        original = {
+            name: len(result.get(name) or [])
+            for name in ("jobs", "profiles", "downloads", "events", "sources")
+        }
+        result["status_truncated"] = {}
+        for name in original:
+            values = result.get(name)
+            while values:
+                keep = len(values) // 2
+                result[name] = values = values[:keep]
+                result["status_truncated"][name] = {
+                    "shown": len(values),
+                    "available": original[name],
+                }
+                try:
+                    encode_ipc_message(envelope)
+                    return
+                except ValueError:
+                    continue
+        # The fixed fields are intentionally tiny; reaching this point would
+        # indicate a new unbounded scalar that must not be silently hidden.
+        encode_ipc_message(envelope)
 
     async def handle(self, method: str, args: dict) -> dict:
         if method == "ai_config_get":
@@ -680,48 +938,15 @@ class Service:
         if method.startswith("ai_"):
             return await self.ai_ipc.handle(method, args)
         if method == "status":
-            configured = read_credentials() is not None
-            auth_state = self.engine.authorization_step
-            if not configured:
-                auth_state = AuthState.API_REQUIRED
-            archive_root = self.store.telegram.archive_root()
-            return {
-                "version": __version__,
-                "protocol": IPC_PROTOCOL,
-                "running": self.running,
-                "collector_state": self.collector_state,
-                "telegram": str(auth_state),
-                "configured": configured,
-                "progress": self.progress.copy(),
-                "stats": self.store.stats(),
-                "queue": self.store.queue_stats(),
-                "sources": self.store.sources(),
-                "downloads": self.store.recent_downloads(),
-                "profiles": self.store.telegram.recent_profiles(),
-                "video_frames": self.store.telegram.frame_stats(),
-                "media_running": self.media_runner.running,
-                "jobs": self.store.recent_jobs(),
-                "events": self.store.recent_events(),
-                "archive_root": str(archive_root),
-                "catalog": str(telegram_catalog_file(archive_root)),
-                "integrations": {
-                    "telegram": True,
-                    "rclone": shutil.which("rclone") is not None,
-                    "yt_dlp": shutil.which("yt-dlp") is not None,
-                    "ffmpeg": (
-                        shutil.which("ffmpeg") is not None
-                        and shutil.which("ffprobe") is not None
-                    ),
-                    "browser": False,
-                    "ai": self.ai_core.is_configured(),
-                },
-            }
+            return self._status_snapshot(detailed=True)
+        if method == "status_brief":
+            return self._status_snapshot(detailed=False)
         if method == "credentials":
             api_id = int(args.get("api_id", 0))
             api_hash = str(args.get("api_hash", ""))
             if api_id <= 0 or not api_hash.strip():
                 raise ValueError("Укажи корректные API ID и API Hash")
-            async with self._telegram_lock:
+            async with self._telegram_operation():
                 await self.engine.disconnect()
                 write_credentials(api_id, api_hash)
             return {"message": "Параметры API сохранены в закрытом локальном файле"}
@@ -737,7 +962,7 @@ class Service:
             "auth_password",
             "auth_check",
         }:
-            async with self._telegram_lock:
+            async with self._telegram_operation():
                 if method == "auth_begin":
                     return await self._auth_call(self.engine.begin_authorization())
                 if method in {"auth_send_code", "auth_code"}:
@@ -760,7 +985,7 @@ class Service:
                 return await self._auth_call(self.engine.begin_authorization())
         if method == "source_validate":
             post = parse_post_url(str(args.get("url", "")))
-            async with self._telegram_lock:
+            async with self._telegram_operation():
                 return await self.engine.validate_post(post)
         if method == "source_add":
             post = parse_post_url(str(args.get("url", "")))
@@ -805,19 +1030,14 @@ class Service:
             if not source_id or not message_id:
                 raise ValueError("Нужны source_id и message_id видеокружка")
             if method == "telegram_frames_process":
-                job_id = self.store.telegram.queue_frame_job(
-                    source_id, message_id, reset_failed=True
-                )
-                self.media_runner.wakeup()
+                started = await self._start_single_frame_processing(source_id, message_id)
                 return {
-                    "message": (
-                        f"Извлечение кадров поставлено в очередь: #{job_id}"
-                        if job_id is not None
-                        else "Кадры уже готовы или обработка уже выполняется"
-                    ),
-                    "job_id": job_id,
+                    **started,
                     "frames": self.store.telegram.frame_details(source_id, message_id),
-                    "stats": self.store.telegram.frame_stats(),
+                    "stats": {
+                        **self.store.telegram.frame_stats(),
+                        "processing_mode": self._frame_mode,
+                    },
                 }
             return {
                 "frames": self.store.telegram.frame_details(source_id, message_id),
@@ -830,24 +1050,33 @@ class Service:
             "telegram_frames_retry_failed",
         }:
             if method == "telegram_frames_backfill_start":
-                stats = self.store.telegram.start_frame_backfill()
-                self.media_runner.wakeup()
-                return {"message": "Обработка сохранённых видеокружков запущена", "stats": stats}
+                if not bool(args.get("confirmed")):
+                    raise ValueError(
+                        "Массовая обработка требует подтверждения нагрузки FFmpeg"
+                    )
+                return await self._start_bulk_frame_processing()
             if method == "telegram_frames_backfill_pause":
+                stopped = await self._stop_frame_processing()
                 return {
                     "message": (
-                        "Новые задания больше не ставятся; текущий FFmpeg завершится, "
-                        "а очередь доработает"
+                        "FFmpeg остановлен; незавершённое задание ожидает ручного запуска"
+                        if stopped
+                        else "Обработка кадров уже остановлена"
                     ),
                     "stats": self.store.telegram.pause_frame_backfill(),
                 }
             if method == "telegram_frames_retry_failed":
-                result = self.store.telegram.retry_failed_frames(
-                    limit=int(args.get("limit", 100))
-                )
-                self.media_runner.wakeup()
-                return {"message": f"Повторно поставлено: {result['queued']}", "stats": result}
-            return {"stats": self.store.telegram.frame_stats()}
+                if not bool(args.get("confirmed")):
+                    raise ValueError(
+                        "Повторная обработка требует подтверждения нагрузки FFmpeg"
+                    )
+                return await self._start_bulk_frame_processing(retry_failed=True)
+            return {
+                "stats": {
+                    **self.store.telegram.frame_stats(),
+                    "processing_mode": self._frame_mode,
+                }
+            }
         if method == "telegram_enrich":
             jobs = 0
             for source in self.store.sources():
@@ -888,14 +1117,25 @@ class Service:
             ).fetchone()
             if job is not None and str(job["kind"]).startswith("ai."):
                 raise ValueError("AI-запросы повторяются только через ai_attempt_retry")
-            job_id = self.store.retry_job(int(args["id"]))
+            is_frame_job = (
+                job is not None and str(job["kind"]) == "telegram.video_frames"
+            )
+            job_id = self.store.retry_job(
+                int(args["id"]),
+                target_state="waiting" if is_frame_job else "queued",
+            )
             if job is not None and str(job["kind"]) == "telegram.report":
                 # A user retry is explicit: it must not wait for the automatic
                 # filesystem-failure backoff.
                 self.store.telegram.clear_catalog_report_retry()
-            self.runner.wakeup()
+            if not is_frame_job:
+                self.runner.wakeup()
             message = (
-                "Задание возвращено в очередь"
+                (
+                    "Задание ожидает явного запуска обработки кадров"
+                    if is_frame_job
+                    else "Задание возвращено в очередь"
+                )
                 if job_id == int(args["id"])
                 else f"Задание уже выполняется или стоит в очереди: #{job_id}"
             )
