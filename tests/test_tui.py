@@ -36,7 +36,7 @@ if TYPE_CHECKING:
         TelegramScreen,
         TelegramSourcesScreen,
     )
-    from hoard.tui.widgets import HoardHeader, HoardStatusBar, ProgressView, Sidebar
+    from hoard.tui.widgets import HoardHeader, HoardStatusBar, Sidebar
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -67,7 +67,6 @@ def load_textual_after_existing_async_tests():
     from hoard.tui.screens import TelegramWebScreen as TelegramWebScreenClass
     from hoard.tui.widgets import HoardHeader as HoardHeaderClass
     from hoard.tui.widgets import HoardStatusBar as HoardStatusBarClass
-    from hoard.tui.widgets import ProgressView as ProgressViewClass
     from hoard.tui.widgets import Sidebar as SidebarClass
 
     globals().update(
@@ -86,7 +85,6 @@ def load_textual_after_existing_async_tests():
         Input=InputClass,
         OptionList=OptionListClass,
         SelectionList=SelectionListClass,
-        ProgressView=ProgressViewClass,
         Sidebar=SidebarClass,
         SourceDialog=SourceDialogClass,
         Static=StaticClass,
@@ -108,6 +106,16 @@ def status_fixture(*, total: int | None = 4096) -> dict[str, Any]:
         "file": "circle.mp4",
         "bytes": 1024,
         "speed_bps": 512,
+        "active_downloads": 1,
+        "aggregate_speed_bps": 512,
+        "transfers": [
+            {
+                "source_id": 1,
+                "message_id": 101,
+                "bytes": 1024,
+                "total": total or 0,
+            }
+        ],
     }
     if total is not None:
         progress["total"] = total
@@ -370,6 +378,8 @@ async def wait_for_condition(pilot, predicate, message="condition was not reache
 
 @pytest.mark.asyncio
 async def test_initializes_home_from_real_status_contract():
+    from hoard.tui.widgets import TelegramMonitor
+
     api = FakeAPI()
     app = HoardApp(api)
     async with app.run_test(size=(80, 24)) as pilot:
@@ -377,16 +387,13 @@ async def test_initializes_home_from_real_status_contract():
         assert isinstance(app.screen, HomeScreen)
         assert api.ensure_calls == 1
         assert api.status_calls == 1
-        tools = str(app.screen.query_one("#tools", Static).content)
-        archive = str(app.screen.query_one("#statistics", Static).content)
-        queue = str(app.screen.query_one("#queue-stats", Static).content)
-        events = str(app.screen.query_one("#events", Static).content)
-        assert "подключён" in tools
-        assert "работает" in tools
-        assert all(number in archive for number in ("2", "14", "31"))
-        assert all(number in queue for number in ("4", "1", "2"))
-        assert "Сохранён кружок" in events
-        assert "Нет связи" in events
+        monitor = app.screen.query_one(TelegramMonitor)
+        assert all(value in str(monitor.content) for value in ("sample_channel/42", "17", "3"))
+        summary = str(app.screen.query_one("#home-summary", Static).content)
+        assert all(number in summary for number in ("2", "14", "31", "4", "1"))
+        assert not list(app.screen.query("#tools-panel"))
+        assert not list(app.screen.query("#events-panel"))
+        assert not list(app.screen.query("#now-panel"))
 
 
 @pytest.mark.asyncio
@@ -452,6 +459,8 @@ async def test_round_three_screens_tables_buttons_and_dialogs_remain_strict_blac
 @pytest.mark.asyncio
 @pytest.mark.parametrize("size", [(40, 16), (60, 20), (80, 24), (120, 35)])
 async def test_supported_terminal_sizes_have_valid_layout(size):
+    from hoard.tui.widgets import TelegramMonitor
+
     app = HoardApp(FakeAPI())
     async with app.run_test(size=size) as pilot:
         await wait_for_startup(app, pilot)
@@ -462,6 +471,9 @@ async def test_supported_terminal_sizes_have_valid_layout(size):
         assert app.screen.query_one(HoardHeader).size.height > 0
         assert app.screen.query_one(HoardStatusBar).size.height > 0
         assert app.screen.query_one(Sidebar).display is (size[0] >= 60)
+        monitor = app.screen.query_one(TelegramMonitor)
+        assert monitor.virtual_size.width <= monitor.size.width
+        assert str(monitor.content).splitlines()[-1].count("│") == 2
 
 
 @pytest.mark.asyncio
@@ -613,6 +625,8 @@ async def test_exit_stops_home_timer():
 
 @pytest.mark.asyncio
 async def test_empty_status_has_informative_states():
+    from hoard.tui.widgets import TelegramMonitor
+
     empty = {
         "running": False,
         "collector_state": "stopped",
@@ -625,20 +639,148 @@ async def test_empty_status_has_informative_states():
     app = HoardApp(FakeAPI(empty))
     async with app.run_test() as pilot:
         await wait_for_startup(app, pilot)
-        assert "данные недоступны" in str(app.screen.query_one("#tools", Static).content)
-        assert "Событий пока нет" in str(app.screen.query_one("#events", Static).content)
+        monitor = app.screen.query_one(TelegramMonitor)
+        assert "Источник" in str(monitor.content)
+        assert "0 загрузок" in str(monitor.content)
+        assert monitor.slot_keys == (None, None, None)
 
 
 @pytest.mark.asyncio
 async def test_home_uses_only_available_progress_values():
+    from hoard.tui.widgets import TelegramMonitor
+
     app = HoardApp(FakeAPI(status_fixture(total=None)))
     async with app.run_test() as pilot:
         await wait_for_startup(app, pilot)
-        progress = str(app.screen.query_one(ProgressView).content)
-        assert "1.0 KiB" in progress
-        assert "512 B/s" in progress
+        progress = str(app.screen.query_one(TelegramMonitor).content)
+        assert "sample_channel/42" in progress
+        assert "17" in progress and "3" in progress
+        assert "•" in progress
         assert "%" not in progress
         assert "ETA" not in progress
+
+
+def test_telegram_home_indicator_requires_confirmed_account_and_collector_state():
+    from hoard.tui.widgets.telegram_monitor import telegram_indicator
+
+    status = status_fixture()
+    assert telegram_indicator(status) == "green"
+    assert telegram_indicator({**status, "collector_state": "paused", "running": False}) == "yellow"
+    assert telegram_indicator({**status, "running": False}) == "yellow"
+    assert telegram_indicator({**status, "telegram_account": {}}) == "neutral"
+    assert telegram_indicator(
+        {**status, "telegram_account": {"state": "saved", "verified": None}}
+    ) == "red"
+    assert telegram_indicator({**status, "telegram": "phone_required"}) == "red"
+    assert telegram_indicator(status, available=False) == "neutral"
+
+
+@pytest.mark.asyncio
+async def test_telegram_monitor_keeps_three_stable_slots_for_four_transfers_and_clears_stale_data():
+    from hoard.tui.widgets import TelegramMonitor
+
+    def transfer(source_id: int, message_id: int, received: object, total: object) -> dict:
+        return {
+            "source_id": source_id,
+            "message_id": message_id,
+            "bytes": received,
+            "total": total,
+        }
+
+    status = status_fixture()
+    progress = {
+        **status["progress"],
+        "active_downloads": 4,
+        "transfers": [
+            transfer(1, 101, 10, 100),
+            transfer(1, 102, 20, 0),
+            transfer(1, 103, 30, 100),
+            transfer(1, 104, 40, 100),
+        ],
+    }
+    api = FakeAPI({**status, "progress": progress})
+    app = HoardApp(api)
+    async with app.run_test(size=(80, 24)) as pilot:
+        await wait_for_startup(app, pilot)
+        monitor = app.screen.query_one(TelegramMonitor)
+        assert monitor.slot_keys == ((1, 101), (1, 102), (1, 103))
+        assert "4 загрузок" in str(monitor.content)
+        assert "•" in str(monitor.content)
+
+        api.result = {
+            **api.result,
+            "progress": {
+                **progress,
+                "active_downloads": 3,
+                "transfers": [
+                    transfer(1, 103, 60, 100),
+                    transfer(1, 104, 50, 100),
+                    transfer(1, 101, 70, 100),
+                ],
+            },
+        }
+        await app.refresh_status(brief=True, wait=True)
+        assert monitor.slot_keys == ((1, 101), (1, 104), (1, 103))
+
+        api.result = {
+            **api.result,
+            "progress": {
+                **api.result["progress"],
+                "transfers": [
+                    transfer(1, 104, 80, 100),
+                    transfer(1, 101, 90, 100),
+                    transfer(1, 103, 75, 100),
+                ],
+            },
+        }
+        await app.refresh_status(brief=True, wait=True)
+        assert monitor.slot_keys == ((1, 101), (1, 104), (1, 103))
+
+        api.result = {**api.result, "running": False, "collector_state": "stopped"}
+        await app.refresh_status(brief=True, wait=True)
+        assert monitor.slot_keys == (None, None, None)
+        assert "0 загрузок" in str(monitor.content)
+
+        api.result = {**api.result, "running": True, "collector_state": "running"}
+        api.error = ConnectionError("daemon unavailable")
+        await app.refresh_status(brief=True, wait=True)
+        assert monitor.slot_keys == (None, None, None)
+        assert "Данные Telegram недоступны" in str(monitor.content)
+
+
+@pytest.mark.asyncio
+async def test_telegram_monitor_handles_zero_to_four_transfers_and_invalid_sizes():
+    from hoard.tui.widgets import TelegramMonitor
+
+    app = HoardApp(FakeAPI())
+    async with app.run_test(size=(80, 24)) as pilot:
+        await wait_for_startup(app, pilot)
+        monitor = app.screen.query_one(TelegramMonitor)
+        for count in range(5):
+            status = status_fixture()
+            status["progress"]["active_downloads"] = count
+            status["progress"]["transfers"] = [
+                {
+                    "source_id": 1,
+                    "message_id": 200 + index,
+                    "bytes": index * 10,
+                    "total": -1 if index == 1 else 100,
+                }
+                for index in range(count)
+            ]
+            monitor.show_status(status)
+            assert sum(key is not None for key in monitor.slot_keys) == min(count, 3)
+            assert str(monitor.content).splitlines()[-1].count("│") == 2
+
+        invalid = status_fixture()
+        invalid["progress"]["active_downloads"] = 2
+        invalid["progress"]["transfers"] = [
+            {"source_id": 1, "message_id": 301, "bytes": "invalid", "total": 100},
+            {"source_id": 1, "message_id": 302, "bytes": 50, "total": "unknown"},
+        ]
+        monitor.show_status(invalid)
+        assert monitor.slot_keys == ((1, 302), None, None)
+        assert "•" in str(monitor.content)
 
 
 @pytest.mark.asyncio
@@ -1619,14 +1761,11 @@ async def test_navigation_registry_groups_tools_and_nested_telegram_pages():
         TELEGRAM_SECTIONS,
         breadcrumb,
     )
-    from hoard.tui.screens.home import MODULE_SUMMARIES
-
     keys = [section.key for section in SECTIONS]
     assert keys == ["home", "archive", "telegram", "ai"]
     assert len(keys) == len(set(keys))
     assert {"home", "archive", "ai"} <= set(HoardApp.SCREENS)
     assert {section.key for section in TELEGRAM_SECTIONS} <= set(HoardApp.SCREENS)
-    assert set(MODULE_SUMMARIES) <= set(keys)
     assert [section.label for section in breadcrumb("telegram")] == ["Telegram", "Статус"]
     assert [section.label for section in breadcrumb("sources")] == ["Telegram", "Источники"]
     assert [section.label for section in breadcrumb("home")] == ["Главная"]
@@ -1865,29 +2004,21 @@ async def test_responsive_classes_follow_terminal_size():
 
 
 @pytest.mark.asyncio
-async def test_home_summarises_each_tool_and_reflows_statistics():
-    from hoard.tui.widgets import StatisticsView
-
-    status = status_fixture()
-    status["integrations"] = {"ai": True}
-    app = HoardApp(FakeAPI(status))
+async def test_home_keeps_hoard_totals_compact_below_the_telegram_monitor():
+    app = HoardApp(FakeAPI(status_fixture()))
     async with app.run_test(size=(120, 35)) as pilot:
         await wait_for_startup(app, pilot)
         await pilot.pause()
-        tools = str(app.screen.query_one("#tools", Static).content)
-        assert "Telegram" in tools and "подключён · сборщик работает" in tools
-        assert "AI" in tools and "настроен" in tools and "не настроен" not in tools
+        wide = str(app.screen.query_one("#home-summary", Static).content)
+        assert "\n" not in wide
+        assert "Очередь" in wide and "Архив" in wide
+        assert all(number in wide for number in ("2", "14", "31", "4", "1"))
 
-        archive = app.screen.query_one("#statistics", StatisticsView)
-        wide_rows = str(archive.content).count("\n")
-        await pilot.resize_terminal(30, 24)
+        await pilot.resize_terminal(40, 16)
         await pilot.pause()
-        narrow_rows = str(app.screen.query_one("#statistics", StatisticsView).content).count("\n")
-        assert narrow_rows > wide_rows  # tiles wrap instead of being cut off
-        for number in ("2", "14", "31"):
-            assert number in str(app.screen.query_one("#statistics", StatisticsView).content)
-        for number in ("4", "1", "2"):
-            assert number in str(app.screen.query_one("#queue-stats", StatisticsView).content)
+        narrow = str(app.screen.query_one("#home-summary", Static).content)
+        assert narrow.count("\n") == 1
+        assert all(number in narrow for number in ("2", "14", "31", "4", "1"))
 
 
 @pytest.mark.asyncio
@@ -1916,8 +2047,8 @@ async def test_home_shows_only_the_logo_until_the_daemon_answers():
         await wait_for_startup(app, pilot)
         assert isinstance(app.screen, HomeScreen)
         assert app.screen.query_one(Hero).display
-        assert not app.screen.query_one("#home-grid").display
-        assert not app.screen.query_one("#events-panel").display
+        assert not app.screen.query_one("#telegram-monitor-panel").display
+        assert not app.screen.query_one("#home-summary").display
         assert app.screen.query_one("#status-error", Static).display
 
 
@@ -1931,7 +2062,10 @@ async def test_home_carries_the_program_name_and_picks_a_logo_that_fits():
         big, small = app.screen.query_one("#hero-big"), app.screen.query_one("#hero-small")
         assert big.display and not small.display
         text = str(big.content)
-        assert "локальный архив" in text and "сборщик работает" in text
+        assert "v0.7.4.0" in text
+        assert "локальный архив" not in text
+        assert "всё хранится" not in text
+        assert "сборщик" not in text
         # Letters are painted as coloured blanks, so the solid glyph never reaches the terminal.
         assert "█" not in text
         assert len(logo_text(LOGO_BIG, shadow=True)) == len(LOGO_BIG)
@@ -1953,7 +2087,8 @@ async def test_panels_carry_their_title_in_the_border_and_light_up_with_focus():
     async with app.run_test(size=(120, 35)) as pilot:
         await wait_for_startup(app, pilot)
         titles = {str(panel.border_title) for panel in app.screen.query(Panel)}
-        assert {"Сейчас", "Очередь", "Архив", "Инструменты", "События"} <= titles
+        assert any("Telegram " in title for title in titles)
+        assert not {"Сейчас", "Инструменты", "События"} & titles
         app.open_section("telegram_sources")
         await pilot.pause()
         panel = app.screen.query_one("#sources-panel", Panel)
@@ -2436,7 +2571,7 @@ async def test_workspace_is_not_a_dead_tab_stop_and_hidden_sidebar_drops_focus()
         assert workspace.can_focus is False
         await pilot.press("ctrl+pagedown")
         await pilot.pause()
-        assert workspace.scroll_offset.y > 0
+        assert workspace.scroll_offset.y == 0  # compact Home fits without a scroll region
         await pilot.resize_terminal(40, 16)
         await pilot.pause()
         assert app.focused is None

@@ -432,22 +432,35 @@ def test_progress_tracks_individual_and_aggregate_transfers():
     reports: list[dict] = []
     engine = TelegramEngine(store=None, report_progress=reports.append, download_limit=2)
     first = (1, 101)
-    second = (1, 105)
+    second = (2, 101)
 
     engine._begin_download_progress(first, message_id=101, filename="101.mp4")
     engine._update_download_progress(first, current=10, total=100, speed_bps=100.0)
-    engine._begin_download_progress(second, message_id=105, filename="105.mp4")
+    engine._begin_download_progress(second, message_id=101, filename="other-101.mp4")
     engine._update_download_progress(second, current=20, total=100, speed_bps=250.0)
 
     assert reports[-1]["active_downloads"] == 2
-    assert reports[-1]["file"] == "105.mp4"
+    assert reports[-1]["file"] == "other-101.mp4"
     assert reports[-1]["speed_bps"] == 250.0
     assert reports[-1]["aggregate_speed_bps"] == 350.0
+    assert reports[-1]["transfers"] == [
+        {"source_id": 1, "message_id": 101, "bytes": 10, "total": 100},
+        {"source_id": 2, "message_id": 101, "bytes": 20, "total": 100},
+    ]
+
+    engine._update_download_progress(first, current=50, total=100, speed_bps=125.0)
+    assert reports[-1]["transfers"] == [
+        {"source_id": 1, "message_id": 101, "bytes": 50, "total": 100},
+        {"source_id": 2, "message_id": 101, "bytes": 20, "total": 100},
+    ]
 
     engine._finish_download_progress(second)
     assert reports[-1]["active_downloads"] == 1
     assert reports[-1]["file"] == "101.mp4"
-    assert reports[-1]["speed_bps"] == 100.0
-    assert reports[-1]["aggregate_speed_bps"] == 100.0
+    assert reports[-1]["speed_bps"] == 125.0
+    assert reports[-1]["aggregate_speed_bps"] == 125.0
+    assert reports[-1]["transfers"] == [
+        {"source_id": 1, "message_id": 101, "bytes": 50, "total": 100}
+    ]
     engine._finish_download_progress(first)
     assert reports[-1] == {}

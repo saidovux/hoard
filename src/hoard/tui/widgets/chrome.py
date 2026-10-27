@@ -12,7 +12,7 @@ from textual.message import Message
 from textual.widgets import OptionList, Static
 from textual.widgets.option_list import Option, OptionDoesNotExist
 
-from ..colors import ACCENT, MUTED, TEXT
+from ..colors import ACCENT, DANGER, GOOD, MUTED, TEXT, WARNING
 from ..navigation import (
     GROUP_TITLES,
     SECTIONS,
@@ -79,12 +79,12 @@ class Sidebar(Static):
 
     BACK = "workspace-back"
     INDICATOR_COLORS = {
-        "ready": "#55C878",
-        "connected": "#55C878",
-        "saved": "#E3B341",
-        "stopped": "#E5534B",
-        "error": "#E5534B",
-        "login_required": "#E5534B",
+        "ready": GOOD,
+        "connected": GOOD,
+        "saved": WARNING,
+        "stopped": DANGER,
+        "error": DANGER,
+        "login_required": DANGER,
         "starting": MUTED,
         "stopping": MUTED,
         "unknown": MUTED,

@@ -11,6 +11,7 @@ from .status import (
     StatisticsView,
     Tile,
 )
+from .telegram_monitor import TelegramMonitor
 
 __all__ = [
     "ARCHIVE_TILES",
@@ -23,6 +24,7 @@ __all__ = [
     "ProgressView",
     "Sidebar",
     "StatisticsView",
+    "TelegramMonitor",
     "Tile",
     "hints_text",
 ]

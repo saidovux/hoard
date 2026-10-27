@@ -213,52 +213,28 @@ OptionList > .option-list--separator {
 
 /* ── Home ───────────────────────────────────────────────────────────────── */
 
-#home-grid {
-    layout: grid;
-    grid-size: 2;
-    grid-columns: 1fr 1fr;
-    grid-rows: auto;
-    grid-gutter: 0 1;
+#telegram-monitor-panel {
     height: auto;
+    min-height: 8;
 }
 
-#home-grid > .panel {
-    height: 100%;
+#telegram-monitor, #home-summary {
+    height: auto;
+    min-height: 1;
+    text-wrap: nowrap;
+    text-overflow: ellipsis;
 }
 
-/* What is running takes the whole left side; the figures stack on its right. */
-#now-panel {
-    row-span: 2;
+#workspace #telegram-monitor {
+    padding-left: 0;
 }
 
-#tools-panel {
-    column-span: 2;
+#home-summary {
+    margin-top: 1;
 }
 
-.narrow #home-grid {
-    grid-size: 1;
-    grid-columns: 1fr;
-}
-
-.narrow #now-panel {
-    row-span: 1;
-}
-
-.narrow #tools-panel {
-    column-span: 1;
-}
-
-#events-panel {
-    height: 1fr;
+.compact #telegram-monitor-panel, .tiny #telegram-monitor-panel {
     min-height: 5;
-}
-
-.short #events-panel {
-    min-height: 3;
-}
-
-.tiny #events-panel {
-    min-height: 3;
 }
 
 #current-action, #progress, #telegram-summary, #account-summary, #web-summary,
@@ -267,7 +243,7 @@ OptionList > .option-list--separator {
     min-height: 1;
 }
 
-/* A spanning panel is measured at one column's width: wrapped lines would reserve phantom rows. */
+/* Legacy status widgets remain available to non-Home consumers. */
 #current-action, #progress, #events, #statistics, #queue-stats, #tools {
     text-wrap: nowrap;
     text-overflow: ellipsis;

@@ -15,8 +15,9 @@ background service.
   workspace (former Overview/Activity map to Home; Sources maps to Telegram Sources) used by the
   contextual sidebar, breadcrumb, level-local digits/cycling and palette;
   `colors.py` owns the Noir palette; `palette.py` searches sections and app commands;
-  `widgets/panel.py`, `widgets/hero.py`, `widgets/status.py` and `widgets/chrome.py` provide the
-  framed-panel layout, wordmark, figures and key-chip footer. Dialogs, screens, status formatting,
+  `widgets/panel.py`, `widgets/hero.py`, `widgets/status.py`, `widgets/telegram_monitor.py` and
+  `widgets/chrome.py` provide the framed-panel layout, wordmark, figures, the compact Home transfer
+  strip and key-chip footer. Dialogs, screens, status formatting,
   reusable widgets and TCSS remain separate. The package imports neither storage nor Telethon, and
   never creates a Telegram client. See `docs/TUI.md`.
 - `ipc.py` starts the daemon detached when required and sends one JSON request per private
@@ -87,7 +88,9 @@ network/VPN guidance inside the active Textual modal while the daemon owns the a
 
 The Textual client is the sole interactive presentation and may enter application mode. Only the
 visible Home screen owns the moderate 1.5-second timer; it requests a bounded `status_brief`
-snapshot and the app's async lock drops overlapping ticks and skips unchanged redraws. Archive and
+snapshot and the app's async lock drops overlapping ticks and skips unchanged redraws. The Home
+Telegram monitor uses only that snapshot, updates changed content without rebuilding navigation,
+and clears transfer slots when the collector stops or IPC becomes unavailable. Archive and
 Telegram Sources request detailed status only when opened; recent collections are bounded and an oversized
 compatibility response is explicitly truncated before the 64 KiB IPC boundary. Screen suspension, unmount and app exit
 stop the timer. IPC startup and request errors render inside the stable black workspace so a slow
@@ -97,7 +100,9 @@ collector, frame-stop, shutdown or Telegram command; previously started frame/We
 The Textual theme sets background, surface and panel to `#000000`; TCSS also fixes computed
 backgrounds for containers, navigation components, focus/hover/selected states, inputs, tables,
 buttons, menus and modals. The outer workspace exposes **Главная**, **Архив**, **Telegram** and
-**AI**. Home merges the former Overview and Activity dashboards. Telegram switches that same
+**AI**. Home keeps the wordmark, one Telegram activity monitor and compact Hoard-wide totals;
+historical events and tool summaries remain available through their owning screens/data rather
+than global Home panels. Telegram switches that same
 sidebar to **Статус**, **Источники**, and bottom-pinned **Web Viewer** and **Вход** pages; no second
 sidebar is mounted. `telegram` resolves to Status and `sources` directly to Sources. Archive retains
 downloads, profiles, jobs, catalog and video-frame actions, with less frequent AI/frame commands
@@ -210,7 +215,11 @@ after a manual session ends, a bounded deferred report publishes if the Telegram
 Enabled sources become unique `telegram.scan` jobs when due. Telegram jobs remain serialized by
 the global session lock, while one scan uses the same authorized client for a bounded set of video
 note transfers. `HOARD_TG_DOWNLOADS` selects `1` through `4` transfers (default `3`) independently
-of `HOARD_MAX_JOBS`; both active transfers and the traversal reorder buffer are bounded. Profile
+of `HOARD_MAX_JOBS`; both active transfers and the traversal reorder buffer are bounded. Progress
+keeps its compatible selected-file fields and additionally publishes a bounded `transfers` list
+from the same in-memory active-download map. Entries contain only `source_id`, `message_id`, bytes
+and total; they are neither persisted nor obtained through extra polling. The TUI pins at most
+three identities to stable horizontal slots while the fourth transfer continues normally. Profile
 photos, post metadata, post media and report generation remain separate deduplicated job kinds.
 
 The scan coordinator commits cursor movement in encountered traversal order rather than assuming
@@ -343,9 +352,10 @@ SQLite, Telegram sessions, AI attachments and arbitrary filesystem paths have no
 
 Telethon's progress callback supplies current and total bytes. Hoard keeps independent transfer
 state and speed for each active video note. IPC retains the established single-file fields and
-adds optional `active_downloads` and `aggregate_speed_bps`; aggregate speed is the sum of current
-per-file rates and never replaces `speed_bps`. The UI shows a percent only when the selected file's
-total is non-zero and never invents an ETA. Routine Telegram failures are stored as actionable
+adds `active_downloads`, `aggregate_speed_bps` and `transfers`; aggregate speed is the sum of
+current per-file rates and never replaces `speed_bps`. Each transfer is stably identified by its
+source and message IDs. The UI derives a segment fraction only from a positive total and never
+invents a remainder, percentage or ETA. Routine Telegram failures are stored as actionable
 messages; exception class details are returned only when local `HOARD_DEBUG=1` is explicitly
 enabled.
 

@@ -13,6 +13,12 @@ unverified saved session from a daemon-verified connection and shows only cached
 details. Enabling Web waits for confirmed loopback readiness and then opens a fresh one-use URL;
 a browser-launch failure leaves the server running for an explicit retry.
 
+The global **Главная** is now activity-first: the HOARD wordmark, one compact Telegram monitor and
+one quiet line of queue/archive totals. The monitor shows current scan counters and one horizontal
+strip with three identity-stable download segments. Telegram may still run four concurrent
+downloads; all four are counted while three remain visible. Unknown totals and remaining work are
+shown as unknown rather than inferred from message IDs, archive totals or queue length.
+
 The 0.7.3.0 release redesigns the explicit local Web client as **Black Archive 03**. It applies a
 compact black-and-orange workspace to the existing catalog: publication cards, the open
 publication, profile cards, the open profile with photos, video notes, ready frames, username
@@ -190,8 +196,8 @@ screen also retains a direct “Открыть HTML” action for an existing lo
 hoard
 ```
 
-The global level has four entries: **Главная** (HOARD wordmark, current task, progress, queue,
-archive figures, one line per tool and latest events), **Архив**, and, in the **ИНСТРУМЕНТЫ**
+The global level has four entries: **Главная** (HOARD wordmark, Telegram activity monitor and
+compact queue/archive figures), **Архив**, and, in the **ИНСТРУМЕНТЫ**
 group, **Telegram** and **AI**. Opening Telegram switches the same sidebar to its workspace:
 **Статус**, **Источники**, and bottom-pinned **Web Viewer** and **Вход** entries plus a direct
 **Назад в Hoard** action. Former keys remain compatible aliases: `overview`/`activity` open
@@ -323,9 +329,11 @@ The report is one portable HTML file. New media objects use stable ID-based path
 ```
 
 SQLite checkpoints and file-size checks prevent duplicate downloads and recover missing or
-truncated archive files. The progress view reports one current file with its own byte count and
-speed, plus the active-transfer count and aggregate speed when downloads overlap. Percentages are
-shown only when Telegram supplies a total; queue state and recent errors remain visible.
+truncated archive files. Progress retains one compatible current-file view with its byte count and
+speed, plus active-transfer count and aggregate speed. The bounded `progress.transfers` list gives
+the TUI independent `(source_id, message_id, bytes, total)` snapshots without paths or history.
+Percentages are derived only when Telegram supplies a positive total; no remaining count is
+fabricated.
 
 Existing pre-0.4 paths are not moved, copied or deleted. Their SQLite records and safe JSON
 sidecars are migrated in place and referenced by the catalog. Existing source cursors are kept.

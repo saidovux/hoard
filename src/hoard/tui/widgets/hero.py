@@ -1,4 +1,4 @@
-"""The Home page masthead: the program name in block letters, with the system state beside it.
+"""The Home page masthead: the program name in block letters and its compact version.
 
 Two sizes of the same wordmark are kept and the stylesheet picks one by terminal size (see the
 ``hero-*`` rules in ``theme.tcss``): a six-row block logo for roomy terminals and a three-row
@@ -15,8 +15,7 @@ from textual.widgets import Static
 
 from hoard import __version__
 
-from ..colors import ACCENT, FRAME, MUTED, TEXT
-from ..state import collector_label
+from ..colors import ACCENT, FRAME, MUTED
 
 # "ANSI Shadow" H-O-A-R-D. The solid blocks are the letters, the line characters their shadow.
 LOGO_BIG = (
@@ -37,8 +36,6 @@ LOGO_SMALL = (
 
 #: Blank columns between the wordmark and the text beside it.
 GAP = 4
-TAGLINE = "локальный архив"
-SUBLINE = "всё хранится на этом компьютере"
 
 
 def logo_text(rows: tuple[str, ...], *, shadow: bool) -> list[Text]:
@@ -66,36 +63,23 @@ class Hero(Static):
     def __init__(self, variant: str) -> None:
         super().__init__(id=f"hero-{variant}", classes=f"hero hero-{variant}")
         self.big = variant == "big"
-        self._status: dict | None = None
         self._painted_width = -1
 
     def on_mount(self) -> None:
         self._paint()
 
     def show_status(self, status: dict | None) -> None:
-        self._status = status
-        self._paint()
+        del status
+        if self._painted_width < 0:
+            self._paint()
 
     def on_resize(self, event: Resize) -> None:
         if self.content_size.width != self._painted_width:
             self._paint()
 
     def _info_variants(self) -> list[list[Text]]:
-        """Text columns from richest to leanest; the first that fits next to the logo wins."""
-        title = Text(no_wrap=True)
-        title.append(TAGLINE, style=f"bold {TEXT}")
-        title.append(f"   v{__version__}", style=MUTED)
-        subline = Text(SUBLINE, style=MUTED, no_wrap=True)
-        if self._status is None:
-            return [[title, subline], [title]]
-        label = collector_label(self._status)
-        running = label == "работает"
-        state = Text(no_wrap=True)
-        state.append("● " if running else "○ ", style=ACCENT if running else MUTED)
-        state.append(f"сборщик {label}", style=TEXT if running else MUTED)
-        if self.big:
-            return [[title, subline, Text(), state], [title, Text(), state], [title]]
-        return [[title, subline, state], [title, state], [title]]
+        """The version is optional when even the smallest wordmark fills the row."""
+        return [[Text(f"v{__version__}", style=MUTED, no_wrap=True)], []]
 
     def _paint(self) -> None:
         rows = LOGO_BIG if self.big else LOGO_SMALL
@@ -105,7 +89,7 @@ class Hero(Static):
         room = width - art_width - GAP if width > 0 else 10_000
         info: list[Text] = []
         for variant in self._info_variants():
-            if max(line.cell_len for line in variant) <= room:
+            if not variant or max(line.cell_len for line in variant) <= room:
                 info = variant
                 break
         # The text hangs from the second row of a tall wordmark and from the first of a short one.

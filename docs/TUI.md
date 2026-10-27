@@ -41,7 +41,7 @@ nested Sources page.
 
 | Level | Page | Contents |
 | --- | --- | --- |
-| Hoard | **Главная** | wordmark, current task/progress, queue, archive figures, tool summaries and events |
+| Hoard | **Главная** | wordmark, compact Telegram activity monitor and quiet queue/archive totals |
 | Hoard | **Архив** | Кружки / Профили / Задания, catalogue, complete manual frame workflow and existing profile/frame AI actions |
 | Hoard | **Telegram** | entry into the Telegram workspace; defaults to Status |
 | Hoard | **AI** | existing provider settings, records and chat |
@@ -84,7 +84,8 @@ neutral when state cannot be established.
 * When the sidebar is hidden by the responsive breakpoint, focus is moved out of it. It must not
   keep receiving `j`/`k` while invisible.
 * Home polls only bounded `status_brief` data, keeps one request in flight and skips unchanged
-  redraws. Detailed Archive/Sources data is loaded on entry. Web is checked on its page and is not
+  redraws. Its Telegram monitor consumes the snapshot only; it never queries Telegram, SQLite or
+  files independently. Detailed Archive/Sources data is loaded on entry. Web is checked on its page and is not
   polled globally; account checks are explicit. Status repaint never rebuilds the sidebar, moves
   its highlight or steals a field's focus.
 * Opening an AI conversation hides the list workspace, gives the message field focus and scrolls
@@ -94,8 +95,28 @@ neutral when state cannot be established.
 
 The Home wordmark comes in two sizes (`widgets/hero.py`): six rows when the terminal is at least
 30 rows tall and 76 columns wide, three rows below that, and none under 22 rows — the header
-already carries the name there. The text beside it (tagline, version, collector state) degrades
-by width, never wrapping over the letters.
+already carries the name there. Only the compact version is shown beside it when space permits;
+collector state belongs to the monitor rather than being repeated by the logo.
+
+## Home Telegram monitor
+
+The Home monitor describes only the current scan: `progress.source`, comments `checked`, newly
+saved video notes `downloaded`, and the current `active_downloads`. A total or remainder is shown
+only when the daemon actually supplies one; message IDs, queue length and archive totals are never
+used as substitutes. Queue and archive totals remain a separate compact Hoard-wide line.
+
+The title dot is green only when the daemon confirms an authorized connected account and a running
+collector, yellow for a confirmed account with the collector stopped or paused, red when login or
+recovery is required, and neutral for unknown/IPC-unavailable state. The dot is unrelated to Web
+Viewer state.
+
+`progress.transfers` contains at most the active Telegram video-note downloads. Each entry is
+identified by `(source_id, message_id)` and carries received `bytes` plus an optional positive
+`total`. The monitor keeps a temporary identity-to-slot map: surviving transfers do not move when
+another finishes, and the next transfer occupies the free slot. One horizontal strip always has
+three segments. The collector may run four downloads (`HOARD_TG_DOWNLOADS=4`); the fourth remains
+active and is included in the count without displacing the three visible slots. Unknown sizes use
+a neutral activity mark, not a fabricated percentage. Slots are cleared on stop or IPC failure.
 
 ## Keyboard
 
@@ -114,7 +135,7 @@ typing, and `j`/`k`/arrows remain native to focused tables and lists.
 
 | Class | Condition | Effect |
 | --- | --- | --- |
-| `narrow` | width < 96 | Home becomes a single column of panels |
+| `narrow` | width < 96 | Home labels and shared action layouts tighten |
 | `medium` | width < 110 | action grids drop to two or three columns |
 | `compact` | width < 76 | one-column actions, tighter padding, the small wordmark |
 | `sidebar-hidden` | width < 60 | sidebar hidden; use `[` `]`, digits or `:` |
@@ -129,8 +150,7 @@ typing, and `j`/`k`/arrows remain native to focused tables and lists.
    concrete default `target`, declare only implemented child `Section`s with `parent=<tool key>`,
    and add their tuple to `WORKSPACES`. The sidebar, breadcrumb, level-local `[`/`]` and digits,
    aliases and palette then share the same routes.
-3. Optionally add a one-line summary to `MODULE_SUMMARIES` in `tui/screens/home.py` so the tool
-   appears in the *Инструменты* panel on Home, and extra entries to `HoardApp.commands()` for the
-   palette.
+3. Add extra entries to `HoardApp.commands()` only when the tool has a real global command. Home
+   remains activity-first and does not grow a generic tool-summary panel.
 
 Unfinished integrations must stay out of `SECTIONS` — the interface only shows what works.

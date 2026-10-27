@@ -8,11 +8,15 @@ Local-first Telegram archive and extensible small-tool core, Python >=3.11. Keep
 - Keep the Noir terminal-native visual language: black surfaces, `#FFFFFF` text, `#888888` hints,
   `#7B4B23` frames at rest, `#262626` hairlines and `#F79646` focus/meaning. Pages are framed
   `Panel`s with titles in the border, shortcuts as key chips and orange block selection. `Home`,
-  `Home`, `Archive`, `Telegram` and `AI` remain the four global entries. Telegram replaces the
+  `Archive`, `Telegram` and `AI` remain the four global entries. Telegram replaces the
   global menu with its `Status`, `Sources`, bottom-pinned `Web Viewer` and `Login` workspace;
   `overview`/`activity`/`sources` remain navigation aliases, with `sources` opening the nested
   Sources page. New controls for existing features must fit this language instead of adding a new
   visual system or unmounted section.
+- Home stays a global activity surface: the wordmark, one compact Telegram monitor and quiet
+  queue/archive totals. Its three stable horizontal transfer slots are fed only by bounded
+  `status_brief.progress.transfers`; four downloads may keep running while only three are shown.
+  Home never opens SQLite or a Telegram client and retains the single 1.5-second polling loop.
 - Maintain existing XDG session/config/database locations and schema. Never commit sessions, API keys, downloaded media, local archives or real profile data.
 - Preserve `hoard start`, `stop`, `scan`, `status`, `shutdown`, `add`, `retry`, `telegram` and
   `web` and their noninteractive/JSON output. Service commands must not import Textual.

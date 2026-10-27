@@ -218,6 +218,15 @@ class TelegramEngine:
             value["aggregate_speed_bps"] = sum(
                 float(item.get("speed_bps") or 0) for item in active.values()
             )
+            value["transfers"] = [
+                {
+                    "source_id": source_id,
+                    "message_id": message_id,
+                    "bytes": item.get("bytes", 0),
+                    "total": item.get("total", 0),
+                }
+                for (source_id, message_id), item in active.items()
+            ]
         self.progress = value
         self.report_progress(value.copy())
 
