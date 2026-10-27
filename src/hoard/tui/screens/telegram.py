@@ -1,4 +1,4 @@
-"""Telegram, the first tool: the account and collector on top, the watched sources below."""
+"""The four pages of the Telegram workspace."""
 
 from __future__ import annotations
 
@@ -13,27 +13,24 @@ from textual.widgets import Button, DataTable, Static
 
 from ..colors import ACCENT, MUTED, TEXT
 from ..dialogs import ConfirmDialog, SourceDialog
-from ..state import collector_label, telegram_label
-from ..widgets import Panel
+from ..state import collector_label, progress_lines, telegram_label
+from ..widgets import Panel, Sidebar
 from ..widgets.chrome import Hint
 from .base import WorkspaceScreen
 
 SOURCE_COLUMNS = ("Источник", "Состояние", "Кружки", "Каждые", "Проверка", "Результат")
-#: Indices into SOURCE_COLUMNS that stay on terminals narrower than 110 columns.
 DENSE_SOURCE_COLUMNS = (0, 1, 2, 5)
-#: Below 76 columns only the identity and live state are useful.
 COMPACT_SOURCE_COLUMNS = (0, 1, 2)
 SOURCE_HINTS: tuple[Hint, ...] = (("a", "добавить"), ("e", "изменить"), ("s", "проверить"))
 
 
 def _short_time(value: object) -> str:
-    """``2026-10-21 10:12:13`` -> ``2026-10-21 10:12``; the seconds never help in a table."""
     text = str(value or "")
     return text[:16] if text else "ещё не проверялся"
 
 
 def _source_widths(columns: tuple[int, ...], table_width: int) -> tuple[int, ...]:
-    """Fixed widths keep long usernames/errors from creating a horizontal scrollbar."""
+    """Fixed widths keep long usernames/errors from creating horizontal scrolling."""
     count = len(columns)
     available = max(count * 4, table_width - count * 2 - 1)
     if count == 6:
@@ -51,207 +48,31 @@ def _source_widths(columns: tuple[int, ...], table_width: int) -> tuple[int, ...
     return source, state, downloads
 
 
-class TelegramScreen(WorkspaceScreen):
-    section = "telegram"
+class _TelegramWorkspaceScreen(WorkspaceScreen):
     HINTS: ClassVar[tuple[Hint, ...]] = (("tab", "панели"), ("[ ]", "раздел"), ("h", "назад"))
-    BINDINGS = [
-        Binding("a", "add_source", "Добавить"),
-        Binding("e", "edit_source", "Изменить"),
-        Binding("s", "scan_source", "Проверить"),
-    ]
 
-    def __init__(self) -> None:
-        super().__init__()
-        self._source_ids: list[int] = []
-        self._source_layout: tuple[tuple[int, ...], tuple[int, ...]] | None = None
-        self._web_state: dict[str, Any] = {"state": "stopped"}
-        self._web_loading = False
 
-    def compose_workspace(self) -> ComposeResult:
-        with Panel(title="Сборщик", id="collector-panel"):
-            yield Static(id="telegram-summary")
-            with Horizontal(classes="action-row", id="telegram-actions"):
-                yield Button("Подключить", id="telegram-connect", variant="primary")
-                yield Button("Запустить", id="collector-start")
-                yield Button("Пауза", id="collector-pause")
-                yield Button("Остановить", id="collector-stop")
-        with Panel(title="Web", id="web-panel"):
-            yield Static(id="web-summary")
-            with Horizontal(classes="action-row", id="web-actions"):
-                yield Button("Включить Web", id="web-start", variant="primary")
-                yield Button("Открыть Web", id="web-open")
-                yield Button("Выключить Web", id="web-stop")
-        with Panel(title="Источники", hints=SOURCE_HINTS, id="sources-panel"):
-            with Horizontal(classes="action-row", id="source-actions"):
-                yield Button("Добавить", id="source-add", variant="primary")
-                yield Button("Изменить", id="source-edit")
-                yield Button("Вкл./выкл.", id="source-toggle")
-                yield Button("Проверить", id="source-scan")
-                yield Button("Проверить все", id="source-scan-all")
-                yield Button("Анализ профилей", id="source-ai")
-            with Horizontal(classes="action-row", id="source-ai-actions"):
-                yield Button("AI: кадры", id="source-ai-frames")
-                yield Button("AI: кадры + фото", id="source-ai-combined")
-            yield DataTable(id="sources-table", cursor_type="row")
+class _CollectorControls:
+    """Existing collector lifecycle shared only by the status page."""
 
-    def on_mount(self) -> None:
-        super().on_mount()
-        self._refresh_web()
-        self.call_after_refresh(self._focus_initial)
-
-    def _focus_initial(self) -> None:
-        # The sources are the page's working surface: j / k and a / e / s act on them at
-        # once.  On a short terminal, however, auto-scrolling them into view would hide the
-        # account and collector; keep focus on the visible top of the page instead.
-        self.focus_working_surface(self.query_one("#sources-table", DataTable))
-
-    def on_screen_resume(self) -> None:
-        super().on_screen_resume()
-        self._refresh_web()
-
-    # ── collector ────────────────────────────────────────────────────────────
-
-    def render_data(self, status: dict) -> None:
-        self._render_collector(status)
-        self._render_web()
-        self._render_sources(status)
-
-    def _render_collector(self, status: dict) -> None:
-        authorized = str(status.get("telegram") or "") == "authorized"
-        queue = status.get("queue") or {}
-        summary = Text()
-        summary.append("аккаунт".ljust(9), style=MUTED)
-        summary.append(telegram_label(status), style=TEXT if authorized else ACCENT)
-        summary.append("\n" + "сборщик".ljust(9), style=MUTED)
-        summary.append(collector_label(status), style=TEXT)
-        summary.append(
-            f" · {queue.get('queued', 0)} ожидают · {queue.get('running', 0)} выполняются",
-            style=MUTED,
-        )
-        self.query_one("#telegram-summary", Static).update(summary)
-
-        running = bool(status.get("running"))
-        collector_state = str(status.get("collector_state") or "stopped")
-        connect = self.query_one("#telegram-connect", Button)
-        connect.label = "Проверить сессию" if authorized else "Подключить"
-        self.query_one("#collector-start", Button).label = (
-            "Возобновить" if collector_state == "paused" else "Запустить"
-        )
-        self.query_one("#collector-start", Button).disabled = running
-        self.query_one("#collector-pause", Button).disabled = not running
-        self.query_one("#collector-stop", Button).disabled = (
-            not running and collector_state == "stopped"
-        )
-
-    def _render_web(self) -> None:
-        state = str(self._web_state.get("state") or "stopped")
-        labels = {
-            "stopped": "выключен",
-            "starting": "запускается",
-            "ready": "работает",
-            "stopping": "останавливается",
-            "error": "ошибка",
-        }
-        text = Text()
-        text.append("состояние".ljust(11), style=MUTED)
-        text.append(labels.get(state, state), style=ACCENT if state == "error" else TEXT)
-        if state == "ready" and self._web_state.get("port"):
-            text.append(f" · 127.0.0.1:{self._web_state['port']}", style=MUTED)
-        if state == "error" and self._web_state.get("error"):
-            text.append("\n" + str(self._web_state["error"]), style=ACCENT)
-        if state == "ready" and not self._web_state.get("controllable", True):
-            text.append(
-                "\nWeb запущен без управляющего канала; перезапусти его вручную",
-                style=ACCENT,
-            )
-        self.query_one("#web-summary", Static).update(text)
-
-        busy = self._web_loading
-        controllable = bool(self._web_state.get("controllable", True))
-        start = self.query_one("#web-start", Button)
-        open_button = self.query_one("#web-open", Button)
-        stop = self.query_one("#web-stop", Button)
-        start.disabled = busy or state in {"starting", "ready", "stopping"}
-        open_button.disabled = busy or state != "ready" or not controllable
-        stop.disabled = busy or state != "ready" or not controllable
-
-    def _refresh_web(self) -> None:
-        if self._web_loading:
+    def _start(self: TelegramStatusScreen) -> None:
+        if str((self.hoard_app.status or {}).get("telegram") or "") != "authorized":
+            self.hoard_app.set_notice("Сначала подключи Telegram на странице «Вход».")
+            self.hoard_app.open_section("telegram_login")
             return
-        self._web_loading = True
-        self._render_web()
-        self.run_worker(self._load_web_state(), name="web-status", exit_on_error=False)
-
-    async def _load_web_state(self) -> None:
-        try:
-            self._web_state = await self.hoard_app.api.web_status()
-        except Exception as exc:
-            self._web_state = {"state": "error", "error": str(exc) or type(exc).__name__}
-        finally:
-            self._web_loading = False
-            if self.is_mounted:
-                self._render_web()
-
-    def _web_start(self) -> None:
-        if self._web_loading:
-            return
-        self._web_state = {"state": "starting"}
-        self._run_web_action("web-start", self.hoard_app.api.start_web, "Включаем Web…")
-
-    def _web_open(self) -> None:
-        self._run_web_action("web-open", self.hoard_app.api.open_web, "Открываем Web…")
-
-    def _web_stop(self) -> None:
-        if self._web_loading:
-            return
-        self._web_state = {"state": "stopping"}
-        self._run_web_action("web-stop", self.hoard_app.api.stop_web, "Останавливаем Web…")
-
-    def _run_web_action(
-        self,
-        key: str,
-        operation: Callable[[], Awaitable[dict[str, Any]]],
-        pending: str,
-    ) -> None:
-        if self._web_loading:
-            return
-        self._web_loading = True
-        self.hoard_app.set_notice(pending)
-        self._render_web()
-        self.run_worker(self._perform_web_action(operation), name=key, exit_on_error=False)
-
-    async def _perform_web_action(
-        self, operation: Callable[[], Awaitable[dict[str, Any]]]
-    ) -> None:
-        try:
-            result = await operation()
-        except Exception as exc:
-            self.hoard_app.set_notice(str(exc) or type(exc).__name__, error=True)
-        else:
-            self.hoard_app.set_notice(str(result.get("message") or "Готово"))
-        finally:
-            await self._load_web_state()
-
-    def _connect(self) -> None:
-        self.hoard_app.open_auth()
-
-    def _start(self) -> None:
-        self.hoard_app.ensure_telegram(self._start_authorized)
-
-    def _start_authorized(self) -> None:
         self._control(
             "collector-start",
             self.hoard_app.api.start_collector,
             "Запускаем сборщик…",
         )
 
-    def _pause(self) -> None:
+    def _pause(self: TelegramStatusScreen) -> None:
         self._confirm_interrupt("pause")
 
-    def _stop(self) -> None:
+    def _stop(self: TelegramStatusScreen) -> None:
         self._confirm_interrupt("stop")
 
-    def _confirm_interrupt(self, operation: str) -> None:
+    def _confirm_interrupt(self: TelegramStatusScreen, operation: str) -> None:
         status = self.hoard_app.status or {}
         active = bool(status.get("progress")) or bool((status.get("queue") or {}).get("running"))
         if not active:
@@ -268,7 +89,7 @@ class TelegramScreen(WorkspaceScreen):
             lambda confirmed: self._run_interrupt(operation) if confirmed else None,
         )
 
-    def _run_interrupt(self, operation: str) -> None:
+    def _run_interrupt(self: TelegramStatusScreen, operation: str) -> None:
         if operation == "pause":
             self._control(
                 "collector-pause",
@@ -283,7 +104,7 @@ class TelegramScreen(WorkspaceScreen):
             )
 
     def _control(
-        self,
+        self: TelegramStatusScreen,
         key: str,
         operation: Callable[[], Awaitable[dict[str, Any]]],
         pending: str,
@@ -294,24 +115,120 @@ class TelegramScreen(WorkspaceScreen):
             exit_on_error=False,
         )
 
-    # ── sources ──────────────────────────────────────────────────────────────
 
-    def _render_sources(self, status: dict) -> None:
+class TelegramStatusScreen(_CollectorControls, _TelegramWorkspaceScreen):
+    section = "telegram_status"
+
+    def compose_workspace(self) -> ComposeResult:
+        with Panel(title="Статус Telegram", id="collector-panel"):
+            yield Static(id="telegram-summary")
+            with Horizontal(classes="action-row", id="telegram-actions"):
+                yield Button("Запустить", id="collector-start", variant="primary")
+                yield Button("Пауза", id="collector-pause")
+                yield Button("Остановить", id="collector-stop")
+                yield Button("Перейти ко входу", id="telegram-login")
+
+    def render_data(self, status: dict) -> None:
+        account = status.get("telegram_account") or {}
+        account_state = str(account.get("state") or "unknown")
+        account_labels = {
+            "connected": "подключён",
+            "saved": "сессия сохранена, соединение не проверено",
+            "login_required": telegram_label(status),
+            "unknown": "состояние неизвестно",
+        }
+        queue = status.get("queue") or {}
+        summary = Text()
+        summary.append("аккаунт".ljust(12), style=MUTED)
+        summary.append(account_labels.get(account_state, telegram_label(status)), style=TEXT)
+        summary.append("\n" + "сборщик".ljust(12), style=MUTED)
+        summary.append(collector_label(status), style=TEXT)
+        summary.append("\n" + "очередь".ljust(12), style=MUTED)
+        summary.append(
+            f"{queue.get('queued', 0)} ожидают · {queue.get('running', 0)} выполняются",
+            style=TEXT,
+        )
+        summary.append("\n" + "активность".ljust(12), style=MUTED)
+        summary.append(" · ".join(progress_lines(status)), style=TEXT)
+        error = next(
+            (
+                str(event.get("text") or "")
+                for event in status.get("events") or []
+                if str(event.get("kind") or "") == "error" and event.get("text")
+            ),
+            "",
+        )
+        if error:
+            summary.append("\n" + "ошибка".ljust(12), style=MUTED)
+            summary.append(error, style=ACCENT)
+        self.query_one("#telegram-summary", Static).update(summary)
+
+        running = bool(status.get("running"))
+        collector_state = str(status.get("collector_state") or "stopped")
+        self.query_one("#collector-start", Button).label = (
+            "Возобновить" if collector_state == "paused" else "Запустить"
+        )
+        self.query_one("#collector-start", Button).disabled = running
+        self.query_one("#collector-pause", Button).disabled = not running
+        self.query_one("#collector-stop", Button).disabled = (
+            not running and collector_state == "stopped"
+        )
+        self.query_one("#telegram-login", Button).display = account_state != "connected"
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        actions = {
+            "collector-start": self._start,
+            "collector-pause": self._pause,
+            "collector-stop": self._stop,
+            "telegram-login": lambda: self.hoard_app.open_section("telegram_login"),
+        }
+        action = actions.get(str(event.button.id))
+        if action:
+            action()
+
+
+class TelegramSourcesScreen(_TelegramWorkspaceScreen):
+    section = "telegram_sources"
+    BINDINGS = [
+        Binding("a", "add_source", "Добавить"),
+        Binding("e", "edit_source", "Изменить"),
+        Binding("s", "scan_source", "Проверить"),
+    ]
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._source_ids: list[int] = []
+        self._source_layout: tuple[tuple[int, ...], tuple[int, ...]] | None = None
+
+    def compose_workspace(self) -> ComposeResult:
+        with Panel(title="Источники", hints=SOURCE_HINTS, id="sources-panel"):
+            with Horizontal(classes="action-row", id="source-actions"):
+                yield Button("Добавить", id="source-add", variant="primary")
+                yield Button("Изменить", id="source-edit")
+                yield Button("Вкл./выкл.", id="source-toggle")
+                yield Button("Проверить", id="source-scan")
+                yield Button("Проверить все", id="source-scan-all")
+                yield Button("Анализ профилей", id="source-ai")
+            with Horizontal(classes="action-row", id="source-ai-actions"):
+                yield Button("AI: кадры", id="source-ai-frames")
+                yield Button("AI: кадры + фото", id="source-ai-combined")
+            yield DataTable(id="sources-table", cursor_type="row")
+
+    def on_mount(self) -> None:
+        super().on_mount()
+        self.call_after_refresh(self._focus_initial)
+
+    def _focus_initial(self) -> None:
+        self.focus_working_surface(self.query_one("#sources-table", DataTable))
+
+    def render_data(self, status: dict) -> None:
         table = self.query_one("#sources-table", DataTable)
         selected = self.selected_source_id
         compact = self.hoard_app.has_class("compact")
         dense = self.hoard_app.has_class("medium")
-        if compact:
-            keep = COMPACT_SOURCE_COLUMNS
-        elif dense:
-            # Below 110 columns the schedule columns would not fit and the table would
-            # scroll sideways, so only the columns that say what happened are kept.
-            keep = DENSE_SOURCE_COLUMNS
-        else:
-            keep = tuple(range(len(SOURCE_COLUMNS)))
-        # The table can be repainted before its own layout has caught up with a terminal
-        # resize.  Derive the width from the app/sidebar geometry instead of the old table
-        # size so the columns do not keep the previous layout's oversized widths.
+        keep = COMPACT_SOURCE_COLUMNS if compact else DENSE_SOURCE_COLUMNS if dense else tuple(
+            range(len(SOURCE_COLUMNS))
+        )
         table_width = max(
             20,
             self.hoard_app.size.width
@@ -336,7 +253,7 @@ class TelegramScreen(WorkspaceScreen):
             post_id = source.get("post_id", "—")
             name = title or username or "—"
             if short_labels:
-                label = name  # the post address is in the edit dialog; keep the state readable
+                label = name
             elif title and username and title != username:
                 label = f"{title} @{username}/{post_id}"
             elif username:
@@ -379,13 +296,6 @@ class TelegramScreen(WorkspaceScreen):
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         actions = {
-            "telegram-connect": self._connect,
-            "collector-start": self._start,
-            "collector-pause": self._pause,
-            "collector-stop": self._stop,
-            "web-start": self._web_start,
-            "web-open": self._web_open,
-            "web-stop": self._web_stop,
             "source-add": self.action_add_source,
             "source-edit": self.action_edit_source,
             "source-toggle": self._toggle,
@@ -485,3 +395,282 @@ class TelegramScreen(WorkspaceScreen):
             name="source-scan-all",
             exit_on_error=False,
         )
+
+
+class TelegramWebScreen(_TelegramWorkspaceScreen):
+    section = "telegram_web"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._web_state: dict[str, Any] = {"state": "unknown"}
+        self._web_loading = False
+
+    def compose_workspace(self) -> ComposeResult:
+        with Panel(title="Web Viewer", id="web-panel"):
+            yield Static(id="web-summary")
+            with Horizontal(classes="action-row", id="web-actions"):
+                yield Button("Включить", id="web-start", variant="primary")
+                yield Button("Открыть", id="web-open")
+                yield Button("Выключить", id="web-stop")
+
+    def on_mount(self) -> None:
+        super().on_mount()
+        self._refresh_web()
+
+    def on_screen_resume(self) -> None:
+        super().on_screen_resume()
+        self._refresh_web()
+
+    def render_data(self, status: dict) -> None:
+        del status
+        self._render_web()
+
+    def _render_web(self) -> None:
+        state = str(self._web_state.get("state") or "unknown")
+        labels = {
+            "unknown": "проверяем",
+            "stopped": "выключен",
+            "starting": "запускается",
+            "ready": "работает",
+            "stopping": "останавливается",
+            "error": "ошибка",
+        }
+        text = Text()
+        text.append("состояние".ljust(11), style=MUTED)
+        text.append(labels.get(state, state), style=ACCENT if state == "error" else TEXT)
+        if state == "ready" and self._web_state.get("port"):
+            text.append("\n" + "адрес".ljust(11), style=MUTED)
+            text.append(f"127.0.0.1:{self._web_state['port']}", style=TEXT)
+        if state == "error" and self._web_state.get("error"):
+            text.append("\n" + str(self._web_state["error"]), style=ACCENT)
+        if state == "ready" and not self._web_state.get("controllable", True):
+            text.append(
+                "\nWeb запущен без управляющего канала; перезапусти его вручную",
+                style=ACCENT,
+            )
+        self.query_one("#web-summary", Static).update(text)
+
+        busy = self._web_loading
+        controllable = bool(self._web_state.get("controllable", True))
+        self.query_one("#web-start", Button).disabled = busy or state in {
+            "starting", "ready", "stopping"
+        }
+        self.query_one("#web-open", Button).disabled = busy or state != "ready" or not controllable
+        self.query_one("#web-stop", Button).disabled = busy or state != "ready" or not controllable
+        if self.is_mounted:
+            self.query_one(Sidebar).set_indicators(web=state)
+
+    def _remember_web_state(self, value: dict[str, Any]) -> None:
+        self._web_state = value
+        self.hoard_app.web_state = dict(value)
+
+    def _refresh_web(self) -> None:
+        if self._web_loading:
+            return
+        self._web_loading = True
+        self._render_web()
+        self.run_worker(self._load_web_state(), name="web-status", exit_on_error=False)
+
+    async def _load_web_state(self) -> None:
+        try:
+            self._remember_web_state(await self.hoard_app.api.web_status())
+        except Exception as exc:
+            self._remember_web_state({"state": "error", "error": str(exc) or type(exc).__name__})
+        finally:
+            self._web_loading = False
+            if self.is_mounted:
+                self._render_web()
+
+    def _run_web_action(self, key: str, operation: str) -> None:
+        if self._web_loading:
+            return
+        self._web_loading = True
+        state = {
+            "start": "starting",
+            "stop": "stopping",
+            "open": "ready",
+        }[operation]
+        self._remember_web_state({"state": state})
+        messages = {
+            "start": "Включаем Web Viewer…",
+            "open": "Открываем Web Viewer…",
+            "stop": "Останавливаем Web Viewer…",
+        }
+        self.hoard_app.set_notice(messages[operation])
+        self._render_web()
+        self.run_worker(
+            self._perform_web_action(operation), name=key, exit_on_error=False
+        )
+
+    async def _perform_web_action(self, operation: str) -> None:
+        try:
+            if operation == "start":
+                await self.hoard_app.api.start_web()
+                ready = await self.hoard_app.api.web_status()
+                self._remember_web_state(ready)
+                if str(ready.get("state") or "") != "ready":
+                    raise RuntimeError("Web Viewer не подтвердил готовность")
+                try:
+                    result = await self.hoard_app.api.open_web()
+                except Exception as exc:
+                    self.hoard_app.set_notice(
+                        "Web Viewer работает, но браузер не открылся: "
+                        f"{str(exc) or type(exc).__name__}",
+                        error=True,
+                    )
+                else:
+                    self.hoard_app.set_notice(
+                        str(result.get("message") or "Web Viewer открыт в браузере"),
+                        error=result.get("opened") is False,
+                    )
+            elif operation == "open":
+                result = await self.hoard_app.api.open_web()
+                opened = result.get("opened")
+                self.hoard_app.set_notice(
+                    str(result.get("message") or "Web Viewer открыт в браузере"),
+                    error=opened is False,
+                )
+            else:
+                result = await self.hoard_app.api.stop_web()
+                self.hoard_app.set_notice(str(result.get("message") or "Web Viewer выключен"))
+        except Exception as exc:
+            self.hoard_app.set_notice(str(exc) or type(exc).__name__, error=True)
+        finally:
+            await self._load_web_state()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        actions = {
+            "web-start": ("web-start", "start"),
+            "web-open": ("web-open", "open"),
+            "web-stop": ("web-stop", "stop"),
+        }
+        action = actions.get(str(event.button.id))
+        if action:
+            self._run_web_action(*action)
+
+
+class TelegramLoginScreen(_TelegramWorkspaceScreen):
+    section = "telegram_login"
+
+    def compose_workspace(self) -> ComposeResult:
+        with Panel(title="Telegram Account", id="account-panel"):
+            yield Static(id="account-summary")
+            with Horizontal(classes="action-row", id="account-actions"):
+                yield Button("Подключить", id="account-connect", variant="primary")
+                yield Button("Проверить сессию", id="account-check")
+                yield Button("Переподключиться", id="account-reconnect")
+                yield Button("Отключить соединение", id="account-disconnect")
+
+    def render_data(self, status: dict) -> None:
+        account = status.get("telegram_account") or {}
+        state = str(account.get("state") or "unknown")
+        labels = {
+            "connected": "подключён",
+            "saved": "сессия сохранена, соединение не проверено",
+            "login_required": "требуется вход",
+            "unknown": "не определено",
+        }
+        summary = Text()
+        summary.append("состояние".ljust(14), style=MUTED)
+        summary.append(labels.get(state, state), style=TEXT if state == "connected" else ACCENT)
+        summary.append("\n" + "сессия".ljust(14), style=MUTED)
+        summary.append("сохранена" if account.get("session_present") else "нет", style=TEXT)
+        summary.append("\n" + "соединение".ljust(14), style=MUTED)
+        summary.append("установлено" if account.get("connected") else "отключено", style=TEXT)
+        profile = account.get("profile") or {}
+        if profile.get("name"):
+            summary.append("\n" + "имя".ljust(14), style=MUTED)
+            summary.append(str(profile["name"]), style=TEXT)
+        if profile.get("username"):
+            summary.append("\n" + "username".ljust(14), style=MUTED)
+            summary.append("@" + str(profile["username"]).lstrip("@"), style=TEXT)
+        if profile.get("id") is not None:
+            summary.append("\n" + "Telegram ID".ljust(14), style=MUTED)
+            summary.append(str(profile["id"]), style=TEXT)
+        if bool(status.get("running")):
+            summary.append(
+                "\n\nСборщик работает. Перед отключением соединения "
+                "останови или поставь его на паузу.",
+                style=ACCENT,
+            )
+        elif state == "login_required" and not status.get("configured"):
+            summary.append(
+                "\n\nДля входа понадобятся API ID и API Hash с my.telegram.org/apps.",
+                style=MUTED,
+            )
+        self.query_one("#account-summary", Static).update(summary)
+
+        self.query_one("#account-connect", Button).disabled = state == "connected"
+        self.query_one("#account-check", Button).disabled = not bool(status.get("configured"))
+        self.query_one("#account-reconnect", Button).disabled = not bool(
+            account.get("session_present")
+        )
+        self.query_one("#account-disconnect", Button).disabled = not bool(account.get("connected"))
+
+    def _open_auth(self) -> None:
+        self.hoard_app.open_auth()
+
+    def _check(self, *, reconnect: bool = False) -> None:
+        self.run_worker(
+            self.hoard_app.execute(
+                "telegram-account-check",
+                self._check_account,
+                pending=(
+                    "Переподключаем Telegram и проверяем сессию…"
+                    if reconnect
+                    else "Проверяем сохранённую сессию Telegram…"
+                ),
+            ),
+            name="telegram-account-check",
+            exit_on_error=False,
+        )
+
+    async def _check_account(self) -> dict[str, Any]:
+        result = await self.hoard_app.api.telegram_account_check()
+        error = str(result.get("error") or "")
+        if error:
+            raise RuntimeError(error)
+        if not result.get("authorized") and not result.get("message"):
+            result["message"] = "Сессия не подтверждена; выполни вход в Telegram"
+        return result
+
+    def _disconnect(self) -> None:
+        if bool((self.hoard_app.status or {}).get("running")):
+            self.hoard_app.set_notice(
+                "Сначала останови или поставь Telegram-сборщик на паузу.", error=True
+            )
+            return
+        self.run_worker(
+            self.hoard_app.execute(
+                "telegram-account-disconnect",
+                self.hoard_app.api.telegram_account_disconnect,
+                pending="Отключаем Telegram, сохраняя авторизованную сессию…",
+            ),
+            name="telegram-account-disconnect",
+            exit_on_error=False,
+        )
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        actions = {
+            "account-connect": self._open_auth,
+            "account-check": self._check,
+            "account-reconnect": lambda: self._check(reconnect=True),
+            "account-disconnect": self._disconnect,
+        }
+        action = actions.get(str(event.button.id))
+        if action:
+            action()
+
+
+# Import compatibility for integrations that treated the former monolithic
+# Telegram page as its default destination.
+TelegramScreen = TelegramStatusScreen
+
+
+__all__ = [
+    "TelegramLoginScreen",
+    "TelegramScreen",
+    "TelegramSourcesScreen",
+    "TelegramStatusScreen",
+    "TelegramWebScreen",
+]

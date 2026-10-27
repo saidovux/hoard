@@ -32,7 +32,9 @@ if TYPE_CHECKING:
         AIWorkspaceScreen,
         ArchiveScreen,
         HomeScreen,
+        TelegramLoginScreen,
         TelegramScreen,
+        TelegramSourcesScreen,
     )
     from hoard.tui.widgets import HoardHeader, HoardStatusBar, ProgressView, Sidebar
 
@@ -59,7 +61,10 @@ def load_textual_after_existing_async_tests():
     from hoard.tui.screens import AIWorkspaceScreen as AIWorkspaceScreenClass
     from hoard.tui.screens import ArchiveScreen as ArchiveScreenClass
     from hoard.tui.screens import HomeScreen as HomeScreenClass
+    from hoard.tui.screens import TelegramLoginScreen as TelegramLoginScreenClass
     from hoard.tui.screens import TelegramScreen as TelegramScreenClass
+    from hoard.tui.screens import TelegramSourcesScreen as TelegramSourcesScreenClass
+    from hoard.tui.screens import TelegramWebScreen as TelegramWebScreenClass
     from hoard.tui.widgets import HoardHeader as HoardHeaderClass
     from hoard.tui.widgets import HoardStatusBar as HoardStatusBarClass
     from hoard.tui.widgets import ProgressView as ProgressViewClass
@@ -86,6 +91,9 @@ def load_textual_after_existing_async_tests():
         SourceDialog=SourceDialogClass,
         Static=StaticClass,
         TelegramScreen=TelegramScreenClass,
+        TelegramLoginScreen=TelegramLoginScreenClass,
+        TelegramSourcesScreen=TelegramSourcesScreenClass,
+        TelegramWebScreen=TelegramWebScreenClass,
         TelegramAIDialog=TelegramAIDialogClass,
         TelegramAnalysisDialog=TelegramAnalysisDialogClass,
         VideoFramesDialog=VideoFramesDialogClass,
@@ -107,6 +115,14 @@ def status_fixture(*, total: int | None = 4096) -> dict[str, Any]:
         "running": True,
         "collector_state": "running",
         "telegram": "authorized",
+        "configured": True,
+        "telegram_account": {
+            "state": "connected",
+            "connected": True,
+            "session_present": True,
+            "verified": True,
+            "profile": {"id": 101, "name": "Test User", "username": "tester"},
+        },
         "stats": {"sources": 2, "authors": 14, "downloads": 31},
         "queue": {"queued": 4, "running": 1, "failed": 2},
         "progress": progress,
@@ -206,6 +222,29 @@ class FakeAPI:
     async def auth_cancel(self) -> dict:
         return await self._operation("auth_cancel", default={"state": "phone_required"})
 
+    async def telegram_account_check(self) -> dict:
+        self.result["telegram"] = "authorized"
+        self.result["telegram_account"] = {
+            **self.result.get("telegram_account", {}),
+            "state": "connected",
+            "connected": True,
+            "verified": True,
+        }
+        return await self._operation(
+            "telegram_account_check", default={"message": "Сессия подтверждена"}
+        )
+
+    async def telegram_account_disconnect(self) -> dict:
+        self.result["telegram"] = "disconnected"
+        self.result["telegram_account"] = {
+            **self.result.get("telegram_account", {}),
+            "state": "saved",
+            "connected": False,
+        }
+        return await self._operation(
+            "telegram_account_disconnect", default={"message": "Соединение отключено"}
+        )
+
     async def validate_source(self, url: str) -> dict:
         return await self._operation(
             "validate_source",
@@ -284,6 +323,7 @@ class FakeAPI:
             default={
                 "state": "ready",
                 "url": "http://127.0.0.1:45678/start/test",
+                "opened": True,
                 "message": "Web открыт в браузере",
             },
         )
@@ -383,7 +423,15 @@ async def test_round_three_screens_tables_buttons_and_dialogs_remain_strict_blac
     app = HoardApp(api)
     async with app.run_test(size=(100, 30)) as pilot:
         await wait_for_startup(app, pilot)
-        for section in ("home", "telegram", "archive", "ai"):
+        for section in (
+            "home",
+            "telegram_status",
+            "telegram_sources",
+            "telegram_web",
+            "telegram_login",
+            "archive",
+            "ai",
+        ):
             app.open_section(section)
             await pilot.pause()
             for node in [app.screen, *app.screen.query("*")]:
@@ -432,7 +480,7 @@ async def test_live_resize_updates_compact_layout_and_sidebar():
 
 
 @pytest.mark.asyncio
-async def test_keyboard_navigation_switches_and_goes_back_without_nested_screens():
+async def test_keyboard_navigation_enters_and_leaves_telegram_workspace():
     app = HoardApp(FakeAPI())
     async with app.run_test(size=(80, 24)) as pilot:
         await wait_for_startup(app, pilot)
@@ -441,25 +489,89 @@ async def test_keyboard_navigation_switches_and_goes_back_without_nested_screens
         await pilot.press("j", "j", "enter")
         await pilot.pause()
         assert isinstance(app.screen, TelegramScreen)
+        assert app.screen.section == "telegram_status"
         assert len(app.screen_stack) == base_depth
         await pilot.press("h")
         await pilot.pause()
         assert isinstance(app.screen, HomeScreen)
         assert len(app.screen_stack) == base_depth
-        await pilot.press("down", "down", "right")
+        await pilot.press("down", "down", "enter")
         await pilot.pause()
         assert isinstance(app.screen, TelegramScreen)
         await pilot.press("escape")
         await pilot.pause()
         assert isinstance(app.screen, HomeScreen)
         # A list page hands the keyboard to its table; "h" still walks back out.
-        await pilot.press("down", "right")
+        await pilot.press("down", "enter")
         await pilot.pause()
         assert isinstance(app.screen, ArchiveScreen)
         assert isinstance(app.focused, DataTable)
         await pilot.press("h")
         await pilot.pause()
         assert isinstance(app.screen, HomeScreen)
+
+
+@pytest.mark.asyncio
+async def test_telegram_sidebar_has_pinned_lower_actions_and_returns_to_origin():
+    app = HoardApp(FakeAPI())
+    async with app.run_test(size=(80, 24)) as pilot:
+        await wait_for_startup(app, pilot)
+        app.open_section("archive")
+        await pilot.pause()
+        app.open_section("telegram")
+        await pilot.pause()
+
+        sidebar = app.screen.query_one(Sidebar)
+        primary = sidebar.query_one("#navigation", OptionList)
+        secondary = sidebar.query_one("#navigation-secondary", OptionList)
+        assert [
+            str(primary.get_option_at_index(index).id)
+            for index in range(primary.option_count)
+        ] == [Sidebar.BACK, "telegram_status", "telegram_sources"]
+        assert [
+            str(secondary.get_option_at_index(index).id)
+            for index in range(secondary.option_count)
+        ] == ["telegram_web", "telegram_login"]
+        assert secondary.region.bottom <= sidebar.content_region.bottom
+        assert sidebar.content_region.bottom - secondary.region.bottom <= 1
+        assert primary.region.bottom <= secondary.region.y
+
+        app.open_section("telegram_sources")
+        await pilot.press("h")
+        await pilot.pause()
+        assert isinstance(app.screen, TelegramScreen)
+        await pilot.press("h")
+        await pilot.pause()
+        assert isinstance(app.screen, ArchiveScreen)
+
+        app.open_section("telegram")
+        await pilot.pause()
+        primary = app.screen.query_one("#navigation", OptionList)
+        primary.highlighted = primary.get_option_index(Sidebar.BACK)
+        primary.focus()
+        await pilot.press("enter")
+        await pilot.pause()
+        assert isinstance(app.screen, ArchiveScreen)
+
+
+@pytest.mark.asyncio
+async def test_workspace_navigation_crosses_pinned_lists_with_j_and_k():
+    app = HoardApp(FakeAPI())
+    async with app.run_test(size=(60, 20)) as pilot:
+        await wait_for_startup(app, pilot)
+        app.open_section("telegram")
+        await pilot.pause()
+        sidebar = app.screen.query_one(Sidebar)
+        primary = sidebar.query_one("#navigation", OptionList)
+        secondary = sidebar.query_one("#navigation-secondary", OptionList)
+        primary.highlighted = primary.option_count - 1
+        primary.focus()
+        await pilot.press("j")
+        assert app.focused is secondary
+        assert secondary.highlighted == 0
+        await pilot.press("k")
+        assert app.focused is primary
+        assert primary.highlighted == primary.option_count - 1
 
 
 @pytest.mark.asyncio
@@ -777,14 +889,101 @@ async def test_auth_dialog_timeout_returns_to_retry_state():
 
 
 @pytest.mark.asyncio
+async def test_login_page_shows_cached_account_checks_and_disconnects_safely():
+    status = status_fixture()
+    status["running"] = False
+    status["collector_state"] = "stopped"
+    status["telegram"] = "disconnected"
+    status["telegram_account"].update(
+        state="saved",
+        connected=False,
+        verified=None,
+    )
+    api = FakeAPI(status)
+    app = HoardApp(api)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await wait_for_startup(app, pilot)
+        app.open_section("telegram_login")
+        await pilot.pause()
+        assert isinstance(app.screen, TelegramLoginScreen)
+        summary = str(app.screen.query_one("#account-summary", Static).content)
+        assert "сессия сохранена" in summary
+        assert "Test User" in summary and "@tester" in summary and "101" in summary
+
+        login_option = app.screen.query_one(
+            "#navigation-secondary", OptionList
+        ).get_option_at_index(1)
+        assert "#e3b341" in repr(login_option.prompt).lower()
+
+        await pilot.click("#account-check")
+        await wait_for_condition(
+            pilot,
+            lambda: any(name == "telegram_account_check" for name, _ in api.calls),
+        )
+        await wait_for_condition(pilot, lambda: not app._operations)
+        assert "подключён" in str(app.screen.query_one("#account-summary", Static).content)
+
+        await pilot.click("#account-disconnect")
+        await wait_for_condition(
+            pilot,
+            lambda: any(name == "telegram_account_disconnect" for name, _ in api.calls),
+        )
+        await wait_for_condition(pilot, lambda: not app._operations)
+        summary = str(app.screen.query_one("#account-summary", Static).content)
+        assert "сессия сохранена" in summary and "соединение" in summary
+
+
+@pytest.mark.asyncio
+async def test_credentials_alone_never_make_account_indicator_green():
+    status = status_fixture()
+    status["telegram"] = "phone_required"
+    status["configured"] = True
+    status["telegram_account"] = {
+        "state": "login_required",
+        "connected": False,
+        "session_present": False,
+        "verified": False,
+        "profile": {},
+    }
+    app = HoardApp(FakeAPI(status))
+    async with app.run_test(size=(100, 30)) as pilot:
+        await wait_for_startup(app, pilot)
+        app.open_section("telegram_login")
+        await pilot.pause()
+        summary = str(app.screen.query_one("#account-summary", Static).content)
+        assert "требуется вход" in summary
+        option = app.screen.query_one("#navigation-secondary", OptionList).get_option_at_index(1)
+        prompt = repr(option.prompt).lower()
+        assert "#e5534b" in prompt
+        assert "#55c878" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_login_page_refuses_disconnect_while_collector_runs():
+    api = FakeAPI()
+    app = HoardApp(api)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await wait_for_startup(app, pilot)
+        app.open_section("telegram_login")
+        await pilot.pause()
+        await pilot.click("#account-disconnect")
+        await pilot.pause()
+        assert "telegram_account_disconnect" not in [name for name, _ in api.calls]
+        assert app.notice == (
+            "Сначала останови или поставь Telegram-сборщик на паузу.",
+            True,
+        )
+
+
+@pytest.mark.asyncio
 async def test_source_flow_validates_upserts_and_does_not_create_duplicate_scan():
     api = FakeAPI()
     app = HoardApp(api)
     async with app.run_test(size=(100, 30)) as pilot:
         await wait_for_startup(app, pilot)
-        app.open_section("telegram")
+        app.open_section("telegram_sources")
         await pilot.pause()
-        assert isinstance(app.screen, TelegramScreen)
+        assert isinstance(app.screen, TelegramSourcesScreen)
         await pilot.click("#source-add")
         await wait_for_condition(pilot, lambda: isinstance(app.screen, SourceDialog))
         dialog = app.screen
@@ -806,7 +1005,7 @@ async def test_source_flow_validates_upserts_and_does_not_create_duplicate_scan(
         )
         await wait_for_condition(pilot, lambda: not dialog._busy)
         dialog.query_one("#source-primary").press()
-        await wait_for_condition(pilot, lambda: isinstance(app.screen, TelegramScreen))
+        await wait_for_condition(pilot, lambda: isinstance(app.screen, TelegramSourcesScreen))
 
         await pilot.click("#source-edit")
         await wait_for_condition(pilot, lambda: isinstance(app.screen, SourceDialog))
@@ -820,7 +1019,7 @@ async def test_source_flow_validates_upserts_and_does_not_create_duplicate_scan(
         await wait_for_condition(pilot, lambda: getattr(app.screen, "step", None) == "done")
         await wait_for_condition(pilot, lambda: not dialog._busy)
         dialog.query_one("#source-primary").press()
-        await wait_for_condition(pilot, lambda: isinstance(app.screen, TelegramScreen))
+        await wait_for_condition(pilot, lambda: isinstance(app.screen, TelegramSourcesScreen))
 
     names = [name for name, _ in api.calls]
     assert names.count("validate_source") == 2
@@ -835,7 +1034,7 @@ async def test_sources_toggle_targeted_and_global_scan_are_distinct():
     app = HoardApp(api)
     async with app.run_test() as pilot:
         await wait_for_startup(app, pilot)
-        app.open_section("telegram")
+        app.open_section("telegram_sources")
         await pilot.pause()
         await pilot.click("#source-toggle")
         await wait_for_condition(
@@ -863,7 +1062,7 @@ async def test_double_source_action_is_dropped_while_first_ipc_call_is_running()
     app = HoardApp(api)
     async with app.run_test() as pilot:
         await wait_for_startup(app, pilot)
-        app.open_section("telegram")
+        app.open_section("telegram_sources")
         await pilot.pause()
         screen = app.screen
         screen.action_scan_source()
@@ -874,9 +1073,10 @@ async def test_double_source_action_is_dropped_while_first_ipc_call_is_running()
 
 
 @pytest.mark.asyncio
-async def test_start_collector_connects_first_when_session_is_not_authorized():
+async def test_start_collector_routes_to_login_when_session_is_not_authorized():
     status = status_fixture()
     status["telegram"] = "disconnected"
+    status["telegram_account"].update(state="saved", connected=False)
     status["running"] = False
     status["collector_state"] = "stopped"
     api = FakeAPI(status)
@@ -884,6 +1084,13 @@ async def test_start_collector_connects_first_when_session_is_not_authorized():
     app = HoardApp(api)
     async with app.run_test() as pilot:
         await wait_for_startup(app, pilot)
+        app.open_section("telegram")
+        await pilot.pause()
+        await pilot.click("#collector-start")
+        await wait_for_condition(pilot, lambda: isinstance(app.screen, TelegramLoginScreen))
+        assert "start_collector" not in [name for name, _ in api.calls]
+        await pilot.click("#account-connect")
+        await wait_for_condition(pilot, lambda: not isinstance(app.screen, AuthDialog))
         app.open_section("telegram")
         await pilot.pause()
         await pilot.click("#collector-start")
@@ -933,6 +1140,23 @@ async def test_collector_controls_confirm_active_interrupt_and_refresh_state():
             pilot, lambda: any(name == "stop_collector" for name, _ in api.calls)
         )
         assert api.result["collector_state"] == "stopped"
+
+
+@pytest.mark.asyncio
+async def test_telegram_status_is_standalone_and_shows_live_work_and_last_error():
+    app = HoardApp(FakeAPI())
+    async with app.run_test(size=(100, 30)) as pilot:
+        await wait_for_startup(app, pilot)
+        app.open_section("telegram")
+        await pilot.pause()
+        summary = str(app.screen.query_one("#telegram-summary", Static).content)
+        assert "подключён" in summary
+        assert "сборщик" in summary and "работает" in summary
+        assert "4 ожидают" in summary and "1 выполняются" in summary
+        assert "circle.mp4" in summary
+        assert "Нет связи" in summary
+        assert len(app.screen.query("#sources-table")) == 0
+        assert len(app.screen.query("#phone")) == 0
 
 
 @pytest.mark.asyncio
@@ -1030,6 +1254,9 @@ async def test_context_navigation_keeps_tables_native_and_hidden_sidebar_reachab
         await pilot.press("3")
         await pilot.pause()
         assert isinstance(app.screen, TelegramScreen)
+        await pilot.press("2")
+        await pilot.pause()
+        assert isinstance(app.screen, TelegramSourcesScreen)
         table = app.screen.query_one("#sources-table", DataTable)
         table.focus()
         before = table.cursor_row
@@ -1054,7 +1281,15 @@ async def test_all_round_three_workspaces_survive_supported_sizes(size):
     app = HoardApp(FakeAPI())
     async with app.run_test(size=size) as pilot:
         await wait_for_startup(app, pilot)
-        for section in ("telegram", "archive", "ai", "home"):
+        for section in (
+            "telegram_status",
+            "telegram_sources",
+            "telegram_web",
+            "telegram_login",
+            "archive",
+            "ai",
+            "home",
+        ):
             app.open_section(section)
             await pilot.pause()
             workspace = app.screen.query_one("#workspace")
@@ -1377,16 +1612,23 @@ print("STORAGE", "hoard.storage" in sys.modules)
 
 
 @pytest.mark.asyncio
-async def test_navigation_registry_groups_tools_and_matches_registered_screens():
-    from hoard.tui.navigation import GROUP_TITLES, SECTIONS, breadcrumb
+async def test_navigation_registry_groups_tools_and_nested_telegram_pages():
+    from hoard.tui.navigation import (
+        GROUP_TITLES,
+        SECTIONS,
+        TELEGRAM_SECTIONS,
+        breadcrumb,
+    )
     from hoard.tui.screens.home import MODULE_SUMMARIES
 
     keys = [section.key for section in SECTIONS]
     assert keys == ["home", "archive", "telegram", "ai"]
     assert len(keys) == len(set(keys))
-    assert set(keys) == set(HoardApp.SCREENS)
+    assert {"home", "archive", "ai"} <= set(HoardApp.SCREENS)
+    assert {section.key for section in TELEGRAM_SECTIONS} <= set(HoardApp.SCREENS)
     assert set(MODULE_SUMMARIES) <= set(keys)
-    assert [section.label for section in breadcrumb("telegram")] == ["Telegram"]
+    assert [section.label for section in breadcrumb("telegram")] == ["Telegram", "Статус"]
+    assert [section.label for section in breadcrumb("sources")] == ["Telegram", "Источники"]
     assert [section.label for section in breadcrumb("home")] == ["Главная"]
 
     app = HoardApp(FakeAPI())
@@ -1400,20 +1642,18 @@ async def test_navigation_registry_groups_tools_and_matches_registered_screens()
         assert [str(option.id) for option in options if not option.disabled] == keys
 
 
-def test_pages_that_were_merged_still_resolve_and_children_get_a_breadcrumb(monkeypatch):
+def test_legacy_routes_resolve_to_concrete_navigation_levels():
     from hoard.tui import navigation
 
     assert [navigation.resolve(key) for key in ("overview", "activity", "sources")] == [
         "home",
         "home",
-        "telegram",
+        "telegram_sources",
     ]
     assert navigation.resolve("archive") == "archive"
-    assert navigation.section_index("sources") == navigation.section_index("telegram")
-
-    child = navigation.Section("video", "Видео", navigation.TOOLS, parent="telegram")
-    monkeypatch.setattr(navigation, "SECTIONS", (*navigation.SECTIONS, child))
-    assert [section.label for section in navigation.breadcrumb("video")] == ["Telegram", "Видео"]
+    assert navigation.resolve("telegram") == "telegram_status"
+    assert navigation.section_index("sources") == 1
+    assert navigation.section_index("telegram") == 0
 
 
 @pytest.mark.asyncio
@@ -1423,7 +1663,7 @@ async def test_legacy_section_keys_open_the_page_that_absorbed_them():
         await wait_for_startup(app, pilot)
         app.open_section("sources")
         await pilot.pause()
-        assert isinstance(app.screen, TelegramScreen)
+        assert isinstance(app.screen, TelegramSourcesScreen)
         app.open_section("overview")
         await pilot.pause()
         assert isinstance(app.screen, HomeScreen)
@@ -1448,8 +1688,10 @@ async def test_header_breadcrumb_and_footer_hints_follow_the_screen():
         await pilot.pause()
         header = str(app.screen.query_one(HoardHeader).content)
         footer = str(app.screen.query_one(HoardStatusBar).content)
-        assert "Telegram" in header and "Источники" not in header
+        assert "Telegram" in header and "Статус" in header and "Источники" not in header
         assert "панели" in footer and "помощь" in footer
+        app.open_section("telegram_sources")
+        await pilot.pause()
         # The source shortcuts live on the frame of the panel they act on, not in the footer.
         hints = str(app.screen.query_one("#sources-panel").border_subtitle)
         assert "добавить" in hints and "изменить" in hints and "проверить" in hints
@@ -1477,11 +1719,14 @@ async def test_digit_shortcuts_jump_to_sections_and_leave_text_entry_alone():
         assert isinstance(app.screen, TelegramScreen)
         await pilot.press("2")
         await pilot.pause()
-        assert isinstance(app.screen, ArchiveScreen)
+        assert isinstance(app.screen, TelegramSourcesScreen)
         await pilot.press("9")
         await pilot.pause()
-        assert isinstance(app.screen, ArchiveScreen)
+        assert isinstance(app.screen, TelegramSourcesScreen)
         await pilot.press("1")
+        await pilot.pause()
+        assert isinstance(app.screen, TelegramScreen)
+        await pilot.press("h")
         await pilot.pause()
         assert isinstance(app.screen, HomeScreen)
 
@@ -1542,10 +1787,10 @@ async def test_command_palette_filters_navigates_and_never_leaks_keys():
         await pilot.pause()
         assert isinstance(app.screen, PaletteScreen)
         options = app.screen.query_one("#palette-list", OptionList)
-        await pilot.press("t", "e", "l", "e")
+        await pilot.press(*"сборщик")
         await pilot.pause()
         assert options.option_count == 1
-        assert str(options.get_option_at_index(0).id) == "goto:telegram"
+        assert str(options.get_option_at_index(0).id) == "goto:telegram_status"
         await pilot.press("enter")
         await wait_for_condition(pilot, lambda: isinstance(app.screen, TelegramScreen))
         assert len(app.screen_stack) == 2  # the palette left no screen behind
@@ -1652,7 +1897,7 @@ async def test_actions_and_tables_are_borderless_words_not_boxes():
     app = HoardApp(FakeAPI())
     async with app.run_test(size=(120, 35)) as pilot:
         await wait_for_startup(app, pilot)
-        for section in ("home", "telegram", "archive"):
+        for section in ("home", "telegram_status", "telegram_sources", "archive"):
             app.open_section(section)
             await pilot.pause()
             for button in app.screen.query(Button):
@@ -1709,14 +1954,14 @@ async def test_panels_carry_their_title_in_the_border_and_light_up_with_focus():
         await wait_for_startup(app, pilot)
         titles = {str(panel.border_title) for panel in app.screen.query(Panel)}
         assert {"Сейчас", "Очередь", "Архив", "Инструменты", "События"} <= titles
-        app.open_section("telegram")
+        app.open_section("telegram_sources")
         await pilot.pause()
         panel = app.screen.query_one("#sources-panel", Panel)
         table = app.screen.query_one("#sources-table", DataTable)
         assert app.focused is table
         assert panel.has_pseudo_class("focus-within")
         assert str(panel.styles.border_top[1]) != str(
-            app.screen.query_one("#collector-panel", Panel).styles.border_top[1]
+            app.screen.query_one(Sidebar).styles.border_top[1]
         )
 
 
@@ -1725,7 +1970,7 @@ async def test_sources_table_is_compact_and_trims_timestamps():
     app = HoardApp(FakeAPI())
     async with app.run_test(size=(120, 35)) as pilot:
         await wait_for_startup(app, pilot)
-        app.open_section("telegram")
+        app.open_section("telegram_sources")
         await pilot.pause()
         table = app.screen.query_one("#sources-table", DataTable)
         labels = [str(column.label) for column in table.columns.values()]
@@ -1740,7 +1985,7 @@ async def test_sources_table_drops_schedule_columns_instead_of_scrolling_sideway
     app = HoardApp(FakeAPI())
     async with app.run_test(size=(100, 30)) as pilot:
         await wait_for_startup(app, pilot)
-        app.open_section("telegram")
+        app.open_section("telegram_sources")
         await pilot.pause()
         table = app.screen.query_one("#sources-table", DataTable)
         assert [str(column.label) for column in table.columns.values()] == [
@@ -1800,11 +2045,12 @@ async def test_telegram_web_controls_reflect_state_and_are_nonblocking():
     app = HoardApp(api)
     async with app.run_test(size=(100, 30)) as pilot:
         await wait_for_startup(app, pilot)
-        app.open_section("telegram")
+        app.open_section("telegram_web")
         await wait_for_condition(
             pilot,
             lambda: "выключен" in str(app.screen.query_one("#web-summary", Static).content),
         )
+        assert "start_web" not in [name for name, _ in api.calls]
         screen = app.screen
         assert screen.query_one("#web-start", Button).disabled is False
         assert screen.query_one("#web-open", Button).disabled is True
@@ -1815,13 +2061,14 @@ async def test_telegram_web_controls_reflect_state_and_are_nonblocking():
             pilot,
             lambda: "работает" in str(app.screen.query_one("#web-summary", Static).content),
         )
+        assert [name for name, _ in api.calls].count("open_web") == 1
         assert screen.query_one("#web-start", Button).disabled is True
         assert screen.query_one("#web-open", Button).disabled is False
         assert screen.query_one("#web-stop", Button).disabled is False
 
         screen.query_one("#web-open").press()
         await wait_for_condition(
-            pilot, lambda: any(name == "open_web" for name, _ in api.calls)
+            pilot, lambda: [name for name, _ in api.calls].count("open_web") == 2
         )
         await wait_for_condition(
             pilot,
@@ -1842,13 +2089,40 @@ async def test_telegram_web_controls_reflect_state_and_are_nonblocking():
 
 
 @pytest.mark.asyncio
+async def test_web_browser_failure_keeps_ready_server_running():
+    api = FakeAPI()
+    api.queue("open_web", RuntimeError("Браузер недоступен"))
+    app = HoardApp(api)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await wait_for_startup(app, pilot)
+        app.open_section("telegram_web")
+        await wait_for_condition(
+            pilot,
+            lambda: "выключен" in str(app.screen.query_one("#web-summary", Static).content),
+        )
+        await pilot.click("#web-start")
+        await wait_for_condition(
+            pilot,
+            lambda: app.notice is not None and "браузер" in app.notice[0].lower(),
+        )
+        await wait_for_condition(pilot, lambda: not app.screen._web_loading)
+        assert app.notice == (
+            "Web Viewer работает, но браузер не открылся: Браузер недоступен",
+            True,
+        )
+        assert api.web_state["state"] == "ready"
+        assert "stop_web" not in [name for name, _ in api.calls]
+        assert "работает" in str(app.screen.query_one("#web-summary", Static).content)
+
+
+@pytest.mark.asyncio
 async def test_telegram_web_state_is_recovered_on_reopen():
     api = FakeAPI()
     api.web_state = {"state": "ready", "port": 45678, "controllable": True}
     app = HoardApp(api)
     async with app.run_test(size=(100, 30)) as pilot:
         await wait_for_startup(app, pilot)
-        app.open_section("telegram")
+        app.open_section("telegram_web")
         await wait_for_condition(
             pilot,
             lambda: "работает" in str(app.screen.query_one("#web-summary", Static).content),
@@ -2139,7 +2413,7 @@ async def test_source_table_fits_long_real_values_at_supported_widths():
     app = HoardApp(FakeAPI(status))
     async with app.run_test(size=(120, 35)) as pilot:
         await wait_for_startup(app, pilot)
-        app.open_section("telegram")
+        app.open_section("telegram_sources")
         await pilot.pause()
         for width, height in ((120, 35), (100, 30), (80, 24)):
             if (app.size.width, app.size.height) != (width, height):

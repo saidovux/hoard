@@ -25,6 +25,12 @@ class AuthClient:
         self.code_sign_in_errors = []
         self.password_errors = []
         self.authorization_error = None
+        self.me = SimpleNamespace(
+            id=101,
+            first_name="Test",
+            last_name="User",
+            username="tester",
+        )
 
     def is_connected(self):
         return self.connected
@@ -39,6 +45,9 @@ class AuthClient:
         if self.authorization_error:
             raise self.authorization_error
         return self.authorized
+
+    async def get_me(self):
+        return self.me
 
     async def send_code_request(self, phone):
         self.code_calls += 1
@@ -191,3 +200,48 @@ async def test_network_error_while_checking_session_is_actionable(configured):
 
     assert unavailable.value.code == "network"
     assert "private low-level detail" not in str(unavailable.value)
+
+
+async def test_account_snapshot_distinguishes_saved_and_verified_connection(
+    configured, monkeypatch, tmp_path
+):
+    base = tmp_path / "telegram"
+    (tmp_path / "telegram.session").write_bytes(b"saved-session")
+    monkeypatch.setattr(telegram_module, "session_path", lambda: base)
+    engine = TelegramEngine(store=None)
+
+    saved = engine.account_snapshot()
+    assert saved["state"] == "saved"
+    assert saved["session_present"] is True
+    assert saved["verified"] is None
+    assert saved["connected"] is False
+
+    engine.client = AuthClient(authorized=True)
+    result = await engine.begin_authorization()
+    connected = engine.account_snapshot()
+    assert result["authorized"] is True
+    assert connected["state"] == "connected"
+    assert connected["profile"] == {
+        "id": 101,
+        "name": "Test User",
+        "username": "tester",
+    }
+
+    await engine.disconnect()
+    disconnected = engine.account_snapshot()
+    assert disconnected["state"] == "saved"
+    assert disconnected["session_present"] is True
+    assert disconnected["connected"] is False
+    assert (tmp_path / "telegram.session").is_file()
+
+
+async def test_account_profile_allows_missing_username(configured):
+    client = AuthClient(authorized=True)
+    client.me.username = None
+    engine = TelegramEngine(store=None)
+    engine.client = client
+
+    await engine.begin_authorization()
+
+    assert engine.account_info["name"] == "Test User"
+    assert engine.account_info["username"] == ""

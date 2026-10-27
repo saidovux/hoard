@@ -335,6 +335,30 @@ def test_launch_web_timeout_terminates_owned_child(monkeypatch, tmp_path):
     assert process.terminated is True
 
 
+def test_open_web_browser_failure_does_not_expose_bootstrap_in_message(monkeypatch):
+    bootstrap = "http://127.0.0.1:45678/start/one-time-secret"
+    state = {
+        "status": "ready",
+        "pid": os.getpid(),
+        "port": 45678,
+        "control_port": 45679,
+        "control_token": "private-control-token",
+    }
+    monkeypatch.setattr("hoard.web._read_state", lambda: state)
+    monkeypatch.setattr("hoard.web._pid_alive", lambda pid: True)
+    monkeypatch.setattr("hoard.web._web_reachable", lambda port: True)
+    monkeypatch.setattr("hoard.web._control_request", lambda value, action: {"url": bootstrap})
+    monkeypatch.setattr("hoard.web._open_browser", lambda url: False)
+
+    result = web_module.open_web()
+
+    assert result["state"] == "ready"
+    assert result["opened"] is False
+    assert result["url"] == bootstrap
+    assert bootstrap not in result["message"]
+    assert "one-time-secret" not in result["message"]
+
+
 def test_web_requires_bootstrap_cookie_exact_host_origin_and_csrf(tmp_path):
     catalog = tmp_path / "telegram_archive.html"
     media = tmp_path / "avatar.png"

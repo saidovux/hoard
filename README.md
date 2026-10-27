@@ -1,9 +1,17 @@
-# Hoard 0.7.3.0
+# Hoard 0.7.4.0
 
 Hoard is a local-first Linux and Windows archive for Telegram posts, profiles and video notes
 found in a channel post's comments. It uses Telethon, SQLite, an autonomous offline HTML catalog
 and terminal interfaces. A private background daemon performs all Telegram work; closing an
 interface does not stop downloads.
+
+The 0.7.4.0 release introduces hierarchical TUI workspaces. Opening **Telegram** replaces the
+global sidebar with **Статус**, **Источники**, and the bottom-pinned **Web Viewer** and **Вход**
+destinations; legacy `telegram` and `sources` routes open the correct nested page. Collector,
+source and PSL actions are preserved on dedicated pages. The account page distinguishes an
+unverified saved session from a daemon-verified connection and shows only cached public account
+details. Enabling Web waits for confirmed loopback readiness and then opens a fresh one-use URL;
+a browser-launch failure leaves the server running for an explicit retry.
 
 The 0.7.3.0 release redesigns the explicit local Web client as **Black Archive 03**. It applies a
 compact black-and-orange workspace to the existing catalog: publication cards, the open
@@ -182,25 +190,32 @@ screen also retains a direct “Открыть HTML” action for an existing lo
 hoard
 ```
 
-It has four pages: **Главная** (HOARD wordmark, current task, progress, queue, archive figures,
-one line per tool and latest events), **Архив**, and, in the **ИНСТРУМЕНТЫ** group, **Telegram**
-(account, collector, separate Web process and watched sources) and **AI**. Former pages remain
-compatible aliases: `overview`/`activity` open **Главная**, `sources` opens **Telegram**. The
-Archive page keeps downloads, profiles, jobs, catalog actions and the video-frame workflow.
-Telegram keeps login including 2FA, collector start/pause/stop, source validation and editing,
-selected-source or global scans, and Web start/open/stop. All operations use the private daemon
-IPC layer; the TUI never opens SQLite or creates a Telegram client. Only the visible Home screen
-polls a compact status, with one request in flight at a time and no redraw when its data did not
-change; detailed Archive/Telegram data is fetched on entry. See `docs/TUI.md` for the design
-contract.
+The global level has four entries: **Главная** (HOARD wordmark, current task, progress, queue,
+archive figures, one line per tool and latest events), **Архив**, and, in the **ИНСТРУМЕНТЫ**
+group, **Telegram** and **AI**. Opening Telegram switches the same sidebar to its workspace:
+**Статус**, **Источники**, and bottom-pinned **Web Viewer** and **Вход** entries plus a direct
+**Назад в Hoard** action. Former keys remain compatible aliases: `overview`/`activity` open
+**Главная**, `telegram` opens **Telegram → Статус**, and `sources` opens
+**Telegram → Источники**. Archive remains a separate page through Round 7 and keeps downloads,
+profiles, jobs, catalog actions and the complete video-frame workflow.
+
+Telegram Status owns collector start/pause/stop and current queue/activity/error presentation;
+Sources keeps validation, editing, selected/global scans and publication-scoped PSL actions.
+Login reuses the daemon authorization flow, shows cached public account details, and separates a
+saved but unverified session from a verified live connection. Web Viewer starts/opens/stops only
+the separate loopback process. All operations use private daemon IPC; the TUI never opens SQLite
+or creates a Telegram client. Only visible Home polls compact status. Detailed source/archive data
+is fetched on entry and Web readiness is checked when its page is visited. See `docs/TUI.md`.
 
 The interface keeps the entire Textual surface, including navigation, focus, hover, palette and
 help modal states, on `#000000`. Text is white, secondary text `#888888`, frames `#7B4B23`,
 hairlines `#262626` and the accent `#F79646`. Pages are framed panels with titles in the border;
 the focused panel lights up, the footer shows key chips, tables and buttons use an orange selection
-block. Use `j`/`k` or arrows to move, `l`, Right or Enter to open, `h`, Left or Esc to return,
-`1`–`9` to jump to a page, `:` or Ctrl+K for the command palette, `?` for help, `b` to toggle the
-sidebar and `q` to close only the UI. `[` and `]` switch pages even when the sidebar is hidden;
+block. Use `j`/`k` or arrows to move, `l` or Enter to open, and `h` or Esc to return.
+Inside Telegram, back moves from a nested page to Status and from Status to the previous Hoard
+section. `1`–`9` and `[`/`]` address only the visible navigation level. Use `:` or Ctrl+K for the
+command palette, `?` for help, `b` to toggle the sidebar and `q` to close only the UI. Section
+cycling keeps working when the sidebar is hidden;
 `Ctrl+PageUp` / `Ctrl+PageDown` scroll the current page. On terminals narrower than 60 columns the
 sidebar hides automatically. Action grids and table columns adapt to the available width, dropping
 or shortening secondary columns instead of scrolling sideways. Archive’s less frequent frame and
@@ -230,7 +245,7 @@ For development, install the test tools with `python -m pip install -e '.[dev]'`
 
 An upgrade keeps the existing XDG configuration, database, Telegram session and archive.
 If an older daemon is still running, execute `hoard shutdown` before starting the upgraded
-installation. The 0.7.3.0 client accepts only a daemon reporting the same application version and
+installation. The 0.7.4.0 client accepts only a daemon reporting the same application version and
 IPC protocol `1`; it reports the mismatch instead of starting a competing service. If a matching
 daemon already owns the service lock but is still initializing, clients wait for it and show a
 specific startup diagnostic.
@@ -255,8 +270,8 @@ Use `hoard shutdown` to fully close the service. Windows CI does not test live T
 
 ## First launch and Telegram login
 
-Run `hoard`, open **Telegram** and choose **Подключить**. Hoard performs the complete login as one
-flow through the background daemon:
+Run `hoard`, open **Telegram → Вход** and choose **Подключить**. Hoard performs the complete login
+as one flow through the background daemon:
 
 1. It checks the saved session and finishes immediately if that session is still valid.
 2. On first use it asks for the API ID and API Hash from
@@ -384,8 +399,9 @@ HTML, CSS and JavaScript; no CDN or third-party browser dependency is loaded. A 
 URL creates an HttpOnly, SameSite session cookie. Exact Host and Origin checks, a separate CSRF
 token, a strict content security policy and closed write routes prevent unrelated local pages from
 driving Hoard. The server never listens on a LAN address. The direct `hoard web` command keeps
-`--no-open` and its idle `--lifetime`; Web enabled from **Telegram → Web** uses a manual lifetime
-until explicitly stopped. Closing the TUI leaves it running. Each **Открыть Web** asks the running
+`--no-open` and its idle `--lifetime`; Web enabled from **Telegram → Web Viewer** waits for the
+confirmed ready state, opens the browser automatically and then uses a manual lifetime until
+explicitly stopped. Closing the TUI leaves it running. Each **Открыть** asks the running
 process for a fresh one-time URL; used URLs are rejected and do not invalidate other browser
 sessions. A fresh URL and the stop command are available only through a separate authenticated
 loopback control channel advertised in the private mode-`0600` state file. The browser page never

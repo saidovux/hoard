@@ -31,36 +31,45 @@ inverse bar.
   orange block. Modes (e.g. Archive: Кружки / Профили / Задания) are tabs.
 * Numbers fade when they are zero and turn orange when they need attention.
 
-## Pages
+## Pages and navigation levels
 
-One page per concern. Pages that used to be separate were merged: *Обзор* and *Активность* are
-now **Главная**, and *Источники* lives on the **Telegram** page. The old keys still resolve
-(`navigation.ALIASES`), so scripts, palette habits and tests keep working.
+The outer Hoard level remains deliberately small. *Обзор* and *Активность* are **Главная**;
+**Архив** remains separate through Round 7; **Telegram** and **AI** are tools. Opening Telegram
+replaces, rather than duplicates, the sidebar with the tool's own workspace. The old keys still
+resolve: `overview`/`activity` open Home, `telegram` opens Telegram Status and `sources` opens the
+nested Sources page.
 
-| Page | Contents |
-| --- | --- |
-| **Главная** | the HOARD wordmark with the daemon state; panels *Сейчас* (current task + progress), *Очередь*, *Архив*, *Инструменты* (one line per tool) and *События* |
-| **Архив** | Кружки / Профили / Задания, catalogue actions, manual selected-frame extraction, confirmed bounded batch processing and hard stop; less frequent frame/profile AI commands sit behind **Ещё…** |
-| **Telegram** | panels *Сборщик* (account and collector control), *Web* (separate loopback process) and *Источники* (table + add / edit / toggle / scan / frame AI) |
-| **AI** | provider settings, record list and chat |
+| Level | Page | Contents |
+| --- | --- | --- |
+| Hoard | **Главная** | wordmark, current task/progress, queue, archive figures, tool summaries and events |
+| Hoard | **Архив** | Кружки / Профили / Задания, catalogue, complete manual frame workflow and existing profile/frame AI actions |
+| Hoard | **Telegram** | entry into the Telegram workspace; defaults to Status |
+| Hoard | **AI** | existing provider settings, records and chat |
+| Telegram | **Статус** | verified account state, collector controls, activity, queued/running counts and latest important error |
+| Telegram | **Источники** | table plus add/edit/toggle/selected/global scan and publication-scoped photo/frame PSL actions |
+| Telegram | **Web Viewer** | actual loopback-process state and enable/open/disable actions |
+| Telegram | **Вход** | saved-session/live-connection state, cached public account data and the existing authorization dialog |
 
 ```
- hoard › Telegram                                                  ● работает      header
- ╭ Разделы ───╮ ╭ Сборщик ─────────────────────────────────────────────────────╮
- │ ▎1 Главная │ │ подключён · сборщик работает                                  │
- │  2 Архив   │ │ Подключить   Запустить   Пауза   Остановить                   │   panels
- │ ИНСТРУМЕНТЫ│ ╰───────────────────────────────────────────────────────────────╯
- │  3 Telegram│ ╭ Источники ────────────────────────────────────────────────────╮
- │  4 AI      │ │ Источник            Состояние  Кружки  Каждые  Проверка  …    │
- │            │ │ Sample  @chan/42    включён        31   120 с  2026-10-21 …   │
- ╰────────────╯ ╰────────────────── a добавить   e изменить   s проверить ───────╯
-  a добавить  e изменить  s проверить  tab панели            : команды ? помощь q выход
+ hoard  ›  Telegram  ›  Источники                                 ● работает
+ ╭ Telegram ────────╮ ╭ Источники ──────────────────────────────────────────────╮
+ │ ← Назад в Hoard  │ │ Добавить  Изменить  Вкл./выкл.  Проверить  Проверить все│
+ │ ▎1 Статус        │ │ Источник            Состояние  Кружки  Каждые  …        │
+ │  2 Источники     │ │ Sample @chan/42     включён        31   120 с  …        │
+ │                  │ │                                                             │
+ │                  │ │                                                             │
+ │  3 Web Viewer  ● │ │                                                             │
+ │  4 Вход        ● │ ╰──────────── a добавить  e изменить  s проверить ────────╯
+ ╰──────────────────╯
+  tab панели  [ ] раздел  h назад                         : команды ? помощь q выход
 ```
 
-The reference layout was designed before the Web process and video-frame workflow existed. Those
-current features are integrated as additional panels/toolbars with the same framing, typography and
-key-chip language: **Web** sits on Telegram, and frame inspection/backfill/AI actions sit inside the
-Archive page. No old functional control was removed.
+The two lower entries are a separate flex child pinned to the available sidebar bottom, not blank
+rows. On short terminals both option lists remain keyboard-reachable and do not overlap. The Web
+dot is green only for confirmed ready state, red for stopped/error, and neutral while unknown or
+transitioning. The account dot is green only for a verified authorized live client, yellow for an
+unverified or intentionally disconnected saved session, red when a full login is needed, and
+neutral when state cannot be established.
 
 ## Responsive and interactive rules
 
@@ -75,11 +84,12 @@ Archive page. No old functional control was removed.
 * When the sidebar is hidden by the responsive breakpoint, focus is moved out of it. It must not
   keep receiving `j`/`k` while invisible.
 * Home polls only bounded `status_brief` data, keeps one request in flight and skips unchanged
-  redraws. Detailed Archive/Telegram data is loaded on entry; polling must not rebuild the sidebar
-  or move the navigation highlight.
+  redraws. Detailed Archive/Sources data is loaded on entry. Web is checked on its page and is not
+  polled globally; account checks are explicit. Status repaint never rebuilds the sidebar, moves
+  its highlight or steals a field's focus.
 * Opening an AI conversation hides the list workspace, gives the message field focus and scrolls
   the conversation to its top. Returning restores the list and focus.
-* Archive and Telegram tables preserve the selected record across status refreshes, terminal
+* Archive and Telegram Sources tables preserve the selected record across status refreshes, terminal
   resizes and profile multi-selection.
 
 The Home wordmark comes in two sizes (`widgets/hero.py`): six rows when the terminal is at least
@@ -89,11 +99,13 @@ by width, never wrapping over the letters.
 
 ## Keyboard
 
-`j`/`k`, arrows — move · `l`, →, Enter — open · `h`, ←, Esc — back · `tab` — next panel ·
-`[` `]` — previous/next section · `1`–`9` — jump to a section · `:` or Ctrl+K — command palette ·
-`b` — toggle sidebar · `?` — help · `q` — quit (the daemon keeps running). Global keys are
-disabled in modals and while typing in an input. A focused table keeps `←`/`→` for itself; use
-`h` to go back.
+`j`/`k`, arrows — move · `l`, Enter — open · `h`, Esc — back · `tab` — next panel ·
+`[` `]` — previous/next section of the current level · `1`–`9` — jump within the current visible
+level · `:` or Ctrl+K — command palette · `b` — toggle sidebar · `?` — help · `q` — quit (the
+daemon keeps running). From Sources/Web/Login, back opens Status; from Status it restores the
+global section from which Telegram was entered, falling back to Home. The explicit sidebar back
+always leaves Telegram. Modals consume Escape first. Global keys are disabled in modals and while
+typing, and `j`/`k`/arrows remain native to focused tables and lists.
 
 ## Responsive classes
 
@@ -112,10 +124,11 @@ disabled in modals and while typing in an input. A focused table keeps `←`/`�
 ## Adding a tool
 
 1. Write a `WorkspaceScreen` subclass in `tui/screens/` (set `section`, optionally `HINTS`),
-   compose its page from `Panel`s and register it in `HoardApp.SCREENS`.
-2. Append a `Section` to `SECTIONS` in `tui/navigation.py` (`group=TOOLS`; give sub-pages
-   `parent=<tool key>`). The sidebar, breadcrumb, `[` `]`, digit shortcuts and the palette pick it
-   up; the first nine sections get digits automatically.
+   compose its page from `Panel`s and register the concrete screen in `HoardApp.SCREENS`.
+2. Append a global tool entry to `SECTIONS`. If it has an inner workspace, give the entry a
+   concrete default `target`, declare only implemented child `Section`s with `parent=<tool key>`,
+   and add their tuple to `WORKSPACES`. The sidebar, breadcrumb, level-local `[`/`]` and digits,
+   aliases and palette then share the same routes.
 3. Optionally add a one-line summary to `MODULE_SUMMARIES` in `tui/screens/home.py` so the tool
    appears in the *Инструменты* panel on Home, and extra entries to `HoardApp.commands()` for the
    palette.

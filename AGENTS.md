@@ -8,16 +8,18 @@ Local-first Telegram archive and extensible small-tool core, Python >=3.11. Keep
 - Keep the Noir terminal-native visual language: black surfaces, `#FFFFFF` text, `#888888` hints,
   `#7B4B23` frames at rest, `#262626` hairlines and `#F79646` focus/meaning. Pages are framed
   `Panel`s with titles in the border, shortcuts as key chips and orange block selection. `Home`,
-  `Archive`, `Telegram` and `AI` are the four registry pages; `overview`/`activity`/`sources`
-  remain navigation aliases. New controls for existing features must fit this language instead of
-  adding a new visual system or unmounted section.
+  `Home`, `Archive`, `Telegram` and `AI` remain the four global entries. Telegram replaces the
+  global menu with its `Status`, `Sources`, bottom-pinned `Web Viewer` and `Login` workspace;
+  `overview`/`activity`/`sources` remain navigation aliases, with `sources` opening the nested
+  Sources page. New controls for existing features must fit this language instead of adding a new
+  visual system or unmounted section.
 - Maintain existing XDG session/config/database locations and schema. Never commit sessions, API keys, downloaded media, local archives or real profile data.
 - Preserve `hoard start`, `stop`, `scan`, `status`, `shutdown`, `add`, `retry`, `telegram` and
   `web` and their noninteractive/JSON output. Service commands must not import Textual.
 - The Textual client may use full-screen application mode. Closing or cancelling it must never
   kill the daemon, stop background work or close an already running Web session.
 - UI must call daemon through IPC; never instantiate `TelegramClient` in the UI process.
-- Telegram Web is a separate loopback process managed from **Telegram → Web**. Its private
+- Telegram Web is a separate loopback process managed from **Telegram → Web Viewer**. Its private
   `0600` state file carries a launch identity, PID, control port and control token. The browser
   app must never receive the control token or a stop route. Closing the TUI leaves Web running;
   only an explicit TUI stop, daemon shutdown or a crash ends a manually managed Web. Bootstrap

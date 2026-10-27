@@ -970,9 +970,9 @@ def open_web(*, open_browser: bool = True) -> dict[str, Any]:
     message = (
         "Web открыт в браузере"
         if opened
-        else f"Браузер не открылся. Ссылка: {url}"
+        else "Браузер не открылся. Повтори команду «Открыть» после проверки браузера."
     )
-    return {"state": "ready", "url": url, "message": message}
+    return {"state": "ready", "url": url, "opened": opened, "message": message}
 
 
 def stop_web() -> dict[str, Any]:

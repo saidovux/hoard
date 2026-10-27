@@ -11,15 +11,16 @@ background service.
 - `tui/` is the only interactive terminal client: a full-screen Textual application. `app.py`
   owns lifecycle, contextual keyboard navigation, named mutation guards and the single in-flight
   status refresh; `api.py` provides typed operations over the existing `ensure_daemon()` /
-  `request()` boundary. `navigation.py` is the four-page registry (former Overview/Activity map to
-  Home; Sources maps to Telegram) used by the sidebar, breadcrumb, digits and palette;
+  `request()` boundary. `navigation.py` declares the four-entry global level and the Telegram
+  workspace (former Overview/Activity map to Home; Sources maps to Telegram Sources) used by the
+  contextual sidebar, breadcrumb, level-local digits/cycling and palette;
   `colors.py` owns the Noir palette; `palette.py` searches sections and app commands;
   `widgets/panel.py`, `widgets/hero.py`, `widgets/status.py` and `widgets/chrome.py` provide the
   framed-panel layout, wordmark, figures and key-chip footer. Dialogs, screens, status formatting,
   reusable widgets and TCSS remain separate. The package imports neither storage nor Telethon, and
   never creates a Telegram client. See `docs/TUI.md`.
 - `ipc.py` starts the daemon detached when required and sends one JSON request per private
-  Unix-socket connection. Client and daemon must both report Hoard 0.7.3.0 and IPC protocol `1`.
+  Unix-socket connection. Client and daemon must both report Hoard 0.7.4.0 and IPC protocol `1`.
   A held instance lock with no ready socket means initialization is in progress, so the client
   waits for that owner instead of spawning a second daemon.
 - `service.py` owns the database, three independently limited job runners and the sole
@@ -43,7 +44,9 @@ background service.
   bootstrap/session token, HttpOnly SameSite cookie, independent CSRF token and CSP protect every
   write. Only media paths already validated into the current catalog snapshot and still contained
   by one of the daemon-reported archive roots are served through an opaque root-prefixed URL.
-  The launcher and server coordinate through one atomically replaced private state file. Before
+  The launcher and server coordinate through one atomically replaced private state file. The TUI
+  enable action waits for confirmed readiness and only then requests a fresh one-use URL and opens
+  the browser; failure to launch the browser does not stop the ready Web process. Before
   spawning, the parent writes a `starting` record with a random launch identifier; only the child
   writes `preparing`, `ready` (after binding the HTTP socket) and `error`. The parent never writes
   after `Popen()`, so a fast child cannot be overwritten by an older state. A launch/server lock
@@ -85,7 +88,7 @@ network/VPN guidance inside the active Textual modal while the daemon owns the a
 The Textual client is the sole interactive presentation and may enter application mode. Only the
 visible Home screen owns the moderate 1.5-second timer; it requests a bounded `status_brief`
 snapshot and the app's async lock drops overlapping ticks and skips unchanged redraws. Archive and
-Telegram request detailed status only when opened; recent collections are bounded and an oversized
+Telegram Sources request detailed status only when opened; recent collections are bounded and an oversized
 compatibility response is explicitly truncated before the 64 KiB IPC boundary. Screen suspension, unmount and app exit
 stop the timer. IPC startup and request errors render inside the stable black workspace so a slow
 or unavailable daemon never produces an unexplained empty screen. Exiting the client sends no
@@ -93,11 +96,12 @@ collector, frame-stop, shutdown or Telegram command; previously started frame/We
 
 The Textual theme sets background, surface and panel to `#000000`; TCSS also fixes computed
 backgrounds for containers, navigation components, focus/hover/selected states, inputs, tables,
-buttons, menus and modals. The workspace exposes **Главная**, **Архив**, **Telegram** and **AI**.
-Home merges the former Overview and Activity dashboards; Telegram contains both collector and
-sources and adds the separate Web process panel; Archive retains downloads, profiles, jobs,
-catalog and video-frame actions, with less frequent AI/frame commands behind a mode-specific
-**Ещё…** block. Tables fit or reduce their columns instead of scrolling sideways, and a table is
+buttons, menus and modals. The outer workspace exposes **Главная**, **Архив**, **Telegram** and
+**AI**. Home merges the former Overview and Activity dashboards. Telegram switches that same
+sidebar to **Статус**, **Источники**, and bottom-pinned **Web Viewer** and **Вход** pages; no second
+sidebar is mounted. `telegram` resolves to Status and `sources` directly to Sources. Archive retains
+downloads, profiles, jobs, catalog and video-frame actions, with less frequent AI/frame commands
+behind a mode-specific **Ещё…** block. Tables fit or reduce their columns instead of scrolling sideways, and a table is
 auto-focused only when it is fully visible. The modular AI screen and dialogs expose only
 implemented IPC operations and never import storage, provider transports or Telegram. Every
 surface is a black framed-panel workspace with an orange focus border; tests enforce the palette,
@@ -117,6 +121,15 @@ memory, and repeated requests for the same pending code are deduplicated. Expect
 errors are converted to structured `state`, `error_code`, `retryable` responses; secret request
 arguments are never recorded in events or logs. `auth_cancel` clears only a pending challenge,
 not credentials or an authorized session.
+
+`status_brief` includes a bounded `telegram_account` snapshot. A session file is only evidence of
+saved state: it is yellow/unverified until an explicit daemon-side authorization check succeeds.
+Green requires a connected client, a confirmed authorized session and the process-local verified
+state. Red means no usable confirmed session; unknown failures remain neutral. The daemon caches
+only display-safe `id`, name and optional username from `get_me()` after successful login or an
+explicit check, never on sidebar render. `telegram_account_disconnect` refuses to run while the
+collector is active, disconnects the sole daemon-owned client and preserves the session file;
+logout/revocation is intentionally not exposed.
 
 After login, scans reuse the connected client immediately. If the process is restarted during
 login, the transient challenge is intentionally lost and a new code must be requested.

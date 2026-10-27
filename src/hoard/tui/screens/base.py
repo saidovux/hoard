@@ -59,6 +59,12 @@ class WorkspaceScreen(Screen):
     def render_status(self, status: dict | None, error: str | None = None) -> None:
         self.query_one(HoardHeader).show_status(status, error)
         self.query_one(HoardStatusBar).show_hints(self.HINTS)
+        sidebar = self.query_one(Sidebar)
+        account = (status or {}).get("telegram_account") or {}
+        sidebar.set_indicators(
+            web=str(self.hoard_app.web_state.get("state") or "unknown"),
+            account=str(account.get("state") or "unknown"),
+        )
         error_view = self.query_one("#status-error", Static)
         if error:
             error_view.update(
@@ -112,7 +118,10 @@ class WorkspaceScreen(Screen):
             self.set_focus(None)
 
     def on_sidebar_navigate(self, message: Sidebar.Navigate) -> None:
-        self.hoard_app.open_section(message.section)
+        if message.section == Sidebar.BACK:
+            self.hoard_app.leave_workspace()
+        else:
+            self.hoard_app.open_section(message.section)
 
 
 __all__ = ["WorkspaceScreen"]

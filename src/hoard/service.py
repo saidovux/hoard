@@ -807,6 +807,28 @@ class Service:
                 "retryable": exc.retryable,
             }
 
+    def _telegram_account_snapshot(self, *, configured: bool) -> dict:
+        snapshot = getattr(self.engine, "account_snapshot", None)
+        if callable(snapshot):
+            result = dict(snapshot())
+        else:
+            # Compatibility with injected engines used by integrations/tests.
+            authorized = self.engine.authorization_step == AuthState.AUTHORIZED
+            result = {
+                "state": "connected" if authorized else "login_required",
+                "connected": authorized,
+                "session_present": False,
+                "verified": True if authorized else None,
+                "profile": {},
+            }
+        if not configured:
+            result.update(
+                state="login_required",
+                connected=False,
+                verified=False,
+            )
+        return result
+
     def _status_snapshot(self, *, detailed: bool) -> dict:
         configured = read_credentials() is not None
         auth_state = self.engine.authorization_step
@@ -818,6 +840,7 @@ class Service:
             "running": self.running,
             "collector_state": self.collector_state,
             "telegram": str(auth_state),
+            "telegram_account": self._telegram_account_snapshot(configured=configured),
             "configured": configured,
             "progress": self.progress.copy(),
             "stats": self.store.stats(),
@@ -949,7 +972,34 @@ class Service:
             async with self._telegram_operation():
                 await self.engine.disconnect()
                 write_credentials(api_id, api_hash)
+                if hasattr(self.engine, "session_verified"):
+                    self.engine.session_verified = None
+                if hasattr(self.engine, "account_info"):
+                    self.engine.account_info = {}
             return {"message": "Параметры API сохранены в закрытом локальном файле"}
+        if method == "telegram_account_check":
+            async with self._telegram_operation():
+                result = await self._auth_call(self.engine.begin_authorization())
+            if result.get("authorized"):
+                result["message"] = result.get("message") or "Сессия Telegram подтверждена"
+            result["account"] = self._telegram_account_snapshot(
+                configured=read_credentials() is not None
+            )
+            return result
+        if method == "telegram_account_disconnect":
+            async with self._mode_lock:
+                if self.runner.running:
+                    raise RuntimeError(
+                        "Сначала останови или поставь Telegram-сборщик на паузу"
+                    )
+                async with self._telegram_lock:
+                    await self.engine.disconnect()
+            return {
+                "message": "Соединение Telegram отключено; сохранённая сессия не удалена",
+                "account": self._telegram_account_snapshot(
+                    configured=read_credentials() is not None
+                ),
+            }
         if method in {
             "auth_begin",
             "auth_send_code",

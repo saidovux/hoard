@@ -195,6 +195,8 @@ class TelegramEngine:
         self.phone = ""
         self.phone_code_hash = ""
         self.authorization_step = AuthState.DISCONNECTED
+        self.session_verified: bool | None = None
+        self.account_info: dict[str, Any] = {}
 
     def _publish_progress(self, preferred: tuple[int, int] | None = None) -> None:
         """Publish one compatible file view plus aggregate concurrent telemetry."""
@@ -281,6 +283,61 @@ class TelegramEngine:
     def _set_auth_state(self, state: AuthState) -> None:
         self.authorization_step = state
 
+    @staticmethod
+    def _session_present() -> bool:
+        """Telethon's SQLite session exists; this alone never proves authorization."""
+        try:
+            path = Path(f"{session_path()}.session")
+            return path.is_file() and path.stat().st_size > 0
+        except OSError:
+            return False
+
+    def account_snapshot(self) -> dict[str, Any]:
+        """Return cached, display-safe account state without doing network work."""
+        connected = False
+        if self.client is not None:
+            try:
+                connected = bool(self.client.is_connected())
+            except Exception:
+                connected = False
+        connected = (
+            connected
+            and self.session_verified is True
+            and self.authorization_step == AuthState.AUTHORIZED
+        )
+        session_present = self._session_present()
+        if connected:
+            state = "connected"
+        elif session_present and self.session_verified is not False:
+            state = "saved"
+        else:
+            state = "login_required"
+        return {
+            "state": state,
+            "connected": connected,
+            "session_present": session_present,
+            "verified": self.session_verified,
+            "profile": self.account_info.copy(),
+        }
+
+    async def refresh_account_info(self) -> dict[str, Any]:
+        """Refresh the safe cache after an explicit successful session check."""
+        client = self.client
+        if client is None or not hasattr(client, "get_me"):
+            return self.account_info.copy()
+        me = await client.get_me()
+        if me is None:
+            return self.account_info.copy()
+        first_name = str(getattr(me, "first_name", "") or "")
+        last_name = str(getattr(me, "last_name", "") or "")
+        name = " ".join(filter(None, [first_name, last_name])).strip()
+        self.account_info = {
+            "id": int(me.id) if getattr(me, "id", None) is not None else None,
+            "name": name,
+            "username": str(getattr(me, "username", "") or ""),
+        }
+        return self.account_info.copy()
+
     async def _connect_for_auth(self, state: AuthState):
         try:
             return await self.connect()
@@ -323,6 +380,7 @@ class TelegramEngine:
     async def authorized(self) -> bool:
         client = await self.connect()
         ok = await client.is_user_authorized()
+        self.session_verified = bool(ok)
         self._set_auth_state(AuthState.AUTHORIZED if ok else AuthState.PHONE_REQUIRED)
         return ok
 
@@ -334,6 +392,12 @@ class TelegramEngine:
         pending_state = self.authorization_step
         try:
             if await self.authorized():
+                try:
+                    await self.refresh_account_info()
+                except Exception:
+                    # Authorization itself is confirmed; optional public profile
+                    # details may be retried explicitly without invalidating it.
+                    pass
                 return self.auth_result("Telegram подключён; сохранённая сессия действительна.")
         except (OSError, TimeoutError) as exc:
             raise AuthFlowError(
@@ -364,6 +428,11 @@ class TelegramEngine:
         try:
             if await client.is_user_authorized():
                 self._set_auth_state(AuthState.AUTHORIZED)
+                self.session_verified = True
+                try:
+                    await self.refresh_account_info()
+                except Exception:
+                    pass
                 return self.auth_result("Telegram уже подключён.")
         except (OSError, TimeoutError) as exc:
             raise AuthFlowError(
@@ -503,7 +572,12 @@ class TelegramEngine:
                 code="rpc_error",
             ) from exc
         self._set_auth_state(AuthState.AUTHORIZED)
+        self.session_verified = True
         self.phone = self.phone_code_hash = ""
+        try:
+            await self.refresh_account_info()
+        except Exception:
+            pass
         return self.auth_result("Telegram успешно подключён.")
 
     async def sign_in_password(self, password: str) -> dict[str, Any]:
@@ -550,7 +624,12 @@ class TelegramEngine:
                 code="rpc_error",
             ) from exc
         self._set_auth_state(AuthState.AUTHORIZED)
+        self.session_verified = True
         self.phone = self.phone_code_hash = ""
+        try:
+            await self.refresh_account_info()
+        except Exception:
+            pass
         return self.auth_result("Telegram успешно подключён.")
 
     async def cancel_authorization(self) -> dict[str, Any]:

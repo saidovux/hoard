@@ -45,6 +45,10 @@ class HoardAPI(Protocol):
 
     async def auth_cancel(self) -> AuthResult: ...
 
+    async def telegram_account_check(self) -> dict[str, Any]: ...
+
+    async def telegram_account_disconnect(self) -> dict[str, Any]: ...
+
     async def validate_source(self, url: str) -> SourceValidation: ...
 
     async def add_source(
@@ -134,6 +138,12 @@ class IPCStatusAPI:
 
     async def auth_cancel(self) -> AuthResult:
         return await request("auth_cancel", timeout=self.NETWORK_TIMEOUT)
+
+    async def telegram_account_check(self) -> dict[str, Any]:
+        return await request("telegram_account_check", timeout=self.NETWORK_TIMEOUT)
+
+    async def telegram_account_disconnect(self) -> dict[str, Any]:
+        return await request("telegram_account_disconnect", timeout=self.CONTROL_TIMEOUT)
 
     async def validate_source(self, url: str) -> SourceValidation:
         return await request("source_validate", {"url": url}, timeout=self.NETWORK_TIMEOUT)

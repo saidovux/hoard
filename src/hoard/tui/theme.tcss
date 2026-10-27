@@ -123,7 +123,7 @@ Screen {
     display: none;
 }
 
-#navigation {
+#navigation, #navigation-secondary {
     height: auto;
     max-height: 100%;
     min-height: 4;
@@ -132,9 +132,24 @@ Screen {
     background: #000000;
 }
 
-#navigation:focus {
+#navigation:focus, #navigation-secondary:focus {
     border: none;
     background: #000000;
+}
+
+#workspace-navigation {
+    width: 100%;
+    height: 100%;
+}
+
+#workspace-navigation #navigation {
+    height: 1fr;
+    min-height: 3;
+}
+
+#workspace-navigation #navigation-secondary {
+    height: 2;
+    min-height: 2;
 }
 
 OptionList > .option-list--option,
@@ -246,7 +261,8 @@ OptionList > .option-list--separator {
     min-height: 3;
 }
 
-#current-action, #progress, #telegram-summary, #tools, #statistics, #queue-stats, #events {
+#current-action, #progress, #telegram-summary, #account-summary, #web-summary,
+#tools, #statistics, #queue-stats, #events {
     height: auto;
     min-height: 1;
 }
@@ -372,6 +388,11 @@ Button:disabled {
     margin-bottom: 0;
 }
 
+#account-actions {
+    grid-size: 4;
+    margin-bottom: 0;
+}
+
 #source-actions {
     grid-size: 6;
 }
@@ -388,7 +409,7 @@ Button:disabled {
     grid-size: 3;
 }
 
-.narrow #telegram-actions {
+.narrow #telegram-actions, .narrow #account-actions {
     grid-size: 2;
 }
 
@@ -409,7 +430,7 @@ Button:disabled {
     grid-size: 2;
 }
 
-.compact #telegram-actions, .compact #source-actions, .compact #source-ai-actions,
+.compact #telegram-actions, .compact #account-actions, .compact #source-actions, .compact #source-ai-actions,
 .compact #web-actions {
     grid-size: 2;
 }

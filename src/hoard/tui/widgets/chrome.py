@@ -6,13 +6,23 @@ from collections.abc import Iterable
 
 from rich.text import Text
 from textual.app import ComposeResult
+from textual.containers import Vertical
 from textual.events import Resize
 from textual.message import Message
 from textual.widgets import OptionList, Static
 from textual.widgets.option_list import Option, OptionDoesNotExist
 
 from ..colors import ACCENT, MUTED, TEXT
-from ..navigation import GROUP_TITLES, SECTIONS, Section, breadcrumb, section_index
+from ..navigation import (
+    GROUP_TITLES,
+    SECTIONS,
+    TELEGRAM_SECTIONS,
+    Section,
+    breadcrumb,
+    resolve,
+    sections_for,
+    workspace,
+)
 from ..state import collector_label
 
 Hint = tuple[str, str]
@@ -65,7 +75,20 @@ class HoardHeader(Static):
 
 
 class Sidebar(Static):
-    """Grouped navigation in a frame; only implemented sections appear."""
+    """One framed menu whose contents follow the active navigation level."""
+
+    BACK = "workspace-back"
+    INDICATOR_COLORS = {
+        "ready": "#55C878",
+        "connected": "#55C878",
+        "saved": "#E3B341",
+        "stopped": "#E5534B",
+        "error": "#E5534B",
+        "login_required": "#E5534B",
+        "starting": MUTED,
+        "stopping": MUTED,
+        "unknown": MUTED,
+    }
 
     class Navigate(Message):
         def __init__(self, section: str) -> None:
@@ -74,24 +97,38 @@ class Sidebar(Static):
 
     def __init__(self, active: str) -> None:
         super().__init__(id="sidebar", classes="panel")
-        self.active = active
-        self.border_title = "Разделы"
+        self.active = resolve(active)
+        self.owner = workspace(self.active)
+        self._indicators = {"telegram_web": "unknown", "telegram_login": "unknown"}
+        self.border_title = "Telegram" if self.owner == "telegram" else "Разделы"
 
     def compose(self) -> ComposeResult:
-        yield OptionList(*self._options(), id="navigation")
+        if self.owner == "telegram":
+            with Vertical(id="workspace-navigation"):
+                yield OptionList(*self._primary_options(), id="navigation")
+                yield OptionList(*self._secondary_options(), id="navigation-secondary")
+        else:
+            yield OptionList(*self._global_options(), id="navigation")
 
     def on_mount(self) -> None:
-        navigation = self.query_one(OptionList)
-        navigation.highlighted = self._index_of(self.active)
+        navigation, index = self._location(self.active)
+        navigation.highlighted = index
 
-    def _index_of(self, key: str) -> int:
-        navigation = self.query_one(OptionList)
-        try:
-            return navigation.get_option_index(key)
-        except OptionDoesNotExist:  # unknown section keys fall back to the first entry
-            return navigation.get_option_index(SECTIONS[section_index(key)].key)
+    def _lists(self) -> tuple[OptionList, ...]:
+        return tuple(self.query(OptionList))
 
-    def _options(self) -> list[Option]:
+    def _location(self, key: str) -> tuple[OptionList, int]:
+        key = resolve(key)
+        for navigation in self._lists():
+            try:
+                return navigation, navigation.get_option_index(key)
+            except OptionDoesNotExist:
+                continue
+        navigation = self._lists()[0]
+        fallback = "telegram_status" if self.owner else "home"
+        return navigation, navigation.get_option_index(fallback)
+
+    def _global_options(self) -> list[Option]:
         options: list[Option] = []
         previous: str | None = None
         for number, section in enumerate(SECTIONS, start=1):
@@ -109,48 +146,100 @@ class Sidebar(Static):
             options.append(Option(self._label(section, number), id=section.key))
         return options
 
+    def _primary_options(self) -> list[Option]:
+        return [
+            Option(Text("←  Назад в Hoard", style=MUTED), id=self.BACK),
+            *(Option(self._label(section, number), id=section.key)
+              for number, section in enumerate(TELEGRAM_SECTIONS[:2], start=1)),
+        ]
+
+    def _secondary_options(self) -> list[Option]:
+        return [
+            Option(self._label(section, number), id=section.key)
+            for number, section in enumerate(TELEGRAM_SECTIONS[2:], start=3)
+        ]
+
     def _label(self, section: Section, number: int) -> Text:
         """``▎1  Главная``: the digit is the shortcut, the bar marks the open page."""
-        active = section.key == self.active
+        active = resolve(section.key) == self.active
         label = Text(no_wrap=True, overflow="ellipsis")
         label.append("▎" if active else " ", style=f"bold {ACCENT}")
-        label.append("  " if section.parent else "")
         label.append(
             str(number) if number < 10 else " ", style=f"bold {ACCENT}" if active else MUTED
         )
         label.append("  ")
         label.append(section.label, style="bold" if active else "")
+        indicator = self._indicators.get(section.key)
+        if indicator is not None:
+            label.append(" " * max(1, 17 - label.cell_len))
+            label.append("●", style=self.INDICATOR_COLORS.get(indicator, MUTED))
         return label
 
     def set_active(self, active: str, *, reset_highlight: bool = False) -> None:
         # Status polling repeatedly renders the current screen.  Rebuilding an unchanged
         # sidebar would reset the user's navigation highlight every poll (Home refreshes
         # every 1.5 seconds).  Only page activation or an explicit reset may move it.
-        navigation = self.query_one(OptionList)
+        active = resolve(active)
         changed = active != self.active
         if changed:
             self.active = active
-            for number, section in enumerate(SECTIONS, start=1):
-                index = navigation.get_option_index(section.key)
+            for number, section in enumerate(sections_for(active), start=1):
+                navigation, index = self._location(section.key)
                 navigation.replace_option_prompt_at_index(index, self._label(section, number))
         if changed or reset_highlight:
-            navigation.highlighted = self._index_of(active)
+            navigation, index = self._location(active)
+            navigation.highlighted = index
+
+    def set_indicators(self, *, web: str | None = None, account: str | None = None) -> None:
+        """Repaint only the two status dots, preserving focus and highlights."""
+        if self.owner != "telegram":
+            return
+        changes = {"telegram_web": web, "telegram_login": account}
+        for key, value in changes.items():
+            if value is None or self._indicators[key] == value:
+                continue
+            self._indicators[key] = value
+            section = next(item for item in TELEGRAM_SECTIONS if item.key == key)
+            number = TELEGRAM_SECTIONS.index(section) + 1
+            navigation, index = self._location(key)
+            navigation.replace_option_prompt_at_index(index, self._label(section, number))
 
     def move(self, direction: int) -> None:
-        navigation = self.query_one(OptionList)
+        lists = self._lists()
+        navigation = next(
+            (
+                item
+                for item in lists
+                if self.app.focused is item or item in getattr(self.app.focused, "ancestors", [])
+            ),
+            lists[0],
+        )
         navigation.focus()
+        index = navigation.highlighted
+        if len(lists) > 1 and index is not None:
+            at_edge = (
+                direction > 0 and index >= navigation.option_count - 1
+            ) or (direction < 0 and index <= 0)
+            if at_edge:
+                target = lists[
+                    (lists.index(navigation) + (1 if direction > 0 else -1)) % len(lists)
+                ]
+                target.focus()
+                target.highlighted = 0 if direction > 0 else target.option_count - 1
+                return
         if direction > 0:
             navigation.action_cursor_down()
         else:
             navigation.action_cursor_up()
 
     def choose(self) -> None:
-        navigation = self.query_one(OptionList)
+        lists = self._lists()
+        navigation = next((item for item in lists if self.app.focused is item), lists[0])
         index = navigation.highlighted
         if index is None:
             return
         key = str(navigation.get_option_at_index(index).id)
-        if any(section.key == key for section in SECTIONS):
+        if key == self.BACK or any(section.key == key for section in sections_for(self.active)):
             self.post_message(self.Navigate(key))
 
     def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:

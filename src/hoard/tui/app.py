@@ -32,9 +32,25 @@ from .ai_dialogs import AIKeyDialog, TelegramAIDialog, TelegramAnalysisDialog
 from .api import HoardAPI, IPCStatusAPI
 from .colors import ACCENT, MUTED, TEXT
 from .dialogs import AuthDialog
-from .navigation import SECTIONS, breadcrumb, resolve, section_index
+from .navigation import (
+    SECTIONS,
+    breadcrumb,
+    palette_sections,
+    resolve,
+    section_index,
+    sections_for,
+    workspace,
+)
 from .palette import Command, PaletteScreen
-from .screens import AIWorkspaceScreen, ArchiveScreen, HomeScreen, TelegramScreen
+from .screens import (
+    AIWorkspaceScreen,
+    ArchiveScreen,
+    HomeScreen,
+    TelegramLoginScreen,
+    TelegramSourcesScreen,
+    TelegramStatusScreen,
+    TelegramWebScreen,
+)
 from .screens.base import WorkspaceScreen
 from .widgets import Sidebar
 
@@ -69,8 +85,8 @@ def _help_text() -> Text:
             "Навигация",
             (
                 ("j k  ↑ ↓", "выбор"),
-                ("l  →  ⏎", "открыть"),
-                ("h  ←  esc", "назад"),
+                ("l  ⏎", "открыть"),
+                ("h  esc", "назад"),
                 ("[ ]", "предыдущий / следующий раздел"),
                 (f"1 – {min(9, len(SECTIONS))}", "перейти к разделу"),
                 ("tab  ⇧tab", "следующий / предыдущий элемент"),
@@ -139,7 +155,10 @@ class HoardApp(App[None]):
     SCREENS: ClassVar[dict[str, type[WorkspaceScreen]]] = {
         "home": HomeScreen,
         "archive": ArchiveScreen,
-        "telegram": TelegramScreen,
+        "telegram_status": TelegramStatusScreen,
+        "telegram_sources": TelegramSourcesScreen,
+        "telegram_web": TelegramWebScreen,
+        "telegram_login": TelegramLoginScreen,
         "ai": AIWorkspaceScreen,
     }
     BINDINGS = [
@@ -149,8 +168,8 @@ class HoardApp(App[None]):
         Binding("down", "nav_down", "Вниз"),
         Binding("k", "nav_up", "Вверх"),
         Binding("up", "nav_up", "Вверх"),
-        Binding("l,right,enter", "open", "Открыть"),
-        Binding("h,left,escape", "back", "Назад"),
+        Binding("l,enter", "open", "Открыть"),
+        Binding("h,escape", "back", "Назад"),
         Binding("b", "sidebar", "Sidebar"),
         Binding("[", "previous_section", "Предыдущий раздел"),
         Binding("]", "next_section", "Следующий раздел"),
@@ -160,7 +179,7 @@ class HoardApp(App[None]):
         Binding("ctrl+pagedown", "scroll_workspace(1)", "Страница вниз", show=False),
         *(
             Binding(str(number), f"goto_section({number - 1})", show=False)
-            for number in range(1, min(9, len(SECTIONS)) + 1)
+            for number in range(1, 10)
         ),
     ]
 
@@ -170,10 +189,12 @@ class HoardApp(App[None]):
         self.status: dict | None = None
         self.status_error: str | None = None
         self.notice: tuple[str, bool] | None = None
+        self.web_state: dict[str, Any] = {"state": "unknown"}
         self._refresh_lock = asyncio.Lock()
         self._operations: set[str] = set()
         self._startup_complete = False
         self._last_narrow: bool | None = None
+        self._telegram_return_section = "home"
 
     def on_mount(self) -> None:
         self.register_theme(BLACK_THEME)
@@ -259,14 +280,23 @@ class HoardApp(App[None]):
         if isinstance(self.screen, HelpScreen) or section not in self.SCREENS:
             return
         current = getattr(self.screen, "section", None)
+        if workspace(section) == "telegram" and workspace(str(current or "")) is None:
+            current_section = resolve(str(current or "home"))
+            self._telegram_return_section = (
+                current_section if current_section in {"home", "archive", "ai"} else "home"
+            )
         if current != section:
             self.switch_screen(section)
-            if section in {"archive", "telegram"}:
+            if section in {"archive", "telegram_sources"}:
                 self.run_worker(
                     self.refresh_status(wait=True),
                     name=f"{section}-details",
                     exit_on_error=False,
                 )
+
+    def leave_workspace(self) -> None:
+        """Return from a tool menu to the outer Hoard level."""
+        self.open_section(self._telegram_return_section)
 
     def open_auth(self, on_authorized: Callable[[], None] | None = None) -> None:
         def complete(authorized: bool | None) -> None:
@@ -562,6 +592,10 @@ class HoardApp(App[None]):
         focused = self.focused
         if self._is_text_entry(focused):
             return
+        sidebar = self._visible_sidebar()
+        if sidebar is not None and self._focus_is_inside(focused, sidebar):
+            sidebar.move(1)
+            return
         if isinstance(focused, (DataTable, ListView, OptionList)):
             focused.action_cursor_down()
         elif self._is_interactive(focused):
@@ -572,6 +606,10 @@ class HoardApp(App[None]):
     def action_nav_up(self) -> None:
         focused = self.focused
         if self._is_text_entry(focused):
+            return
+        sidebar = self._visible_sidebar()
+        if sidebar is not None and self._focus_is_inside(focused, sidebar):
+            sidebar.move(-1)
             return
         if isinstance(focused, (DataTable, ListView, OptionList)):
             focused.action_cursor_up()
@@ -584,7 +622,10 @@ class HoardApp(App[None]):
         focused = self.focused
         if self._is_text_entry(focused):
             return
-        if isinstance(focused, DataTable):
+        sidebar = self._visible_sidebar()
+        if sidebar is not None and self._focus_is_inside(focused, sidebar):
+            sidebar.choose()
+        elif isinstance(focused, DataTable):
             focused.action_select_cursor()
         elif isinstance(focused, ListView):
             focused.action_select_cursor()
@@ -598,7 +639,13 @@ class HoardApp(App[None]):
     def action_back(self) -> None:
         if self._is_text_entry(self.focused):
             return
-        if getattr(self.screen, "section", None) != "home":
+        current = str(getattr(self.screen, "section", "home"))
+        if workspace(current) == "telegram":
+            if current == "telegram_status":
+                self.leave_workspace()
+            else:
+                self.open_section("telegram_status")
+        elif current != "home":
             self.open_section("home")
 
     def action_help(self) -> None:
@@ -613,14 +660,13 @@ class HoardApp(App[None]):
             Command(
                 f"goto:{section.key}",
                 section.label,
-                hint=str(number) if number < 10 else "",
+                hint=str(section_index(section.key) + 1),
                 keywords=section.keywords,
                 context=breadcrumb(section.key)[0].label if section.parent else "",
             )
-            for number, section in enumerate(SECTIONS, start=1)
+            for section in palette_sections()
         ]
         entries += [
-            Command("web", "Открыть веб-интерфейс", keywords=("браузер", "web", "каталог")),
             Command("sidebar", "Показать / скрыть меню", "b", keywords=("sidebar", "навигация")),
             Command("help", "Горячие клавиши", "?", keywords=("помощь", "клавиши", "help")),
             Command("quit", "Выйти", "q", keywords=("закрыть", "exit", "quit")),
@@ -635,8 +681,6 @@ class HoardApp(App[None]):
             return
         if key.startswith("goto:"):
             self.open_section(key.removeprefix("goto:"))
-        elif key == "web":
-            self.open_web_interface()
         elif key == "sidebar":
             self.action_sidebar()
         elif key == "help":
@@ -645,8 +689,9 @@ class HoardApp(App[None]):
             self.exit()
 
     def action_goto_section(self, index: int) -> None:
-        if 0 <= index < len(SECTIONS) and not self._is_text_entry(self.focused):
-            self.open_section(SECTIONS[index].key)
+        sections = sections_for(str(getattr(self.screen, "section", "home")))
+        if 0 <= index < len(sections) and not self._is_text_entry(self.focused):
+            self.open_section(sections[index].key)
 
     def action_sidebar(self) -> None:
         if not self._is_text_entry(self.focused):
@@ -655,8 +700,9 @@ class HoardApp(App[None]):
 
     def _move_section(self, offset: int) -> None:
         current = getattr(self.screen, "section", "home")
-        index = (section_index(current) + offset) % len(SECTIONS)
-        self.open_section(SECTIONS[index].key)
+        sections = sections_for(str(current))
+        index = (section_index(str(current)) + offset) % len(sections)
+        self.open_section(sections[index].key)
 
     def action_scroll_workspace(self, direction: int) -> None:
         if not isinstance(self.screen, WorkspaceScreen):
