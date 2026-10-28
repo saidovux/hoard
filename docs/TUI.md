@@ -158,11 +158,31 @@ another full source. Existing photos are never copied or removed.
 
 ## Telegram Publication
 
-Publication is one screen with four local tabs. Кружки and Кадры use source-filtered daemon IPC in
-stable `message_id DESC` order; Профили reuses `profile_summaries(source_id=...)` and its local
-username/name/ID search; PSL uses the union of batch, video and analysis-photo source links with
-distinct analysis IDs and batch-author consistency. Each tab requests 50 rows, the daemon caps
-pages at 100, and switching tabs does not prefetch the other three.
+Publication is one screen with four local read-only data tabs plus one explicit operation panel.
+Кружки and Кадры use source-filtered daemon IPC in stable `message_id DESC` order; Профили reuses
+`profile_summaries(source_id=...)` and its local username/name/ID search; PSL uses the union of
+batch, video and analysis-photo source links with distinct analysis IDs and batch-author
+consistency. Each tab requests 50 rows, the daemon caps pages at 100, and switching tabs does not
+prefetch the other three. A refresh/search/page request made during an older request is retained as
+one pending reload; the stale response cannot overwrite it. Returning to an unfinished tab starts
+the missing request, while a valid completed snapshot remains available.
+
+Space or **Выбрать / снять** marks the stable message/author ID under the current cursor; **Выбрать
+видимые** affects only the loaded 50-row page, and **Снять все** clears that object type. Marks
+survive pagination and sorting within one publication, never follow row indexes, are capped at 100,
+and are cleared when the source changes. Кружки/Кадры expose confirmed **Извлечь выбранные**,
+**Обработать публикацию**, source-scoped **Повторить ошибки** and hard **Остановить FFmpeg** actions.
+The compact monitor reports the real session ID scope, completed/waiting/running/error totals and
+current message. One 1.5-second status timer exists only while this screen is visible; leaving the
+screen stops polling but not explicitly started daemon work.
+
+Профили supports the same stable multi-selection and the `photos`, `frames` and `combined` image
+modes. **Анализировать выбранных** sends `source_id + author_ids`; **Анализировать публикацию**
+keeps the complete selector server-side. Both open the existing local preview before any external
+request. A single profile may choose its exact ready video; batch rows show the actual selected
+video and skip reason. The submit label states that images go to DeepSeek and may cost money.
+Automatic 18+ admission remains limited to local user profiles; channels/chats remain ineligible.
+The latest durable source-scoped batch is visible again after returning to the screen.
 
 The frame table reads saved SQLite status only, including video notes with no frame-set row. Deep
 MP4/size/mtime/SHA-256 validation runs only after explicitly opening one set, and the reused
@@ -170,14 +190,17 @@ MP4/size/mtime/SHA-256 validation runs only after explicitly opening one set, an
 outcome-unknown PSL rows never expose scores. The detail view omits prompts, raw responses, costs,
 tokens and private paths.
 
-Video, photo and frame buttons send stable IDs rather than paths. The daemon checks publication
+Video, photo and frame buttons send stable IDs rather than paths. The source ID is frozen at click
+time before the asynchronous IPC call. The daemon checks publication
 ownership, global-photo author membership, archive-root containment after symlink resolution,
-regular-file type and known size before calling the platform opener without `shell=True`. No tab,
-detail card or media action starts Telegram, Web, FFmpeg/FFprobe or AI.
+regular-file type and known size before calling the platform opener without `shell=True`. Opening a
+tab, detail card, preview or media item starts neither Telegram, Web, FFmpeg/FFprobe nor paid AI;
+only the named confirmed operation controls do so.
 
 ## Keyboard
 
-`j`/`k`, arrows — move · `l`, Enter — open · `h`, Esc — back · `tab` — next panel ·
+`j`/`k`, arrows — move · `l`, Enter — open · `space` — mark current publication object ·
+`v` — mark visible page · `x` — clear marks · `h`, Esc — back · `tab` — next panel ·
 `[` `]` — previous/next section of the current level · `1`–`9` — jump within the current visible
 level · `:` or Ctrl+K — command palette · `b` — toggle sidebar · `?` — help · `q` — quit (the
 daemon keeps running). From Publication, back opens Sources. From Sources/Web/Login, back opens

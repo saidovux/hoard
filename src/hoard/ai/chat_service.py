@@ -753,13 +753,26 @@ class AIChatService:
             raise ValueError("Telegram-хранилище недоступно")
         selected_source: int | None = None
         has_source = source_id not in {None, ""} or bool(str(source_url or "").strip())
-        if has_source and author_ids is not None:
-            raise ValueError("Выбери author_ids или публикацию, но не оба режима сразу")
         if has_source:
             selected_source = self.telegram_storage.resolve_source_id(
                 source_url if str(source_url or "").strip() else source_id
             )
-            identifiers = self.telegram_storage.source_profiles(selected_source)
+            linked_identifiers = self.telegram_storage.source_profiles(selected_source)
+            if author_ids is None:
+                identifiers = linked_identifiers
+            else:
+                identifiers = self._author_ids(author_ids)
+                if len(identifiers) > 100:
+                    raise ValueError(
+                        "В публикации можно явно выбрать не более 100 профилей"
+                    )
+                linked = set(linked_identifiers)
+                foreign = [author_id for author_id in identifiers if author_id not in linked]
+                if foreign:
+                    raise ValueError(
+                        "Профиль не принадлежит выбранной публикации: "
+                        + ", ".join(str(value) for value in foreign[:5])
+                    )
         else:
             identifiers = self._author_ids(author_ids)
         scope_source = selected_source
@@ -933,6 +946,29 @@ class AIChatService:
             candidates.append(base)
         return candidates, selected_source
 
+    @staticmethod
+    def _candidate_selection_snapshot(candidates: list[dict[str, Any]]) -> str:
+        """Fingerprint a complete preview without returning every selection over IPC."""
+        digest = hashlib.sha256()
+        for item in candidates:
+            digest.update(str(int(item["author_id"])).encode("ascii"))
+            digest.update(b"\0")
+            digest.update(str(item.get("image_mode") or "").encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(str(item.get("video_id") or "").encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(
+                str(item.get("image_snapshot") or item.get("photo_snapshot") or "").encode(
+                    "ascii"
+                )
+            )
+            digest.update(b"\0")
+            digest.update(b"1" if item.get("ready") else b"0")
+            digest.update(b"\0")
+            digest.update(str(item.get("reason") or "").encode("utf-8"))
+            digest.update(b"\n")
+        return digest.hexdigest()
+
     def preview_telegram_psl_batch(self, values: dict[str, Any]) -> dict[str, Any]:
         candidates, selected_source = self._telegram_psl_candidates(
             author_ids=values.get("author_ids"),
@@ -974,6 +1010,7 @@ class AIChatService:
             ),
             "frame_count": sum(int(item["frame_count"]) for item in candidates),
             "video_count": sum(int(item["video_count"]) for item in candidates),
+            "selection_snapshot": self._candidate_selection_snapshot(candidates),
             "ready_count": sum(1 for item in candidates if item["ready"]),
             "skipped_count": sum(1 for item in candidates if not item["ready"]),
             "items": page,
@@ -1006,6 +1043,13 @@ class AIChatService:
         )
         if not candidates:
             raise ValueError("В выбранной публикации нет сохранённых локальных профилей")
+        expected_selection = str(values.get("selection_snapshot") or "").strip()
+        if expected_selection and expected_selection != self._candidate_selection_snapshot(
+            candidates
+        ):
+            raise ValueError(
+                "Локальные изображения изменились после предпросмотра; обнови preview"
+            )
         mode = self._image_mode(values.get("image_mode", "photos"))
         items = [
             {
@@ -1073,6 +1117,7 @@ class AIChatService:
             image_ids = list(item.get("photo_ids") or [])
             candidate_args: dict[str, Any] = {
                 "author_ids": [int(item["author_id"])],
+                "source_id": batch_source,
                 "image_mode": item_mode,
                 "video_ids": {
                     str(item["author_id"]): str(item.get("video_id") or "")

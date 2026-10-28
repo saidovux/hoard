@@ -1608,6 +1608,14 @@ async def test_publication_view_fits_supported_terminal_sizes(size):
         assert table.virtual_size.width <= table.size.width
         assert app.screen.query_one("#publication-back", Button).display
         assert app.screen.query_one("#publication-mode-psl", Button).display
+        for button in app.screen.query(Button):
+            if button.display and button.region.width:
+                assert button.region.right <= app.size.width, button.id
+        app.screen._switch_mode("profiles")
+        await wait_for_condition(pilot, lambda: app.screen._pages["profiles"]["loaded"])
+        for button in app.screen.query(Button):
+            if button.display and button.region.width:
+                assert button.region.right <= app.size.width, button.id
 
 
 @pytest.mark.asyncio
@@ -2684,7 +2692,7 @@ async def test_home_carries_the_program_name_and_picks_a_logo_that_fits():
         big, small = app.screen.query_one("#hero-big"), app.screen.query_one("#hero-small")
         assert big.display and not small.display
         text = str(big.content)
-        assert "v0.7.4.3" in text
+        assert "v0.7.4.4" in text
         assert "локальный архив" not in text
         assert "всё хранится" not in text
         assert "сборщик" not in text
@@ -3353,3 +3361,218 @@ async def test_archive_actions_fit_and_advanced_actions_are_opt_in():
         for button in screen.query(Button):
             if button.display and button.region.width:
                 assert button.region.right <= app.size.width, button.id
+
+
+@pytest.mark.asyncio
+async def test_publication_refresh_during_loading_runs_latest_request():
+    status = status_fixture()
+    api = FakeAPI(status)
+    app = HoardApp(api)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await wait_for_startup(app, pilot)
+        app.open_section("telegram_sources")
+        await wait_for_condition(pilot, lambda: bool(getattr(app.screen, "_items", [])))
+        await pilot.press("enter")
+        await wait_for_condition(pilot, lambda: isinstance(app.screen, TelegramPublicationScreen))
+        screen = app.screen
+        await wait_for_condition(pilot, lambda: screen._pages["downloads"]["loaded"])
+        api.queue(
+            "telegram_publication_downloads_list",
+            {
+                "items": [
+                    {"message_id": 11, "author_id": 101, "frame_status": "pending"}
+                ],
+                "total": 1,
+            },
+            {
+                "items": [
+                    {"message_id": 22, "author_id": 102, "frame_status": "saved"}
+                ],
+                "total": 1,
+            },
+        )
+        api.operation_delay = 0.08
+        screen.action_refresh_publication()
+        await wait_for_condition(pilot, lambda: "downloads" in screen._loading_modes)
+        screen.action_refresh_publication()
+        await wait_for_condition(
+            pilot,
+            lambda: bool(screen._pages["downloads"]["loaded"])
+            and screen._pages["downloads"]["items"][0]["message_id"] == 22,
+        )
+        calls = [name for name, _args in api.calls if name == "telegram_publication_downloads_list"]
+        assert calls == ["telegram_publication_downloads_list"] * 3
+
+
+@pytest.mark.asyncio
+async def test_publication_selection_actions_keep_stable_ids_and_source_scope():
+    status = status_fixture()
+    status["downloads"] = [
+        {
+            "source_id": 1,
+            "message_id": message_id,
+            "author_id": 100 + message_id,
+            "author_username": f"user{message_id}",
+            "size": 100,
+            "frame_status": "pending",
+        }
+        for message_id in (11, 12)
+    ]
+    status["profiles"] = [
+        {
+            "author_id": 101,
+            "current_username": "alice",
+            "display_name": "Alice",
+            "photo_count": 1,
+        }
+    ]
+    api = FakeAPI(status)
+    app = HoardApp(api)
+    selectors: list[dict[str, Any]] = []
+    app.open_telegram_analysis = lambda selector: selectors.append(dict(selector))
+    async with app.run_test(size=(100, 30)) as pilot:
+        await wait_for_startup(app, pilot)
+        app.open_section("telegram_sources")
+        await wait_for_condition(pilot, lambda: bool(getattr(app.screen, "_items", [])))
+        await pilot.press("enter")
+        await wait_for_condition(pilot, lambda: isinstance(app.screen, TelegramPublicationScreen))
+        screen = app.screen
+        await wait_for_condition(pilot, lambda: screen._pages["downloads"]["loaded"])
+        screen.action_select_visible()
+        assert screen._marked["downloads"] == {11, 12}
+        screen.query_one("#publication-frames-selected", Button).press()
+        await wait_for_condition(
+            pilot,
+            lambda: isinstance(app.screen, ConfirmDialog)
+            and bool(app.screen.query("#confirm")),
+        )
+        app.screen.query_one("#confirm", Button).press()
+        await wait_for_condition(
+            pilot,
+            lambda: any(
+                name == "telegram_frames_selected_start" for name, _args in api.calls
+            ),
+        )
+        request = next(
+            args
+            for name, args in api.calls
+            if name == "telegram_frames_selected_start"
+        )
+        assert request == {
+            "source_id": 1,
+            "message_ids": [11, 12],
+            "confirmed": True,
+        }
+
+        await pilot.click("#publication-mode-profiles")
+        await wait_for_condition(pilot, lambda: screen._pages["profiles"]["loaded"])
+        screen.action_toggle_mark()
+        screen.query_one("#publication-psl-mode").value = "combined"
+        screen._analyze_selected_profiles()
+        assert selectors == [
+            {"source_id": 1, "author_ids": [101], "image_mode": "combined"}
+        ]
+
+
+@pytest.mark.asyncio
+async def test_publication_media_open_freezes_source_before_async_call():
+    status = status_fixture()
+    status["downloads"] = [
+        {
+            "source_id": 1,
+            "message_id": 77,
+            "author_id": 101,
+            "size": 100,
+            "frame_status": "pending",
+        }
+    ]
+    api = FakeAPI(status)
+    api.operation_delay = 0.08
+    app = HoardApp(api)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await wait_for_startup(app, pilot)
+        app.open_section("telegram_sources")
+        await wait_for_condition(pilot, lambda: bool(getattr(app.screen, "_items", [])))
+        await pilot.press("enter")
+        await wait_for_condition(pilot, lambda: isinstance(app.screen, TelegramPublicationScreen))
+        screen = app.screen
+        await wait_for_condition(pilot, lambda: screen._pages["downloads"]["loaded"])
+        screen._open_video()
+        screen.source_id = 2
+        await wait_for_condition(
+            pilot,
+            lambda: any(name == "telegram_publication_media_open" for name, _ in api.calls),
+        )
+        request = next(
+            args for name, args in api.calls if name == "telegram_publication_media_open"
+        )
+        assert request == {"source_id": 1, "kind": "video", "message_id": 77}
+
+
+@pytest.mark.asyncio
+async def test_publication_profile_search_during_loading_keeps_latest_query():
+    status = status_fixture()
+    status["profiles"] = [
+        {"author_id": 101, "current_username": "initial", "photo_count": 1}
+    ]
+    api = FakeAPI(status)
+    app = HoardApp(api)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await wait_for_startup(app, pilot)
+        app.open_section("telegram_sources")
+        await wait_for_condition(pilot, lambda: bool(getattr(app.screen, "_items", [])))
+        await pilot.press("enter")
+        await wait_for_condition(pilot, lambda: isinstance(app.screen, TelegramPublicationScreen))
+        screen = app.screen
+        await pilot.click("#publication-mode-profiles")
+        await wait_for_condition(pilot, lambda: screen._pages["profiles"]["loaded"])
+        api.queue(
+            "ai_telegram_profile_list",
+            {
+                "items": [{"author_id": 102, "current_username": "old", "photo_count": 1}],
+                "total": 1,
+            },
+            {
+                "items": [{"author_id": 103, "current_username": "latest", "photo_count": 1}],
+                "total": 1,
+            },
+        )
+        api.operation_delay = 0.45
+        screen.action_refresh_publication()
+        await wait_for_condition(pilot, lambda: "profiles" in screen._loading_modes)
+        screen.query_one("#publication-profile-search", Input).value = "latest"
+        await wait_for_condition(
+            pilot,
+            lambda: bool(screen._pages["profiles"]["loaded"])
+            and screen._pages["profiles"]["items"][0]["author_id"] == 103,
+        )
+        profile_calls = [
+            args for name, args in api.calls if name == "ai_telegram_profile_list"
+        ]
+        assert profile_calls[-1]["query"] == "latest"
+
+
+@pytest.mark.asyncio
+async def test_publication_resume_reloads_an_unfinished_active_tab():
+    status = status_fixture()
+    api = FakeAPI(status)
+    app = HoardApp(api)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await wait_for_startup(app, pilot)
+        app.open_section("telegram_sources")
+        await wait_for_condition(pilot, lambda: bool(getattr(app.screen, "_items", [])))
+        await pilot.press("enter")
+        await wait_for_condition(pilot, lambda: isinstance(app.screen, TelegramPublicationScreen))
+        screen = app.screen
+        await wait_for_condition(pilot, lambda: screen._pages["downloads"]["loaded"])
+        before = sum(
+            name == "telegram_publication_downloads_list" for name, _args in api.calls
+        )
+        screen._pages["downloads"].update(loaded=False, items=[])
+        screen.on_screen_suspend()
+        screen.on_screen_resume()
+        await wait_for_condition(pilot, lambda: screen._pages["downloads"]["loaded"])
+        after = sum(
+            name == "telegram_publication_downloads_list" for name, _args in api.calls
+        )
+        assert after == before + 1

@@ -11,10 +11,11 @@ from textual.binding import Binding
 from textual.containers import Horizontal, VerticalScroll
 from textual.screen import ModalScreen
 from textual.timer import Timer
-from textual.widgets import Button, DataTable, Input, Static
+from textual.widgets import Button, DataTable, Input, Select, Static
 
 from ..ai_dialogs import VideoFramesDialog
 from ..colors import MUTED, TEXT
+from ..dialogs import ConfirmDialog
 from ..state import format_bytes
 from ..widgets import HoardHeader, Panel
 from ..widgets.chrome import Hint
@@ -106,11 +107,17 @@ class TelegramPublicationScreen(WorkspaceScreen):
     SEARCH_DEBOUNCE = 0.3
     HINTS: ClassVar[tuple[Hint, ...]] = (
         ("j k", "выбор"),
+        ("space", "отметить"),
+        ("v x", "видимые / снять"),
         ("⏎", "подробнее"),
-        ("tab", "действия"),
         ("h", "к источникам"),
     )
-    BINDINGS = [Binding("r", "refresh_publication", "Обновить")]
+    BINDINGS = [
+        Binding("r", "refresh_publication", "Обновить"),
+        Binding("space", "toggle_mark", "Выбрать"),
+        Binding("v", "select_visible", "Видимые"),
+        Binding("x", "clear_marks", "Снять"),
+    ]
 
     def __init__(self) -> None:
         super().__init__()
@@ -127,8 +134,14 @@ class TelegramPublicationScreen(WorkspaceScreen):
         self._entry_generation = 0
         self._request_generation = {mode: 0 for mode in MODES}
         self._loading_modes: set[str] = set()
+        self._pending_reload: set[str] = set()
         self._profile_query = ""
         self._search_timer: Timer | None = None
+        self._marked: dict[str, set[int]] = {"downloads": set(), "profiles": set()}
+        self._work_timer: Timer | None = None
+        self._work_polling = False
+        self._frame_session: dict[str, Any] | None = None
+        self._ai_batch: dict[str, Any] | None = None
 
     def compose_workspace(self) -> ComposeResult:
         with Panel(title="Публикация", id="publication-summary-panel"):
@@ -159,9 +172,43 @@ class TelegramPublicationScreen(WorkspaceScreen):
                 yield Button("Показать кадры", id="publication-show-frames")
                 yield Button("Показать автора", id="publication-show-author")
             yield Static("Выберите объект в таблице.", id="publication-object")
+        with Panel(title="Операции", id="publication-operations-panel"):
+            with Horizontal(classes="action-row", id="publication-selection-actions"):
+                yield Button("Выбрать / снять", id="publication-toggle")
+                yield Button("Выбрать видимые", id="publication-select-visible")
+                yield Button("Снять все", id="publication-clear-selection")
+            with Horizontal(classes="action-row", id="publication-frame-actions"):
+                yield Button(
+                    "Извлечь выбранные", id="publication-frames-selected", variant="primary"
+                )
+                yield Button("Обработать публикацию", id="publication-frames-source")
+                yield Button("Повторить ошибки", id="publication-frames-retry")
+                yield Button("Остановить FFmpeg", id="publication-frames-stop")
+            with Horizontal(id="publication-psl-controls"):
+                yield Select(
+                    (
+                        ("Фотографии", "photos"),
+                        ("Кадры", "frames"),
+                        ("Кадры + фото", "combined"),
+                    ),
+                    value="photos",
+                    allow_blank=False,
+                    id="publication-psl-mode",
+                )
+                yield Button(
+                    "Анализировать выбранных",
+                    id="publication-psl-selected",
+                    variant="primary",
+                )
+                yield Button("Анализировать публикацию", id="publication-psl-source")
+                yield Button("Открыть последнюю группу", id="publication-psl-batch")
+            yield Static("FFmpeg не запущен.", id="publication-frame-status")
+            yield Static("AI-групп публикации пока нет.", id="publication-batch-status")
 
     def on_mount(self) -> None:
         super().on_mount()
+        self._work_timer = self.set_interval(1.5, self._poll_work_state, pause=True)
+        self._work_timer.resume()
         self._activate_context()
         self.call_after_refresh(
             lambda: self.focus_working_surface(
@@ -171,17 +218,28 @@ class TelegramPublicationScreen(WorkspaceScreen):
 
     def on_screen_resume(self) -> None:
         super().on_screen_resume()
+        if self._work_timer is not None:
+            self._work_timer.resume()
         context = self.hoard_app.publication_source or {}
         if int(context.get("id") or 0) != self.source_id:
             self._activate_context()
+        else:
+            page = self._pages[self.mode]
+            if not page["loaded"] or page["error"] or self.mode in self._pending_reload:
+                self._request_page(self.mode, force=True)
+            self._request_work_state()
 
     def on_screen_suspend(self) -> None:
         self._entry_generation += 1
         self._cancel_search_timer()
+        if self._work_timer is not None:
+            self._work_timer.pause()
 
     def on_unmount(self) -> None:
         self._entry_generation += 1
         self._cancel_search_timer()
+        if self._work_timer is not None:
+            self._work_timer.stop()
 
     def _activate_context(self) -> None:
         context = dict(self.hoard_app.publication_source or {})
@@ -196,6 +254,7 @@ class TelegramPublicationScreen(WorkspaceScreen):
         self._entry_generation += 1
         if changed:
             self.mode = "downloads"
+            self._pending_reload.clear()
             self._pages = {
                 mode: {
                     "items": [], "total": 0, "offset": 0, "loaded": False, "error": ""
@@ -203,6 +262,9 @@ class TelegramPublicationScreen(WorkspaceScreen):
                 for mode in MODES
             }
             self._selected = {mode: None for mode in MODES}
+            self._marked = {"downloads": set(), "profiles": set()}
+            self._frame_session = None
+            self._ai_batch = None
             self._profile_query = ""
             if self.is_mounted:
                 self.query_one("#publication-profile-search", Input).value = ""
@@ -210,6 +272,7 @@ class TelegramPublicationScreen(WorkspaceScreen):
         self._render_publication()
         self._request_header()
         self._request_page(self.mode)
+        self._request_work_state()
 
     def _set_header_detail(self) -> None:
         username = str(self.publication.get("username") or "—").lstrip("@")
@@ -288,7 +351,13 @@ class TelegramPublicationScreen(WorkspaceScreen):
 
     def _request_page(self, mode: str, *, force: bool = False) -> None:
         page = self._pages[mode]
-        if mode in self._loading_modes or (page["loaded"] and not force):
+        if mode in self._loading_modes:
+            self._request_generation[mode] += 1
+            self._pending_reload.add(mode)
+            page["loaded"] = False
+            self._render_pagination()
+            return
+        if page["loaded"] and not force:
             return
         self._request_generation[mode] += 1
         request_generation = self._request_generation[mode]
@@ -340,8 +409,18 @@ class TelegramPublicationScreen(WorkspaceScreen):
             return
         finally:
             self._loading_modes.discard(mode)
+            pending = mode in self._pending_reload
+            if pending:
+                self._pending_reload.discard(mode)
             if self.is_mounted and self.mode == mode:
                 self._render_pagination()
+            if (
+                pending
+                and self.is_mounted
+                and self.app.screen is self
+                and self.mode == mode
+            ):
+                self._request_page(mode, force=True)
         if not self._page_current(
             mode, source_id, offset, query, entry_generation, request_generation
         ):
@@ -394,6 +473,18 @@ class TelegramPublicationScreen(WorkspaceScreen):
             None,
         )
 
+    def _selection_kind(self, mode: str | None = None) -> str | None:
+        selected_mode = mode or self.mode
+        if selected_mode in {"downloads", "frames"}:
+            return "downloads"
+        if selected_mode == "profiles":
+            return "profiles"
+        return None
+
+    def _marked_ids(self, mode: str | None = None) -> set[int]:
+        kind = self._selection_kind(mode)
+        return self._marked[kind] if kind is not None else set()
+
     def _layout(self) -> tuple[tuple[str, ...], tuple[int, ...], tuple[int, ...]]:
         compact = self.hoard_app.has_class("compact")
         medium = self.hoard_app.has_class("medium")
@@ -417,8 +508,10 @@ class TelegramPublicationScreen(WorkspaceScreen):
     def _row_cells(self, item: dict[str, Any]) -> tuple[str, ...]:
         if self.mode == "downloads":
             author = item.get("author_username") or item.get("author_name") or item.get("author_id")
+            message_id = int(item.get("message_id") or 0)
+            marker = "✓ " if message_id in self._marked["downloads"] else "  "
             return (
-                str(item.get("message_id") or "—"),
+                marker + str(item.get("message_id") or "—"),
                 "@" + str(author).lstrip("@") if author else "—",
                 _short_date(item.get("date")),
                 format_bytes(item.get("size")),
@@ -426,8 +519,10 @@ class TelegramPublicationScreen(WorkspaceScreen):
             )
         if self.mode == "profiles":
             username = str(item.get("current_username") or "—").lstrip("@")
+            author_id = int(item.get("author_id") or 0)
+            marker = "✓ " if author_id in self._marked["profiles"] else "  "
             return (
-                str(item.get("author_id") or "—"),
+                marker + str(item.get("author_id") or "—"),
                 "@" + username,
                 str(item.get("display_name") or "—"),
                 str(item.get("photo_count") or 0),
@@ -435,8 +530,10 @@ class TelegramPublicationScreen(WorkspaceScreen):
             )
         if self.mode == "frames":
             author = item.get("author_username") or item.get("author_name") or item.get("author_id")
+            message_id = int(item.get("message_id") or 0)
+            marker = "✓ " if message_id in self._marked["downloads"] else "  "
             return (
-                str(item.get("message_id") or "—"),
+                marker + str(item.get("message_id") or "—"),
                 "@" + str(author).lstrip("@") if author else "—",
                 _frame_label(item),
                 str(item.get("frame_count") or 0),
@@ -504,6 +601,7 @@ class TelegramPublicationScreen(WorkspaceScreen):
             )
         self._render_pagination()
         self._render_object()
+        self._render_operations()
 
     def _render_pagination(self) -> None:
         if not self.is_mounted:
@@ -517,6 +615,9 @@ class TelegramPublicationScreen(WorkspaceScreen):
             label += " · ошибка обновления"
         elif self.mode in self._loading_modes:
             label += " · обновляется…"
+        marked = self._marked_ids()
+        if marked:
+            label += f" · выбрано {len(marked)}"
         self.query_one("#publication-range", Static).update(label)
         self.query_one("#publication-prev", Button).disabled = (
             self.mode in self._loading_modes or int(page["offset"]) <= 0
@@ -524,6 +625,42 @@ class TelegramPublicationScreen(WorkspaceScreen):
         self.query_one("#publication-next", Button).disabled = (
             self.mode in self._loading_modes or last >= int(page["total"])
         )
+
+    def _render_operations(self) -> None:
+        if not self.is_mounted:
+            return
+        selection_kind = self._selection_kind()
+        marked = self._marked_ids()
+        self.query_one("#publication-selection-actions", Horizontal).display = (
+            selection_kind is not None
+        )
+        self.query_one("#publication-frame-actions", Horizontal).display = self.mode in {
+            "downloads",
+            "frames",
+        }
+        self.query_one("#publication-psl-controls", Horizontal).display = self.mode in {
+            "profiles",
+            "psl",
+        }
+        self.query_one("#publication-toggle", Button).disabled = (
+            selection_kind is None or self.selected_item() is None
+        )
+        self.query_one("#publication-select-visible", Button).disabled = (
+            selection_kind is None or not self._row_ids
+        )
+        self.query_one("#publication-clear-selection", Button).disabled = not marked
+        self.query_one("#publication-frames-selected", Button).disabled = not self._marked[
+            "downloads"
+        ]
+        self.query_one("#publication-psl-selected", Button).display = self.mode == "profiles"
+        self.query_one("#publication-psl-selected", Button).disabled = not self._marked[
+            "profiles"
+        ]
+        active = bool(
+            self._frame_session
+            and str(self._frame_session.get("state") or "") == "running"
+        )
+        self.query_one("#publication-frames-stop", Button).disabled = not active
 
     def _render_object(self) -> None:
         item = self.selected_item()
@@ -559,6 +696,7 @@ class TelegramPublicationScreen(WorkspaceScreen):
         row = event.data_table.cursor_row
         self._selected[self.mode] = self._row_ids[row] if 0 <= row < len(self._row_ids) else None
         self._render_object()
+        self._render_operations()
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         if event.data_table.id == "publication-table" and self.selected_item() is not None:
@@ -588,6 +726,183 @@ class TelegramPublicationScreen(WorkspaceScreen):
             self._show_frames()
         elif identifier == "publication-show-author":
             self._show_author()
+        elif identifier == "publication-toggle":
+            self.action_toggle_mark()
+        elif identifier == "publication-select-visible":
+            self.action_select_visible()
+        elif identifier == "publication-clear-selection":
+            self.action_clear_marks()
+        elif identifier == "publication-frames-selected":
+            self._confirm_frames_selected()
+        elif identifier == "publication-frames-source":
+            self._confirm_frames_source()
+        elif identifier == "publication-frames-retry":
+            self._confirm_frames_retry()
+        elif identifier == "publication-frames-stop":
+            self._run_frame_action("telegram_frames_backfill_pause", {})
+        elif identifier == "publication-psl-selected":
+            self._analyze_selected_profiles()
+        elif identifier == "publication-psl-source":
+            self._analyze_publication()
+        elif identifier == "publication-psl-batch":
+            self._open_last_batch()
+
+    def action_toggle_mark(self) -> None:
+        kind = self._selection_kind()
+        item = self.selected_item()
+        if kind is None or item is None:
+            return
+        identifier = int(item["message_id"] if kind == "downloads" else item["author_id"])
+        selected = self._marked[kind]
+        if identifier in selected:
+            selected.remove(identifier)
+        elif len(selected) >= 100:
+            self.hoard_app.set_notice(
+                "За одну операцию можно выбрать не более 100 объектов.", error=True
+            )
+            return
+        else:
+            selected.add(identifier)
+        self._render_page()
+
+    def action_select_visible(self) -> None:
+        kind = self._selection_kind()
+        if kind is None:
+            return
+        visible = {int(value) for value in self._row_ids if int(value) > 0}
+        combined = self._marked[kind].union(visible)
+        if len(combined) > 100:
+            self.hoard_app.set_notice(
+                "Выбор видимой страницы превысит предел 100 объектов.", error=True
+            )
+            return
+        self._marked[kind] = combined
+        self._render_page()
+
+    def action_clear_marks(self) -> None:
+        kind = self._selection_kind()
+        if kind is None:
+            return
+        self._marked[kind].clear()
+        self._render_page()
+
+    def _confirm_frames_selected(self) -> None:
+        message_ids = sorted(self._marked["downloads"])
+        if not message_ids:
+            self.hoard_app.set_notice("Сначала выбери видеокружки.", error=True)
+            return
+        source_id = self.source_id
+        self.app.push_screen(
+            ConfirmDialog(
+                "Извлечь кадры выбранных кружков?",
+                f"Будет обработано только выбранных кружков: {len(message_ids)}. "
+                "FFmpeg работает последовательно и только при остановленном Telegram. "
+                "Закрытие TUI не останавливает начатую daemon-сессию.",
+                confirm_label="Запустить FFmpeg",
+            ),
+            lambda confirmed: self._run_frame_action(
+                "telegram_frames_selected_start",
+                {
+                    "source_id": source_id,
+                    "message_ids": message_ids,
+                    "confirmed": True,
+                },
+            )
+            if confirmed
+            else None,
+        )
+
+    def _confirm_frames_source(self) -> None:
+        source_id = self.source_id
+        estimate = int(self.publication.get("download_count") or 0)
+        self.app.push_screen(
+            ConfirmDialog(
+                "Обработать текущую публикацию?",
+                f"Daemon проверит до {estimate} сохранённых кружков этой публикации и "
+                "поставит не более восьми frame-jobs одновременно. Другие публикации "
+                "не будут обработаны.",
+                confirm_label="Запустить FFmpeg",
+            ),
+            lambda confirmed: self._run_frame_action(
+                "telegram_frames_source_start",
+                {"source_id": source_id, "confirmed": True},
+            )
+            if confirmed
+            else None,
+        )
+
+    def _confirm_frames_retry(self) -> None:
+        source_id = self.source_id
+        self.app.push_screen(
+            ConfirmDialog(
+                "Повторить ошибки этой публикации?",
+                "Будут повторно поставлены только failed/stale наборы текущей "
+                "публикации, максимум 100 за один явный запуск.",
+                confirm_label="Повторить через FFmpeg",
+            ),
+            lambda confirmed: self._run_frame_action(
+                "telegram_frames_source_retry_failed",
+                {"source_id": source_id, "confirmed": True},
+            )
+            if confirmed
+            else None,
+        )
+
+    def _run_frame_action(self, method: str, args: dict[str, Any]) -> None:
+        self.run_worker(
+            self._perform_frame_action(method, dict(args)),
+            name=f"publication-{method}",
+            exit_on_error=False,
+        )
+
+    async def _perform_frame_action(self, method: str, args: dict[str, Any]) -> None:
+        try:
+            result = await self.hoard_app.api.telegram_call(method, args)
+        except Exception as exc:
+            self.hoard_app.set_notice(str(exc) or type(exc).__name__, error=True)
+            return
+        self.hoard_app.set_notice(str(result.get("message") or "Готово"))
+        session = result.get("session")
+        if isinstance(session, dict):
+            self._frame_session = session
+        self._pages["downloads"]["loaded"] = False
+        self._pages["frames"]["loaded"] = False
+        if self.mode in {"downloads", "frames"}:
+            self._request_page(self.mode, force=True)
+        self._request_work_state()
+
+    def _selected_image_mode(self) -> str:
+        value = self.query_one("#publication-psl-mode", Select).value
+        return str(value) if value in {"photos", "frames", "combined"} else "photos"
+
+    def _analyze_selected_profiles(self) -> None:
+        author_ids = sorted(self._marked["profiles"])
+        if not author_ids:
+            self.hoard_app.set_notice("Сначала выбери профили.", error=True)
+            return
+        self.hoard_app.open_telegram_analysis(
+            {
+                "source_id": self.source_id,
+                "author_ids": author_ids,
+                "image_mode": self._selected_image_mode(),
+            }
+        )
+
+    def _analyze_publication(self) -> None:
+        self.hoard_app.open_telegram_analysis(
+            {"source_id": self.source_id, "image_mode": self._selected_image_mode()}
+        )
+
+    def _open_last_batch(self) -> None:
+        batch = self._ai_batch
+        if not batch:
+            self.hoard_app.set_notice("У публикации пока нет AI-групп.")
+            return
+        self.hoard_app.set_notice(
+            f"AI-группа {batch.get('id')}: очередь {batch.get('queued', 0)} · "
+            f"готово {batch.get('completed', 0)} · пропущено {batch.get('skipped', 0)} · "
+            f"ошибки {batch.get('errors', 0)}"
+        )
 
     def _switch_mode(self, mode: str) -> None:
         if mode not in MODES or mode == self.mode:
@@ -611,6 +926,90 @@ class TelegramPublicationScreen(WorkspaceScreen):
         self._pages[self.mode]["loaded"] = False
         self._request_header()
         self._request_page(self.mode, force=True)
+        self._request_work_state()
+
+    def _poll_work_state(self) -> None:
+        self._request_work_state()
+
+    def _request_work_state(self) -> None:
+        if (
+            self._work_polling
+            or self.source_id <= 0
+            or not self.is_mounted
+            or self.app.screen is not self
+        ):
+            return
+        self._work_polling = True
+        source_id = self.source_id
+        generation = self._entry_generation
+        self.run_worker(
+            self._load_work_state(source_id, generation),
+            name="publication-work-state",
+            exit_on_error=False,
+        )
+
+    async def _load_work_state(self, source_id: int, generation: int) -> None:
+        try:
+            frame_result, batches_result = await asyncio.gather(
+                self.hoard_app.api.telegram_call(
+                    "telegram_frames_session_status", {"source_id": source_id}
+                ),
+                self.hoard_app.api.ai_call(
+                    "ai_telegram_batch_list", {"source_id": source_id, "limit": 1}
+                ),
+                return_exceptions=True,
+            )
+        finally:
+            self._work_polling = False
+        if not self._current(source_id, generation):
+            return
+        if isinstance(frame_result, dict):
+            session = frame_result.get("session")
+            self._frame_session = session if isinstance(session, dict) else None
+        if isinstance(batches_result, dict):
+            items = list(batches_result.get("items") or [])
+            self._ai_batch = dict(items[0]) if items else None
+        self._render_work_status()
+        self._render_operations()
+
+    def _render_work_status(self) -> None:
+        if not self.is_mounted:
+            return
+        session = self._frame_session
+        if session:
+            mode = {
+                "single": "один кружок",
+                "selected": "выбранные",
+                "retry_source": "повтор ошибок",
+                "source": "публикация",
+                "bulk": "архив",
+            }.get(str(session.get("session_type") or ""), "ручная сессия")
+            source = session.get("source_id")
+            scope = "эта публикация" if source == self.source_id else f"источник {source or '—'}"
+            frame_text = (
+                f"FFmpeg · {mode} · {scope} · {session.get('state') or '—'}\n"
+                f"Готово {session.get('completed', 0)} из "
+                f"{session.get('selected_count', 0)} · ожидает "
+                f"{int(session.get('waiting', 0)) + int(session.get('queued', 0))} · "
+                f"в работе {session.get('running', 0)} · ошибки {session.get('errors', 0)}"
+            )
+            if session.get("current_message_id"):
+                frame_text += f" · текущий {session['current_message_id']}"
+        else:
+            frame_text = "FFmpeg не запущен. Обработка начинается только после подтверждения."
+        self.query_one("#publication-frame-status", Static).update(frame_text)
+
+        batch = self._ai_batch
+        if batch:
+            batch_text = (
+                f"AI-группа {batch.get('id')} · режим {batch.get('image_mode') or 'photos'}\n"
+                f"Всего {batch.get('selected_count', 0)} · очередь {batch.get('queued', 0)} · "
+                f"готово {batch.get('completed', 0)} · пропущено {batch.get('skipped', 0)} · "
+                f"ошибки {batch.get('errors', 0)}"
+            )
+        else:
+            batch_text = "AI-групп публикации пока нет. Preview и отправка запускаются явно."
+        self.query_one("#publication-batch-status", Static).update(batch_text)
 
     def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id != "publication-profile-search":
@@ -795,18 +1194,23 @@ class TelegramPublicationScreen(WorkspaceScreen):
                 "photo", author_id=author_id, photo_id=str(response["photo_id"])
             )
 
-    def _open_media(self, kind: str, **identifiers: Any) -> None:
+    def _open_media(
+        self, kind: str, *, publication_id: int | None = None, **identifiers: Any
+    ) -> None:
+        source_id = int(publication_id or self.source_id)
         self.run_worker(
-            self._perform_media_open(kind, identifiers),
+            self._perform_media_open(source_id, kind, dict(identifiers)),
             name=f"publication-open-{kind}",
             exit_on_error=False,
         )
 
-    async def _perform_media_open(self, kind: str, identifiers: dict[str, Any]) -> None:
+    async def _perform_media_open(
+        self, source_id: int, kind: str, identifiers: dict[str, Any]
+    ) -> None:
         try:
             result = await self.hoard_app.api.telegram_call(
                 "telegram_publication_media_open",
-                {"source_id": self.source_id, "kind": kind, **identifiers},
+                {"source_id": source_id, "kind": kind, **identifiers},
             )
         except Exception as exc:
             self.hoard_app.set_notice(str(exc) or type(exc).__name__, error=True)
@@ -845,7 +1249,10 @@ class TelegramPublicationScreen(WorkspaceScreen):
                 video_id=f"{source_id}:{message_id}",
                 view_only=True,
                 open_frame=lambda position: self._open_media(
-                    "frame", message_id=message_id, position=position
+                    "frame",
+                    publication_id=source_id,
+                    message_id=message_id,
+                    position=position,
                 ),
             )
         )

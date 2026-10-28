@@ -1,9 +1,26 @@
-# Hoard 0.7.4.3
+# Hoard 0.7.4.4
 
 Hoard is a local-first Linux and Windows archive for Telegram posts, profiles and video notes
 found in a channel post's comments. It uses Telethon, SQLite, an autonomous offline HTML catalog
 and terminal interfaces. A private background daemon performs all Telegram work; closing an
 interface does not stop downloads.
+
+The 0.7.4.4 release turns the contextual **Telegram → Источники → Публикация** viewer into the
+manual FFmpeg and PSL workspace. Stable multi-selection survives pagination inside one publication
+and is cleared on source changes. Selected video notes, the current publication, and its failed
+frame sets run through one existing media runner with an explicit per-session job allowlist, an
+eight-job queued/running ceiling and one FFmpeg process. Stop remains hard, daemon restart revokes
+permission, Telegram collection remains mutually exclusive, and no frame operation starts merely
+by opening the screen.
+
+Profiles can be selected individually, by visible page, or delegated as the complete publication
+selector. Photos, one three-frame video set, or those frames plus one same-author photo pass through
+the existing local preview and durable PSL batch; `source_id + author_ids` is validated again during
+resume. The visible publication screen lightly polls only its active FFmpeg session and latest
+source-scoped AI batch. Paid provider work still requires the preview's explicit send confirmation,
+uses automatic 18+ admission for local user profiles, and never retries `outcome_unknown`
+automatically. The release also guarantees the latest refresh/search after an in-flight page load,
+reloads unfinished tabs on resume, and freezes source IDs before asynchronous media-open calls.
 
 The 0.7.4.3 release adds the contextual **Telegram → Источники → Публикация** viewer. Enter opens
 one saved publication while `e` remains edit; returning preserves the Sources query, filter, sort,
@@ -294,7 +311,7 @@ For development, install the test tools with `python -m pip install -e '.[dev]'`
 
 An upgrade keeps the existing XDG configuration, database, Telegram session and archive.
 If an older daemon is still running, execute `hoard shutdown` before starting the upgraded
-installation. The 0.7.4.3 client accepts only a daemon reporting the same application version and
+installation. The 0.7.4.4 client accepts only a daemon reporting the same application version and
 IPC protocol `1`; it reports the mismatch instead of starting a competing service. If a matching
 daemon already owns the service lock but is still initializing, clients wait for it and show a
 specific startup diagnostic.
@@ -494,7 +511,9 @@ extracted frames; the frame-specific AI action uses that exact local set.
 Each newly downloaded video note gets a durable local `waiting` record, not execution permission.
 Daemon/TUI startup, a download, restart and generic job retry never start FFmpeg or FFprobe. In
 **Архив → Кружки**, use **Извлечь кадры** for the selected video or confirm
-**Обработать ожидающие** for a bounded resumable batch. A separate one-slot media runner then uses
+**Обработать ожидающие** for a bounded resumable batch. In **Telegram → Источники → Публикация**,
+mark one or more visible/local video notes and use **Извлечь выбранные**, or confirm
+**Обработать публикацию** / source-scoped **Повторить ошибки**. A separate one-slot media runner uses
 system `ffprobe` to read the actual duration and `ffmpeg` to save three JPEG frames at 20%, 50%
 and 80%. It uses one decode and filter thread, gets a best-effort lower priority on Linux, never
 runs inside the Telegram event loop, never modifies the MP4 and never starts an AI request. Frames
@@ -523,6 +542,13 @@ or Web is closed and does not download the MP4 again. Frame completion marks the
 publication is coalesced for a manual batch, and an open Web receives the new frames without a
 reload. The autonomous `file://` catalog also displays frames when their files remain inside the
 archive.
+
+Selected runs are capped at 100 unique message IDs and daemon-validates that every ID belongs to
+the source. A process-local job allowlist prevents the shared runner from consuming work from any
+other publication. Publication runs keep a source-scoped durable cursor and authorize only free
+slots under the existing eight queued/running job ceiling; they never pass thousands of IDs through
+IPC. The publication monitor polls only while that screen is visible. Leaving or closing the TUI
+does not stop the explicitly started daemon session.
 
 Optional enrichment obtains post text/media and up to 30 latest profile photos visible to the
 authorized account:
@@ -603,6 +629,7 @@ ai_attempt_get/list/retry  ai_job_state  ai_statistics
 ai_telegram_profile_get/list  ai_telegram_source_get  ai_telegram_photos/photo_get
 ai_telegram_psl_start  ai_telegram_analysis_get/list
 ai_telegram_batch_preview/start/get/list
+telegram_frames_selected_start/source_start/source_retry_failed/session_status
 ```
 
 Lists and history are paginated, and both IPC directions retain the 64 KiB message limit. New chat
@@ -622,8 +649,10 @@ paid DeepSeek requests.
 ## Telegram AI and subjective PSL
 
 In **Архив → Профили**, analyze one saved profile or mark several and choose **Анализировать
-выбранные**. In **Telegram → Источники**, choose **Анализ профилей** for a saved publication. The same
-actions are available in `hoard web`. Hoard resolves stable `author_id` values from SQLite, uses
+выбранные**. In **Telegram → Источники → Публикация**, mark up to 100 profiles and choose
+**Анализировать выбранных**, or delegate the complete source selector with **Анализировать
+публикацию**. The same actions are available in `hoard web`. Hoard resolves stable `author_id`
+values from SQLite, uses
 the complete `tg_profile_sources` relation and defaults to the four newest available local photos
 per profile; it never downloads a new photo or expands Telegram collection for AI. A single
 profile still allows manual photo choice without typing IDs.
@@ -632,6 +661,13 @@ Before queueing, local user profiles receive automatic 18+ admission and the UI 
 transmission to DeepSeek. Channels/chats, missing or changed photos and over-limit selections are
 retained in a small durable batch as skipped with an explicit reason. Repeating one logical action
 returns the original paid attempts.
+
+Publication selection supports saved profile photos, three valid frames from one exact video note,
+or those three frames plus one saved photo of the same author. The daemon accepts
+`source_id + author_ids`, rejects foreign authors, restricts video options to that source and
+repeats the ownership check during durable batch resume. Preview shows ready/skipped counts, actual
+image IDs/video IDs and skip reasons without contacting DeepSeek. Only its explicit send button
+creates the paid batch; `outcome_unknown` is never retried automatically.
 
 Batch items expose `pending`, `queued`, `running`, `completed`, `skipped`, `failed` or
 `outcome_unknown`; totals and costs are SQL aggregates independent of the requested item page.

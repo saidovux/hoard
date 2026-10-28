@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Collection
 
 Handler = Callable[[dict], Awaitable[str]]
 
@@ -20,6 +20,7 @@ class JobRunner:
         include_job_id: bool = False,
         redact_errors: bool = False,
         scheduler: Callable[[], None] | None = None,
+        allowed_job_ids: Callable[[], Collection[int] | None] | None = None,
     ):
         if not 1 <= parallel <= 100:
             raise ValueError("Допустимо 1–100 параллельных задач; по умолчанию 3")
@@ -31,6 +32,7 @@ class JobRunner:
         self.include_job_id = include_job_id
         self.redact_errors = redact_errors
         self.scheduler = scheduler
+        self.allowed_job_ids = allowed_job_ids
         self._loop: asyncio.Task | None = None
         self._active: dict[int, asyncio.Task] = {}
         self._wakeup = asyncio.Event()
@@ -154,6 +156,11 @@ class JobRunner:
                         # One deferred report must not hide otherwise runnable work.
                         limit=slots + int("telegram.report" in self.handlers),
                         kinds=self.handlers.keys(),
+                        job_ids=(
+                            self.allowed_job_ids()
+                            if self.allowed_job_ids is not None
+                            else None
+                        ),
                     )
                 except Exception as exc:
                     # A temporary SQLite/filesystem error must not silently kill

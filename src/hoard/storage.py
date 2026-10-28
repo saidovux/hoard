@@ -1015,20 +1015,26 @@ class Store:
         limit: int = 3,
         *,
         kinds: Collection[str] | None = None,
+        job_ids: Collection[int] | None = None,
     ) -> list[dict]:
-        if kinds is None:
-            query = "SELECT * FROM jobs WHERE state='queued' ORDER BY id LIMIT ?"
-            parameters: tuple = (limit,)
-        else:
+        clauses = ["state='queued'"]
+        parameters: list[Any] = []
+        if kinds is not None:
             selected = tuple(kinds)
             if not selected:
                 return []
             placeholders = ",".join("?" for _ in selected)
-            query = (
-                f"SELECT * FROM jobs WHERE state='queued' AND kind IN ({placeholders}) "
-                "ORDER BY id LIMIT ?"
-            )
-            parameters = (*selected, limit)
+            clauses.append(f"kind IN ({placeholders})")
+            parameters.extend(selected)
+        if job_ids is not None:
+            identifiers = tuple(dict.fromkeys(int(value) for value in job_ids))
+            if not identifiers:
+                return []
+            placeholders = ",".join("?" for _ in identifiers)
+            clauses.append(f"id IN ({placeholders})")
+            parameters.extend(identifiers)
+        query = f"SELECT * FROM jobs WHERE {' AND '.join(clauses)} ORDER BY id LIMIT ?"
+        parameters.append(max(0, int(limit)))
         return [dict(row) for row in self.db.execute(query, parameters)]
 
     def recent_jobs(self, count: int = 80) -> list[dict]:

@@ -261,6 +261,11 @@ class AIIPC:
                 "items": self.storage.list_telegram_batches(
                     active_only=bool(args.get("active_only", False)),
                     limit=args.get("limit", 20),
+                    source_id=(
+                        int(args["source_id"])
+                        if args.get("source_id") not in {None, ""}
+                        else None
+                    ),
                 )
             }
         if method == "ai_telegram_analysis_get":

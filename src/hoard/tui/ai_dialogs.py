@@ -550,7 +550,8 @@ class TelegramAnalysisDialog(ModalScreen[dict[str, Any] | None]):
                 yield Static(title, classes="dialog-title")
                 yield Static(
                     f"Выбрано: {self.preview.get('selected_count', 0)} · "
-                    f"локальных фото: {self.preview.get('photo_count', 0)}. "
+                    f"готово: {self.preview.get('ready_count', 0)} · "
+                    f"изображений: {self.preview.get('image_count', 0)}. "
                     "Предпросмотр не обращается к Telegram и DeepSeek.",
                     classes="dialog-message",
                 )
@@ -588,6 +589,7 @@ class TelegramAnalysisDialog(ModalScreen[dict[str, Any] | None]):
                             Option(label, id=str(value)) for label, value in options
                         ]
                         yield OptionList(*option_nodes, id="analysis-video")
+                        yield Static(id="analysis-video-preview", classes="table-help")
                     else:
                         yield Static(
                             "Нет готовых наборов кадров; профиль будет пропущен.",
@@ -625,7 +627,7 @@ class TelegramAnalysisDialog(ModalScreen[dict[str, Any] | None]):
                 yield Static(id="analysis-skipped", classes="dialog-error")
                 yield Static(
                     "Возрастной допуск 18+ применяется автоматически. Будут отправлены только "
-                    "указанные локальные фото; запрос DeepSeek может быть платным, "
+                    "указанные локальные изображения; запрос DeepSeek может быть платным, "
                     "автоматического платного повтора нет.",
                     classes="table-help",
                 )
@@ -658,6 +660,41 @@ class TelegramAnalysisDialog(ModalScreen[dict[str, Any] | None]):
                     index = chooser.get_option_index(selected)
                     if index is not None:
                         chooser.highlighted = index
+                self._render_video_preview()
+
+    def _render_video_preview(self) -> None:
+        if not self.query("#analysis-video") or not self.query("#analysis-video-preview"):
+            return
+        chooser = self.query_one("#analysis-video", OptionList)
+        if chooser.highlighted is None:
+            return
+        option = chooser.get_option_at_index(chooser.highlighted)
+        video_id = str(option.id or "")
+        item = (self.preview.get("items") or [None])[0]
+        choice = next(
+            (
+                candidate
+                for candidate in (item or {}).get("videos") or []
+                if str(candidate.get("video_id") or "") == video_id
+            ),
+            None,
+        )
+        if choice is None:
+            return
+        frames = " · ".join(
+            f"#{frame.get('position')} {float(frame.get('timestamp_seconds') or 0):.2f}s "
+            f"({int(frame.get('size') or 0)} байт)"
+            for frame in choice.get("frames") or []
+        )
+        self.query_one("#analysis-video-preview", Static).update(
+            f"Будет использовано видео {video_id}: {frames or 'три сохранённых кадра'}"
+        )
+
+    def on_option_list_option_highlighted(
+        self, event: OptionList.OptionHighlighted
+    ) -> None:
+        if event.option_list.id == "analysis-video":
+            self._render_video_preview()
 
     def _profile_line(self, item: dict[str, Any]) -> str:
         name = item.get("display_name") or item.get("username") or f"ID {item['author_id']}"
@@ -667,8 +704,17 @@ class TelegramAnalysisDialog(ModalScreen[dict[str, Any] | None]):
         if self.image_mode != "photos":
             video = f" · видео {item.get('video_id')}" if item.get("video_id") else ""
             frames = int(item.get("frame_count") or 0)
-            return f"{name} · ID {item['author_id']} · кадры: {frames}{video}{suffix}"
-        return f"{name} · ID {item['author_id']} · {item.get('photo_count', 0)} фото{suffix}"
+            images = ", ".join(str(value) for value in item.get("selected_image_ids") or [])
+            selected = f" · {images}" if images else ""
+            return (
+                f"{name} · ID {item['author_id']} · кадры: {frames}{video}{selected}{suffix}"
+            )
+        photos = ", ".join(str(value) for value in item.get("selected_photo_ids") or [])
+        selected = f" · {photos}" if photos else ""
+        return (
+            f"{name} · ID {item['author_id']} · {item.get('photo_count', 0)} фото"
+            f"{selected}{suffix}"
+        )
 
     def _render_page(self) -> None:
         page = self.pages[self.page_offset]
@@ -704,7 +750,11 @@ class TelegramAnalysisDialog(ModalScreen[dict[str, Any] | None]):
                 if item and chooser.highlighted is not None:
                     selected = chooser.get_option_at_index(chooser.highlighted)
                     if selected.id:
-                        self.video_ids[str(item["author_id"])] = str(selected.id)
+                        key = str(item["author_id"])
+                        selected_video = str(selected.id)
+                        self.video_ids[key] = selected_video
+                        if selected_video != str(item.get("video_id") or ""):
+                            self.image_snapshots.pop(key, None)
             return True
         if not self.single or not self.query("#analysis-photos"):
             return True
@@ -740,12 +790,16 @@ class TelegramAnalysisDialog(ModalScreen[dict[str, Any] | None]):
         self._render_page()
 
     async def _finish(self) -> None:
-        total = int(self.preview.get("selected_count") or 0)
-        for offset in range(0, total, self.page_limit):
-            if offset not in self.pages:
-                await self._load_page(offset)
-                if offset not in self.pages:
-                    return
+        if not self.single:
+            self.dismiss(
+                {
+                    "image_mode": self.image_mode,
+                    "selection_snapshot": str(
+                        self.preview.get("selection_snapshot") or ""
+                    ),
+                }
+            )
+            return
         if not self.photo_ids and not self.video_ids:
             self.query_one("#analysis-error", Static).update(
                 "Нет подходящих локальных профилей с изображениями."

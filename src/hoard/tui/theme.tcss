@@ -341,7 +341,7 @@ OptionList > .option-list--separator {
 }
 
 /* Contextual publication viewer: one active table, independent server pages. */
-#publication-summary-panel, #publication-object-panel {
+#publication-summary-panel, #publication-object-panel, #publication-operations-panel {
     height: auto;
 }
 
@@ -388,6 +388,36 @@ OptionList > .option-list--separator {
     grid-size: 5;
 }
 
+#publication-selection-actions {
+    grid-size: 3;
+}
+
+#publication-frame-actions {
+    grid-size: 4;
+}
+
+#publication-psl-controls {
+    layout: grid;
+    grid-size: 4;
+    grid-columns: 1fr 1fr 1fr 1fr;
+    grid-rows: 1;
+    grid-gutter: 0 2;
+    width: 100%;
+    height: auto;
+    min-height: 1;
+    margin-bottom: 1;
+}
+
+#publication-psl-mode {
+    width: 100%;
+}
+
+#publication-frame-status, #publication-batch-status {
+    height: auto;
+    color: #888888;
+    margin-top: 1;
+}
+
 .short #publication-content-panel {
     height: auto;
 }
@@ -400,8 +430,22 @@ OptionList > .option-list--separator {
     grid-size: 3;
 }
 
-.compact #publication-actions {
+.medium #publication-selection-actions, .medium #publication-frame-actions,
+.medium #publication-psl-controls {
     grid-size: 2;
+    grid-columns: 1fr 1fr;
+    grid-rows: auto;
+}
+
+.compact #publication-actions {
+    grid-size: 1;
+}
+
+.compact #publication-selection-actions, .compact #publication-frame-actions,
+.compact #publication-psl-controls {
+    grid-size: 1;
+    grid-columns: 1fr;
+    grid-rows: auto;
 }
 
 .compact #publication-modes {

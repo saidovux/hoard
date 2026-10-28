@@ -27,9 +27,12 @@ Local-first Telegram archive and extensible small-tool core, Python >=3.11. Keep
   enabled state, checkpoint and schedule, and never discard archive relations or media.
 - The contextual `telegram_publication` route belongs to Telegram Sources but is not a fifth
   sidebar or palette entry. Enter opens it, `e` edits, and back restores the existing Sources
-  screen state. Its four tabs are read-only, source-scoped and independently paginated; reuse
-  `ai_telegram_profile_list` for profiles, never deep-check every frame row, and never attribute
-  PSL by author membership alone. Media opening must use stable IDs through daemon validation of
+  screen state. Its four data tabs remain read-only, source-scoped and independently paginated;
+  reuse `ai_telegram_profile_list` for profiles, never deep-check every frame row, and never
+  attribute PSL by author membership alone. The separate operation panel may explicitly start
+  source-validated selected/publication FFmpeg sessions and existing PSL preview/batches through
+  IPC. Stable selections are capped at 100 and cleared on source changes; work polling exists only
+  while this screen is visible. Media opening must use stable IDs through daemon validation of
   ownership, resolved archive-root containment, regular-file type and size, never a TUI path.
 - `sources.collection_mode` defaults to `full`. `minimal` still records message identity,
   author/source relations and video notes, but must not resolve a missing sender or schedule a new
@@ -65,6 +68,11 @@ Local-first Telegram archive and extensible small-tool core, Python >=3.11. Keep
   cancel and reap the current FFmpeg/FFprobe process, remove unpublished temporary files, return
   unfinished jobs to waiting and preserve the cursor. Closing the TUI alone leaves an explicitly
   started daemon-side frame session running.
+- Publication frame sessions must keep a process-local allowlist of their durable job IDs. Selected
+  runs may contain at most 100 unique source-owned message IDs; publication runs fill only free
+  slots in the existing eight-job budget and retain a source-scoped durable cursor. Neither may
+  authorize a waiting frame job from another publication. Source-scoped retry handles only that
+  publication's failed/stale sets.
 - Telegram collection and FFmpeg are mutually exclusive at the service boundary. A frame action
   conflicts while Telegram is active; an explicit Telegram start has priority, first hard-stops and
   awaits frame processing, then starts the existing concurrent Telegram downloads. Protect both

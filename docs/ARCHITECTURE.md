@@ -23,7 +23,7 @@ background service.
   reusable widgets and TCSS remain separate. The package imports neither storage nor Telethon, and
   never creates a Telegram client. See `docs/TUI.md`.
 - `ipc.py` starts the daemon detached when required and sends one JSON request per private
-  Unix-socket connection. Client and daemon must both report Hoard 0.7.4.3 and IPC protocol `1`.
+  Unix-socket connection. Client and daemon must both report Hoard 0.7.4.4 and IPC protocol `1`.
   A held instance lock with no ready socket means initialization is in progress, so the client
   waits for that owner instead of spawning a second daemon.
 - `service.py` owns the database, three independently limited job runners and the sole
@@ -202,8 +202,8 @@ Every successful video-note checkpoint writes a `tg_video_frame_sets` row and on
 what still needs work but carry no permission to execute. Daemon/TUI startup, download completion,
 restart and generic `job_retry` do not start the media runner; construction of a new service also
 demotes legacy `queued`/`running` frame work to `waiting` and resets an interrupted frame set to
-`pending`. Only **Извлечь кадры** for one selected video or a confirmed bulk action grants
-process-local permission for the current session.
+`pending`. Only **Извлечь кадры** for one selected video or a confirmed selected/publication/bulk
+action grants process-local permission for the current session.
 
 An authorized session uses FFprobe for real duration and at most one FFmpeg process with one decode
 and filter thread. On Linux the process gets a best-effort lower priority. Three frames at
@@ -223,6 +223,16 @@ the confirmed retry action. Closing the TUI does not stop an authorized daemon s
 **Остановить обработку** performs the hard stop above and restart never resumes it automatically.
 Frame completion is coalesced into the existing catalog dirty/revision and atomic publication path;
 after a manual session ends, a bounded deferred report publishes if the Telegram runner is stopped.
+
+Publication sessions reuse that same one-slot `JobRunner` and extraction handler. The runner takes
+a process-local allowed-job-ID provider; its SQLite dequeue adds an `id IN (...)` predicate, so a
+selected session cannot consume an older queued job merely because its kind matches. Explicit
+selections validate one source plus 1–100 unique positive message IDs and retain at most 100 waiting
+jobs. A publication run uses a source-scoped durable cursor, resumes only that source's interrupted
+waiting work, and scans bounded 50-row windows while authorizing only free slots in the shared
+eight-job queued/running budget. Source retry resolves at most 100 failed/stale IDs and enters the
+same allowlisted sequence. Hard stop and daemon construction clear the allowlist and execution
+permission, but not completed frames, waiting jobs or cursor.
 
 Enabled sources become unique `telegram.scan` jobs when due. Telegram jobs remain serialized by
 the global session lock, while one scan uses the same authorized client for a bounded set of video
@@ -281,6 +291,14 @@ resolves symlinks, checks the regular file and known size under remembered archi
 then calls the platform opener without a shell. Bulk responses and detail cards never expose an
 absolute path. Explicit frame resolution retains the existing three-position, MP4 fingerprint and
 SHA-256 contract; the list never invokes it.
+
+The operation panel adds `telegram_frames_selected_start`, `telegram_frames_source_start`,
+`telegram_frames_source_retry_failed` and `telegram_frames_session_status`; all starts require an
+explicit confirmation and repeat source ownership checks inside the daemon. The existing
+`telegram_frames_backfill_pause` remains the one hard-stop contract for every session type. The TUI
+polls only session status and one source-filtered durable AI-batch summary while the publication
+screen is visible. Page requests use per-tab generations plus one pending-reload bit, and media-open
+workers receive an immutable source/object snapshot rather than mutable screen state.
 
 Duplicate source insertion uses a compatibility-preserving integer `Store.add_source()` over an
 internal `(id, created)` result. Archive-root/catalog dirty side effects and runner wakeup occur
@@ -512,7 +530,10 @@ that source. Profile-only analysis without a publication can still choose among 
 saved sources. The three frames are attached in timestamp order to one user message and
 one `ai_attempts` row; preview fingerprints are rechecked before queueing. The request asks the
 model to treat them as moments of one video and keeps the same PSL output contract. No download
-or frame-extraction completion queues an AI attempt.
+or frame-extraction completion queues an AI attempt. `_telegram_psl_candidates()` accepts the
+backward-compatible global `author_ids` selector, the complete `source_id` selector, and a bounded
+explicit `source_id + author_ids` intersection. Durable batch resume passes both source and item
+author again, so stale state cannot bypass membership or select frames from another publication.
 
 `psl.py` defines schema version 2. Its five metrics are visual `presentation`, approximate
 `estimated_age`, `raw_psl_min`, `raw_psl_max` and `boosted_psl`; numeric scores are bounded to
@@ -528,8 +549,9 @@ ambiguity remains `outcome_unknown` without a domain result; invalid provider JS
 new attempt/analysis row and points `root_analysis_id` to the original. The round-six catalog
 consumes these rows in one batch while retaining the same storage contract.
 
-The 0.7 selection contract accepts either stable local `author_id` values or one saved
-`source_id`/post URL. Source links are resolved against `sources` and the complete
+The selection contract accepts stable local `author_id` values, one saved `source_id`/post URL, or
+up to 100 explicitly selected author IDs within one source. Source links are resolved against
+`sources` and the complete
 `tg_profile_sources` relation; unknown links fail without scheduling Telegram work. Preview
 revalidates local files, defaults to four newest photos, reports prior analysis and makes no
 provider call. Local user profiles receive automatic 18+ admission while channels/chats remain

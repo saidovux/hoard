@@ -896,7 +896,150 @@ class TelegramStorage:
             "backfill_complete": str(row["complete"] or "0") == "1",
         }
 
-    def authorize_waiting_frame_jobs(self, limit: int) -> int:
+    def validate_source_message_ids(
+        self, source_id: int, message_ids: list[int]
+    ) -> list[int]:
+        """Validate an explicit bounded selection without trusting TUI rows."""
+        source = self.resolve_source_id(source_id)
+        identifiers = [int(value) for value in message_ids]
+        if not identifiers:
+            raise ValueError("Выбери хотя бы один видеокружок")
+        placeholders = ",".join("?" for _ in identifiers)
+        found = {
+            int(row["message_id"])
+            for row in self.db.execute(
+                f"""SELECT message_id FROM downloads WHERE source_id=?
+                AND message_id IN ({placeholders})""",
+                (source, *identifiers),
+            )
+        }
+        missing = [value for value in identifiers if value not in found]
+        if missing:
+            raise ValueError(
+                "Видеокружок не принадлежит выбранной публикации: "
+                + ", ".join(str(value) for value in missing[:5])
+            )
+        return identifiers
+
+    def authorize_frame_job_ids(self, job_ids: list[int] | set[int], limit: int) -> list[int]:
+        """Authorize only jobs explicitly owned by the current process-local session."""
+        identifiers = list(dict.fromkeys(int(value) for value in job_ids))
+        if not identifiers or int(limit) <= 0:
+            return []
+        placeholders = ",".join("?" for _ in identifiers)
+        selected = [
+            int(row["id"])
+            for row in self.db.execute(
+                f"""SELECT id FROM jobs WHERE kind='telegram.video_frames'
+                AND state='waiting' AND id IN ({placeholders}) ORDER BY id LIMIT ?""",
+                (*identifiers, max(0, int(limit))),
+            )
+        ]
+        if not selected:
+            return []
+        selected_placeholders = ",".join("?" for _ in selected)
+        with self.db:
+            self.db.execute(
+                f"""UPDATE jobs SET state='queued',result='',updated_at=datetime('now')
+                WHERE state='waiting' AND id IN ({selected_placeholders})""",
+                selected,
+            )
+        return selected
+
+    def frame_job_rows(self, job_ids: list[int] | set[int]) -> list[dict[str, Any]]:
+        identifiers = list(dict.fromkeys(int(value) for value in job_ids))
+        if not identifiers:
+            return []
+        placeholders = ",".join("?" for _ in identifiers)
+        return [
+            dict(row)
+            for row in self.db.execute(
+                f"""SELECT id,state,payload,result FROM jobs
+                WHERE kind='telegram.video_frames' AND id IN ({placeholders}) ORDER BY id""",
+                identifiers,
+            )
+        ]
+
+    def frame_source_actionable_count(self, source_id: int) -> int:
+        source = self.resolve_source_id(source_id)
+        return int(
+            self.db.execute(
+                """SELECT COUNT(*) FROM downloads d
+                LEFT JOIN tg_video_frame_sets sets ON sets.source_id=d.source_id
+                  AND sets.message_id=d.message_id
+                WHERE d.source_id=? AND (sets.status IS NULL OR sets.status='pending')""",
+                (source,),
+            ).fetchone()[0]
+        )
+
+    def start_source_frame_cursor(self, source_id: int) -> int:
+        source = self.resolve_source_id(source_id)
+        cursor_key = f"frames_source_cursor:{source}"
+        complete_key = f"frames_source_complete:{source}"
+        complete = self.get_setting(complete_key, "0") == "1"
+        with self.db:
+            if complete:
+                self._set_setting_sql(cursor_key, "0")
+            self._set_setting_sql(complete_key, "0")
+        return int(self.get_setting(cursor_key, "0") or 0)
+
+    def set_source_frame_cursor(
+        self, source_id: int, cursor: int, *, complete: bool = False
+    ) -> None:
+        source = self.resolve_source_id(source_id)
+        with self.db:
+            self._set_setting_sql(f"frames_source_cursor:{source}", str(max(0, int(cursor))))
+            self._set_setting_sql(
+                f"frames_source_complete:{source}", "1" if complete else "0"
+            )
+
+    def next_source_frame_downloads(
+        self, source_id: int, cursor: int, limit: int
+    ) -> list[dict[str, Any]]:
+        source = self.resolve_source_id(source_id)
+        return [
+            dict(row)
+            for row in self.db.execute(
+                """SELECT d.rowid AS cursor_rowid,d.source_id,d.message_id,d.author_id,
+                d.file_path,d.size,sets.status AS frame_status
+                FROM downloads d LEFT JOIN tg_video_frame_sets sets
+                  ON sets.source_id=d.source_id AND sets.message_id=d.message_id
+                WHERE d.source_id=? AND d.rowid>? ORDER BY d.rowid LIMIT ?""",
+                (source, int(cursor), max(1, min(100, int(limit)))),
+            )
+        ]
+
+    def source_failed_frame_ids(self, source_id: int, *, limit: int = 100) -> list[int]:
+        source = self.resolve_source_id(source_id)
+        return [
+            int(row["message_id"])
+            for row in self.db.execute(
+                """SELECT message_id FROM tg_video_frame_sets
+                WHERE source_id=? AND status IN ('failed','stale')
+                ORDER BY message_id LIMIT ?""",
+                (source, max(1, min(100, int(limit)))),
+            )
+        ]
+
+    def source_waiting_frame_job_ids(
+        self, source_id: int, *, limit: int = 8
+    ) -> list[int]:
+        source = self.resolve_source_id(source_id)
+        return [
+            int(row["id"])
+            for row in self.db.execute(
+                """SELECT jobs.id FROM jobs
+                JOIN tg_video_frame_sets sets
+                  ON jobs.unique_key=('video-frames:' || sets.source_id || ':'
+                    || sets.message_id)
+                WHERE jobs.kind='telegram.video_frames' AND jobs.state='waiting'
+                  AND sets.source_id=? AND sets.status='pending'
+                ORDER BY jobs.id LIMIT ?""",
+                (source, max(1, min(8, int(limit)))),
+            )
+        ]
+
+    def authorize_waiting_frame_job_ids(self, limit: int) -> list[int]:
         identifiers = [
             int(row["id"])
             for row in self.db.execute(
@@ -906,7 +1049,7 @@ class TelegramStorage:
             )
         ]
         if not identifiers:
-            return 0
+            return []
         placeholders = ",".join("?" for _ in identifiers)
         with self.db:
             cursor = self.db.execute(
@@ -914,7 +1057,10 @@ class TelegramStorage:
                 WHERE state='waiting' AND id IN ({placeholders})""",
                 identifiers,
             )
-        return int(cursor.rowcount)
+        return identifiers[: int(cursor.rowcount)]
+
+    def authorize_waiting_frame_jobs(self, limit: int) -> int:
+        return len(self.authorize_waiting_frame_job_ids(limit))
 
     def disable_frame_processing(self) -> None:
         """Revoke process-local execution permission while retaining durable work."""

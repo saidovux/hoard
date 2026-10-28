@@ -97,6 +97,7 @@ class Service:
         self.ai_ipc = AIIPC(
             self.store.ai, self.ai_service, self.ai_runner, self.store.telegram
         )
+        self._frame_allowed_job_ids: set[int] = set()
         self.media_runner = JobRunner(
             self.store,
             {"telegram.video_frames": self._telegram_video_frames},
@@ -104,11 +105,13 @@ class Service:
             retry_interrupted=True,
             name="media",
             scheduler=self._enqueue_frame_backfill,
+            allowed_job_ids=lambda: tuple(self._frame_allowed_job_ids),
         )
         # Frame jobs are durable, but permission to execute them is deliberately
         # process-local.  A new daemon always revokes an interrupted permission.
         self.store.telegram.disable_frame_processing()
         self._frame_mode = "off"
+        self._frame_session: dict[str, object] | None = None
         self._frame_session_task: asyncio.Task | None = None
         self._catalog_task: asyncio.Task | None = None
         self.stop_requested = asyncio.Event()
@@ -217,15 +220,31 @@ class Service:
             self._schedule_catalog_publish()
 
     def _enqueue_frame_backfill(self) -> None:
-        """Feed a bounded old-archive backfill without touching the Telegram path."""
+        """Feed the one media runner without ever escaping the authorized session."""
         telegram = self.store.telegram
-        if self._frame_mode != "bulk" or not telegram.frame_backfill_active():
+        mode = self._frame_mode
+        if mode == "off" or mode == "stopping":
             return
+        self._reap_frame_session_jobs()
         work = telegram.frame_work_state()
         slots = max(0, 8 - int(work["queued"]) - int(work["running"]))
         if slots == 0:
             return
-        slots -= telegram.authorize_waiting_frame_jobs(slots)
+        if mode in {"single", "selected", "retry_source"}:
+            telegram.authorize_frame_job_ids(self._frame_allowed_job_ids, slots)
+            return
+        if mode == "source":
+            self._enqueue_source_frame_jobs(slots)
+            return
+        if mode != "bulk" or not telegram.frame_backfill_active():
+            return
+        authorized = telegram.authorize_waiting_frame_job_ids(slots)
+        self._frame_allowed_job_ids.update(authorized)
+        if self._frame_session is not None:
+            self._frame_session["job_ids"] = set(
+                int(value) for value in self._frame_session.get("job_ids", set())
+            ).union(authorized)
+        slots -= len(authorized)
         if slots == 0:
             return
         cursor = int(telegram.get_setting("frames_backfill_cursor", "0") or 0)
@@ -244,11 +263,20 @@ class Service:
                 stopped_for_capacity = True
                 break
             try:
-                telegram.queue_frame_job(
+                job_id = telegram.queue_frame_job(
                     int(row["source_id"]),
                     int(row["message_id"]),
                     authorized=True,
                 )
+                if job_id is not None:
+                    self._frame_allowed_job_ids.add(int(job_id))
+                    if self._frame_session is not None:
+                        jobs = set(
+                            int(value)
+                            for value in self._frame_session.get("job_ids", set())
+                        )
+                        jobs.add(int(job_id))
+                        self._frame_session["job_ids"] = jobs
             except ValueError:
                 # A missing/corrupt old MP4 is recorded by its status and must
                 # not stall the traversal.
@@ -258,6 +286,89 @@ class Service:
         telegram.set_frame_backfill_cursor(
             last_processed,
             complete=(not stopped_for_capacity and len(rows) < 50),
+        )
+
+    def _reap_frame_session_jobs(self) -> None:
+        session = self._frame_session
+        if session is None:
+            if self._frame_allowed_job_ids:
+                for row in self.store.telegram.frame_job_rows(
+                    self._frame_allowed_job_ids
+                ):
+                    if str(row.get("state") or "") in {"done", "failed"}:
+                        self._frame_allowed_job_ids.discard(int(row["id"]))
+            return
+        jobs = set(int(value) for value in session.get("job_ids", set()))
+        if not jobs:
+            return
+        for row in self.store.telegram.frame_job_rows(jobs):
+            state = str(row.get("state") or "")
+            if state not in {"done", "failed"}:
+                continue
+            job_id = int(row["id"])
+            jobs.discard(job_id)
+            self._frame_allowed_job_ids.discard(job_id)
+            session["completed"] = int(session.get("completed") or 0) + 1
+            if state == "failed":
+                session["errors"] = int(session.get("errors") or 0) + 1
+        session["job_ids"] = jobs
+
+    def _enqueue_source_frame_jobs(self, slots: int) -> None:
+        session = self._frame_session
+        if session is None or str(session.get("mode")) != "source":
+            return
+        source_id = int(session["source_id"])
+        cursor = int(session.get("cursor") or 0)
+        jobs = set(int(value) for value in session.get("job_ids", set()))
+        waiting = self.store.telegram.source_waiting_frame_job_ids(
+            source_id, limit=slots
+        )
+        if waiting:
+            jobs.update(waiting)
+            self._frame_allowed_job_ids.update(waiting)
+            authorized = self.store.telegram.authorize_frame_job_ids(waiting, slots)
+            slots -= len(authorized)
+            session["job_ids"] = jobs
+        if slots <= 0:
+            return
+        rows = self.store.telegram.next_source_frame_downloads(source_id, cursor, 50)
+        if not rows:
+            session["source_complete"] = True
+            self.store.telegram.set_source_frame_cursor(source_id, cursor, complete=True)
+            return
+        last_processed = cursor
+        stopped_for_capacity = False
+        for row in rows:
+            status = str(row.get("frame_status") or "")
+            if status in {"saved", "failed", "stale", "running"}:
+                last_processed = int(row["cursor_rowid"])
+                continue
+            if slots <= 0:
+                stopped_for_capacity = True
+                break
+            try:
+                job_id = self.store.telegram.queue_frame_job(
+                    source_id,
+                    int(row["message_id"]),
+                    authorized=True,
+                )
+            except ValueError:
+                session["completed"] = int(session.get("completed") or 0) + 1
+                session["errors"] = int(session.get("errors") or 0) + 1
+            else:
+                if job_id is None:
+                    session["completed"] = int(session.get("completed") or 0) + 1
+                else:
+                    jobs.add(int(job_id))
+                    self._frame_allowed_job_ids.add(int(job_id))
+                    slots -= 1
+            last_processed = int(row["cursor_rowid"])
+        session["job_ids"] = jobs
+        session["cursor"] = last_processed
+        complete = not stopped_for_capacity and len(rows) < 50
+        session["source_complete"] = complete
+        self.store.telegram.set_source_frame_cursor(
+            source_id, last_processed, complete=complete
         )
 
     def _require_frame_tools(self) -> None:
@@ -277,12 +388,40 @@ class Service:
             raise RuntimeError("Обработка кадров уже выполняется")
         self._require_frame_tools()
 
-    async def _begin_frame_session_locked(self, mode: str, job_id: int | None = None) -> None:
+    def _new_frame_session(
+        self,
+        mode: str,
+        *,
+        source_id: int | None,
+        total: int,
+        job_ids: set[int] | None = None,
+        completed: int = 0,
+    ) -> dict[str, object]:
+        return {
+            "id": uuid.uuid4().hex,
+            "mode": mode,
+            "source_id": source_id,
+            "selected_count": max(0, int(total)),
+            "completed": max(0, int(completed)),
+            "errors": 0,
+            "job_ids": set(job_ids or set()),
+            "source_complete": mode != "source",
+            "cursor": 0,
+            "state": "running",
+        }
+
+    async def _begin_frame_session_locked(
+        self, mode: str, session: dict[str, object]
+    ) -> None:
         self._frame_mode = mode
+        self._frame_session = session
+        self._frame_allowed_job_ids = set(
+            int(value) for value in session.get("job_ids", set())
+        )
         await self.media_runner.start()
         self.media_runner.wakeup()
         self._frame_session_task = asyncio.create_task(
-            self._monitor_frame_session(mode, job_id),
+            self._monitor_frame_session(str(session["id"])),
             name=f"hoard-frame-session-{mode}",
         )
 
@@ -308,11 +447,132 @@ class Service:
                     "message": "Кадры уже готовы и прошли локальную проверку",
                     "job_id": None,
                 }
-            await self._begin_frame_session_locked("single", job_id)
+            session = self._new_frame_session(
+                "single", source_id=source_id, total=1, job_ids={int(job_id)}
+            )
+            await self._begin_frame_session_locked("single", session)
             return {
                 "message": f"Извлекаем кадры выбранного кружка: задание #{job_id}",
                 "job_id": job_id,
+                "session": self._frame_session_status(),
             }
+
+    @staticmethod
+    def _explicit_positive_ids(values: object, *, maximum: int = 100) -> list[int]:
+        if not isinstance(values, list):
+            raise ValueError("message_ids должен быть списком")
+        result: list[int] = []
+        seen: set[int] = set()
+        for raw in values:
+            if isinstance(raw, bool) or not isinstance(raw, (int, str)):
+                raise ValueError("message_ids содержит некорректный ID")
+            try:
+                value = int(raw)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("message_ids содержит некорректный ID") from exc
+            if value <= 0 or (isinstance(raw, str) and str(value) != raw.strip()):
+                raise ValueError("message_ids содержит некорректный ID")
+            if value in seen:
+                raise ValueError("message_ids не должен содержать дубликаты")
+            seen.add(value)
+            result.append(value)
+        if not result:
+            raise ValueError("Выбери хотя бы один видеокружок")
+        if len(result) > maximum:
+            raise ValueError(f"За один запуск можно выбрать не более {maximum} кружков")
+        return result
+
+    async def _start_selected_frame_processing(
+        self,
+        source_id: int,
+        message_ids: object,
+        *,
+        session_mode: str = "selected",
+    ) -> dict:
+        identifiers = self._explicit_positive_ids(message_ids)
+        identifiers = self.store.telegram.validate_source_message_ids(
+            source_id, identifiers
+        )
+        async with self._mode_lock:
+            self._ensure_frames_can_start_locked()
+            jobs: set[int] = set()
+            completed = 0
+            errors: list[str] = []
+            for message_id in identifiers:
+                try:
+                    details = self.store.telegram.frame_details(source_id, message_id)
+                    if details is not None and details.get("valid"):
+                        completed += 1
+                        continue
+                    job_id = self.store.telegram.queue_frame_job(
+                        source_id,
+                        message_id,
+                        reset_failed=True,
+                        authorized=False,
+                    )
+                except ValueError as exc:
+                    errors.append(f"{message_id}: {exc}")
+                else:
+                    if job_id is None:
+                        completed += 1
+                    else:
+                        jobs.add(int(job_id))
+            if not jobs:
+                if errors:
+                    raise ValueError("; ".join(errors[:3]))
+                return {
+                    "message": "У выбранных кружков кадры уже готовы",
+                    "session": None,
+                }
+            session = self._new_frame_session(
+                session_mode,
+                source_id=source_id,
+                total=len(identifiers),
+                job_ids=jobs,
+                completed=completed,
+            )
+            session["errors"] = len(errors)
+            await self._begin_frame_session_locked(session_mode, session)
+            return {
+                "message": (
+                    f"FFmpeg запущен только для выбранных кружков: {len(identifiers)}"
+                ),
+                "session": self._frame_session_status(),
+            }
+
+    async def _start_source_frame_processing(self, source_id: int) -> dict:
+        source = self.store.telegram.resolve_source_id(source_id)
+        async with self._mode_lock:
+            self._ensure_frames_can_start_locked()
+            total = self.store.telegram.frame_source_actionable_count(source)
+            if total <= 0:
+                return {
+                    "message": "В публикации нет кружков, ожидающих извлечения кадров",
+                    "session": None,
+                }
+            cursor = self.store.telegram.start_source_frame_cursor(source)
+            session = self._new_frame_session(
+                "source", source_id=source, total=total
+            )
+            session["cursor"] = cursor
+            session["source_complete"] = False
+            await self._begin_frame_session_locked("source", session)
+            return {
+                "message": (
+                    f"Обработка публикации запущена: до {total} кружков; "
+                    "одновременно работает один FFmpeg"
+                ),
+                "session": self._frame_session_status(),
+            }
+
+    async def _start_source_failed_processing(self, source_id: int) -> dict:
+        source = self.store.telegram.resolve_source_id(source_id)
+        identifiers = self.store.telegram.source_failed_frame_ids(source, limit=100)
+        if not identifiers:
+            return {"message": "В публикации нет ошибок кадров", "session": None}
+        return await self._start_selected_frame_processing(
+            source, identifiers, session_mode="retry_source"
+        )
 
     async def _start_bulk_frame_processing(self, *, retry_failed: bool = False) -> dict:
         async with self._mode_lock:
@@ -326,7 +586,12 @@ class Service:
                     "stats": stats,
                 }
             self.store.telegram.start_frame_backfill()
-            await self._begin_frame_session_locked("bulk")
+            session = self._new_frame_session(
+                "bulk",
+                source_id=None,
+                total=int(stats.get("actionable") or 0),
+            )
+            await self._begin_frame_session_locked("bulk", session)
             stats = self.store.telegram.frame_stats()
             return {
                 "message": (
@@ -336,20 +601,23 @@ class Service:
                 "stats": stats,
             }
 
-    async def _monitor_frame_session(self, mode: str, job_id: int | None) -> None:
+    async def _monitor_frame_session(self, session_id: str) -> None:
         try:
-            while self._frame_mode == mode:
+            while True:
                 await asyncio.sleep(0.1)
-                if mode == "single":
-                    row = self.store.db.execute(
-                        "SELECT state FROM jobs WHERE id=?", (int(job_id or 0),)
-                    ).fetchone()
-                    finished = row is None or str(row["state"]) in {"done", "failed", "waiting"}
-                else:
+                session = self._frame_session
+                if session is None or str(session.get("id")) != session_id:
+                    return
+                self._reap_frame_session_jobs()
+                mode = str(session.get("mode") or "")
+                if mode == "bulk":
                     state = self.store.telegram.frame_work_state()
                     finished = bool(state["backfill_complete"]) and not any(
                         int(state[key]) for key in ("waiting", "queued", "running")
                     )
+                else:
+                    jobs = set(int(value) for value in session.get("job_ids", set()))
+                    finished = not jobs and bool(session.get("source_complete", True))
                 if finished:
                     break
         except asyncio.CancelledError:
@@ -360,9 +628,45 @@ class Service:
                     return
                 await self.media_runner.stop()
                 self.store.telegram.pause_frame_backfill()
+                self._frame_allowed_job_ids.clear()
                 self._frame_mode = "off"
+                if self._frame_session is not None:
+                    self._frame_session["state"] = "completed"
                 self._frame_session_task = None
                 self._schedule_catalog_publish()
+
+    def _frame_session_status(self) -> dict[str, object] | None:
+        session = self._frame_session
+        if session is None:
+            return None
+        self._reap_frame_session_jobs()
+        rows = self.store.telegram.frame_job_rows(
+            set(int(value) for value in session.get("job_ids", set()))
+        )
+        counts = {"waiting": 0, "queued": 0, "running": 0}
+        current_message_id: int | None = None
+        for row in rows:
+            state = str(row.get("state") or "")
+            if state in counts:
+                counts[state] += 1
+            if state == "running":
+                try:
+                    current_message_id = int(json.loads(str(row["payload"]))["message_id"])
+                except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                    current_message_id = None
+        return {
+            "session_id": str(session["id"]),
+            "session_type": str(session["mode"]),
+            "source_id": session.get("source_id"),
+            "selected_count": int(session.get("selected_count") or 0),
+            "completed": int(session.get("completed") or 0),
+            "waiting": counts["waiting"],
+            "queued": counts["queued"],
+            "running": counts["running"],
+            "errors": int(session.get("errors") or 0),
+            "state": str(session.get("state") or "running"),
+            "current_message_id": current_message_id,
+        }
 
     async def _stop_frame_processing_locked(
         self, *, reason: str, publish: bool = True
@@ -376,7 +680,10 @@ class Service:
             await asyncio.gather(task, return_exceptions=True)
         await self.media_runner.stop()
         self.store.telegram.disable_frame_processing()
+        self._frame_allowed_job_ids.clear()
         self._frame_mode = "off"
+        if self._frame_session is not None and was_active:
+            self._frame_session["state"] = "stopped"
         if was_active:
             self.store.event("info", reason)
         if publish:
@@ -1198,7 +1505,40 @@ class Service:
             "telegram_frames_backfill_pause",
             "telegram_frames_backfill_status",
             "telegram_frames_retry_failed",
+            "telegram_frames_selected_start",
+            "telegram_frames_source_start",
+            "telegram_frames_source_retry_failed",
+            "telegram_frames_session_status",
         }:
+            if method == "telegram_frames_session_status":
+                return {
+                    "session": self._frame_session_status(),
+                    "processing_mode": self._frame_mode,
+                }
+            if method == "telegram_frames_selected_start":
+                if args.get("confirmed") is not True:
+                    raise ValueError(
+                        "Обработка выбранных кружков требует подтверждения нагрузки FFmpeg"
+                    )
+                return await self._start_selected_frame_processing(
+                    int(args.get("source_id") or 0), args.get("message_ids")
+                )
+            if method == "telegram_frames_source_start":
+                if args.get("confirmed") is not True:
+                    raise ValueError(
+                        "Обработка публикации требует подтверждения нагрузки FFmpeg"
+                    )
+                return await self._start_source_frame_processing(
+                    int(args.get("source_id") or 0)
+                )
+            if method == "telegram_frames_source_retry_failed":
+                if args.get("confirmed") is not True:
+                    raise ValueError(
+                        "Повтор ошибок публикации требует подтверждения нагрузки FFmpeg"
+                    )
+                return await self._start_source_failed_processing(
+                    int(args.get("source_id") or 0)
+                )
             if method == "telegram_frames_backfill_start":
                 if not bool(args.get("confirmed")):
                     raise ValueError(

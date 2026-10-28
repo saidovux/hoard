@@ -1465,8 +1465,19 @@ class AIStorage:
         )
         return result
 
-    def list_telegram_batches(self, *, active_only: bool, limit: Any = 20) -> list[dict]:
+    def list_telegram_batches(
+        self,
+        *,
+        active_only: bool,
+        limit: Any = 20,
+        source_id: int | None = None,
+    ) -> list[dict]:
         page_limit = max(1, min(100, int(limit)))
+        clauses = ["1=1"]
+        parameters: list[Any] = []
+        if source_id is not None:
+            clauses.append("b.source_id=?")
+            parameters.append(int(source_id))
         active = ""
         if active_only:
             active = """AND EXISTS (
@@ -1482,8 +1493,9 @@ class AIStorage:
             str(item["id"])
             for item in self.db.execute(
                 f"""SELECT b.id FROM ai_telegram_batches b
-                WHERE 1=1 {active} ORDER BY b.created_at DESC,b.id DESC LIMIT ?""",
-                (page_limit,),
+                WHERE {' AND '.join(clauses)} {active}
+                ORDER BY b.created_at DESC,b.id DESC LIMIT ?""",
+                (*parameters, page_limit),
             )
         ]
         return [self.telegram_batch(identifier, limit=20) for identifier in identifiers]
