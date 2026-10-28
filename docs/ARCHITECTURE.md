@@ -21,7 +21,7 @@ background service.
   reusable widgets and TCSS remain separate. The package imports neither storage nor Telethon, and
   never creates a Telegram client. See `docs/TUI.md`.
 - `ipc.py` starts the daemon detached when required and sends one JSON request per private
-  Unix-socket connection. Client and daemon must both report Hoard 0.7.4.0 and IPC protocol `1`.
+  Unix-socket connection. Client and daemon must both report Hoard 0.7.4.1 and IPC protocol `1`.
   A held instance lock with no ready socket means initialization is in progress, so the client
   waits for that owner instead of spawning a second daemon.
 - `service.py` owns the database, three independently limited job runners and the sole
@@ -86,14 +86,16 @@ database and socket.
 Menu keybindings are defined once for arrow and `h/j/k/l` navigation. Telegram IPC failures render
 network/VPN guidance inside the active Textual modal while the daemon owns the actual client.
 
-The Textual client is the sole interactive presentation and may enter application mode. Only the
-visible Home screen owns the moderate 1.5-second timer; it requests a bounded `status_brief`
-snapshot and the app's async lock drops overlapping ticks and skips unchanged redraws. The Home
+The Textual client is the sole interactive presentation and may enter application mode. Visible
+Home and Telegram Status screens each own a moderate 1.5-second timer and stop it when suspended;
+both request bounded `status_brief` snapshots through the app's single in-flight lock. Home's
 Telegram monitor uses only that snapshot, updates changed content without rebuilding navigation,
-and clears transfer slots when the collector stops or IPC becomes unavailable. Archive and
+and clears transfer slots when the collector stops or IPC becomes unavailable. Telegram Status
+loads archival aggregates separately through read-only `telegram_statistics_get` on entry or
+manual refresh, never from its live timer. Archive and
 Telegram Sources request detailed status only when opened; recent collections are bounded and an oversized
 compatibility response is explicitly truncated before the 64 KiB IPC boundary. Screen suspension, unmount and app exit
-stop the timer. IPC startup and request errors render inside the stable black workspace so a slow
+stop their timers. IPC startup and request errors render inside the stable black workspace so a slow
 or unavailable daemon never produces an unexplained empty screen. Exiting the client sends no
 collector, frame-stop, shutdown or Telegram command; previously started frame/Web work stays alive.
 
@@ -132,7 +134,8 @@ saved state: it is yellow/unverified until an explicit daemon-side authorization
 Green requires a connected client, a confirmed authorized session and the process-local verified
 state. Red means no usable confirmed session; unknown failures remain neutral. The daemon caches
 only display-safe `id`, name and optional username from `get_me()` after successful login or an
-explicit check, never on sidebar render. `telegram_account_disconnect` refuses to run while the
+explicit check, never on sidebar render. Cached identity is returned for `saved` state with an
+explicit disconnected label, but is withheld for `login_required`. `telegram_account_disconnect` refuses to run while the
 collector is active, disconnects the sole daemon-owned client and preserves the session file;
 logout/revocation is intentionally not exposed.
 

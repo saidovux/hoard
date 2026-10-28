@@ -237,7 +237,8 @@ OptionList > .option-list--separator {
     min-height: 5;
 }
 
-#current-action, #progress, #telegram-summary, #account-summary, #web-summary,
+#current-action, #progress, #telegram-current, #telegram-statistics,
+#account-summary, #web-summary,
 #tools, #statistics, #queue-stats, #events {
     height: auto;
     min-height: 1;
@@ -250,6 +251,19 @@ OptionList > .option-list--separator {
 }
 
 /* ── Telegram ───────────────────────────────────────────────────────────── */
+
+#collector-panel, #telegram-statistics-panel {
+    height: auto;
+}
+
+#telegram-statistics-panel {
+    margin-top: 1;
+}
+
+#telegram-current, #telegram-statistics {
+    height: auto;
+    min-height: 1;
+}
 
 #sources-panel {
     height: 1fr;
@@ -362,6 +376,10 @@ Button:disabled {
 #telegram-actions {
     grid-size: 4;
     margin-bottom: 0;
+}
+
+#telegram-statistics-actions {
+    grid-size: 1;
 }
 
 #account-actions {

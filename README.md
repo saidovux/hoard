@@ -1,9 +1,16 @@
-# Hoard 0.7.4.0
+# Hoard 0.7.4.1
 
 Hoard is a local-first Linux and Windows archive for Telegram posts, profiles and video notes
 found in a channel post's comments. It uses Telethon, SQLite, an autonomous offline HTML catalog
 and terminal interfaces. A private background daemon performs all Telegram work; closing an
 interface does not stop downloads.
+
+The 0.7.4.1 release turns **Telegram → Статус** into a compact monitoring page. Its live area
+polls only bounded `status_brief` data while visible; its archive statistics use a separate
+read-only aggregate IPC on entry or explicit refresh. Source, media, profile, FFmpeg-frame and
+PSL counts never require Telegram or filesystem scans. Web readiness is checked once on first
+Telegram entry without starting it, the Header reports daemon availability, and cached account
+identity is clearly separated from a verified live connection.
 
 The 0.7.4.0 release introduces hierarchical TUI workspaces. Opening **Telegram** replaces the
 global sidebar with **Статус**, **Источники**, and the bottom-pinned **Web Viewer** and **Вход**
@@ -205,13 +212,15 @@ group, **Telegram** and **AI**. Opening Telegram switches the same sidebar to it
 **Telegram → Источники**. Archive remains a separate page through Round 7 and keeps downloads,
 profiles, jobs, catalog actions and the complete video-frame workflow.
 
-Telegram Status owns collector start/pause/stop and current queue/activity/error presentation;
+Telegram Status owns collector start/pause/stop, a live current-work summary, and archive
+statistics refreshed only on entry or request;
 Sources keeps validation, editing, selected/global scans and publication-scoped PSL actions.
 Login reuses the daemon authorization flow, shows cached public account details, and separates a
 saved but unverified session from a verified live connection. Web Viewer starts/opens/stops only
 the separate loopback process. All operations use private daemon IPC; the TUI never opens SQLite
-or creates a Telegram client. Only visible Home polls compact status. Detailed source/archive data
-is fetched on entry and Web readiness is checked when its page is visited. See `docs/TUI.md`.
+or creates a Telegram client. Visible Home and Telegram Status each own a bounded compact-status
+timer only while on screen. Detailed source/archive data is fetched on entry; Web readiness is
+checked once on first entry to the Telegram workspace. See `docs/TUI.md`.
 
 The interface keeps the entire Textual surface, including navigation, focus, hover, palette and
 help modal states, on `#000000`. Text is white, secondary text `#888888`, frames `#7B4B23`,
@@ -251,7 +260,7 @@ For development, install the test tools with `python -m pip install -e '.[dev]'`
 
 An upgrade keeps the existing XDG configuration, database, Telegram session and archive.
 If an older daemon is still running, execute `hoard shutdown` before starting the upgraded
-installation. The 0.7.4.0 client accepts only a daemon reporting the same application version and
+installation. The 0.7.4.1 client accepts only a daemon reporting the same application version and
 IPC protocol `1`; it reports the mismatch instead of starting a competing service. If a matching
 daemon already owns the service lock but is still initializing, clients wait for it and show a
 specific startup diagnostic.

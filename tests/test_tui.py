@@ -175,6 +175,38 @@ class FakeAPI:
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self.responses: dict[str, list[dict[str, Any] | Exception]] = {}
         self.web_state: dict[str, Any] = {"state": "stopped"}
+        self.statistics: dict[str, Any] = {
+            "sources": {"total": 3, "enabled": 2, "disabled": 1},
+            "media": {
+                "video_notes": 31,
+                "post_images": 4,
+                "post_videos": 2,
+                "post_files": 1,
+                "profile_photos": 9,
+            },
+            "profiles": {"unique": 14},
+            "frames": {
+                "processed_videos": 5,
+                "created_frames": 13,
+                "waiting": 2,
+                "queued": 1,
+                "processing": 1,
+                "missing": 7,
+                "failed": 3,
+                "stale": 1,
+                "active": False,
+                "processing_mode": "off",
+            },
+            "psl": {
+                "unique_profiles": 6,
+                "completed_analyses": 8,
+                "failed_analyses": 2,
+                "unknown_outcome": 1,
+                "without_result": 3,
+                "queued": 1,
+                "running": 0,
+            },
+        }
 
     def queue(self, name: str, *responses: dict[str, Any] | Exception) -> None:
         self.responses[name] = list(responses)
@@ -314,6 +346,9 @@ class FakeAPI:
         self, method: str, args: dict[str, Any] | None = None
     ) -> dict:
         return await self._operation(method, args)
+
+    async def telegram_statistics(self) -> dict[str, Any]:
+        return await self._operation("telegram_statistics_get", default=self.statistics)
 
     async def web_status(self) -> dict:
         self.calls.append(("web_status", {}))
@@ -1050,6 +1085,7 @@ async def test_login_page_shows_cached_account_checks_and_disconnects_safely():
         assert isinstance(app.screen, TelegramLoginScreen)
         summary = str(app.screen.query_one("#account-summary", Static).content)
         assert "сессия сохранена" in summary
+        assert "Последний подтверждённый аккаунт — сейчас не подключён" in summary
         assert "Test User" in summary and "@tester" in summary and "101" in summary
 
         login_option = app.screen.query_one(
@@ -1098,6 +1134,29 @@ async def test_credentials_alone_never_make_account_indicator_green():
         prompt = repr(option.prompt).lower()
         assert "#e5534b" in prompt
         assert "#55c878" not in prompt
+
+
+@pytest.mark.asyncio
+async def test_login_required_never_displays_stale_cached_identity():
+    status = status_fixture()
+    status["telegram"] = "phone_required"
+    status["telegram_account"] = {
+        "state": "login_required",
+        "connected": False,
+        "session_present": True,
+        "verified": False,
+        "profile": {"id": 101, "name": "Stale User", "username": "stale"},
+    }
+    app = HoardApp(FakeAPI(status))
+    async with app.run_test(size=(100, 30)) as pilot:
+        await wait_for_startup(app, pilot)
+        app.open_section("telegram_login")
+        await pilot.pause()
+        summary = str(app.screen.query_one("#account-summary", Static).content)
+        assert "требуется вход" in summary
+        assert "Stale User" not in summary
+        assert "@stale" not in summary
+        assert "Telegram ID" not in summary
 
 
 @pytest.mark.asyncio
@@ -1285,20 +1344,208 @@ async def test_collector_controls_confirm_active_interrupt_and_refresh_state():
 
 
 @pytest.mark.asyncio
-async def test_telegram_status_is_standalone_and_shows_live_work_and_last_error():
-    app = HoardApp(FakeAPI())
+async def test_telegram_status_is_standalone_and_shows_live_work_and_statistics():
+    api = FakeAPI()
+    app = HoardApp(api)
     async with app.run_test(size=(100, 30)) as pilot:
         await wait_for_startup(app, pilot)
         app.open_section("telegram")
-        await pilot.pause()
-        summary = str(app.screen.query_one("#telegram-summary", Static).content)
-        assert "подключён" in summary
-        assert "сборщик" in summary and "работает" in summary
-        assert "4 ожидают" in summary and "1 выполняются" in summary
-        assert "circle.mp4" in summary
-        assert "Нет связи" in summary
+        await wait_for_condition(
+            pilot,
+            lambda: any(name == "telegram_statistics_get" for name, _ in api.calls),
+        )
+        current = str(app.screen.query_one("#telegram-current", Static).content)
+        assert "sample_channel/42" in current
+        assert "Работает" in current
+        assert "Скачивание медиа" in current
+        assert all(value in current for value in ("17", "3 новых кружков", "1 активных"))
+        statistics = str(app.screen.query_one("#telegram-statistics", Static).content)
+        assert all(group in statistics for group in ("ИСТОЧНИКИ", "МЕДИА", "КАДРЫ FFMPEG", "PSL"))
+        assert "31" in statistics and "13" in statistics
         assert len(app.screen.query("#sources-table")) == 0
         assert len(app.screen.query("#phone")) == 0
+
+
+def test_telegram_status_labels_only_confirmed_live_states():
+    status = status_fixture()
+    assert TelegramScreen._collector_state(status, None) == "Работает"
+    assert TelegramScreen._stage(status) == "Скачивание медиа"
+
+    status["progress"] = {}
+    assert TelegramScreen._stage(status) == "Ожидание"
+    status.update(running=False, collector_state="paused")
+    assert TelegramScreen._collector_state(status, None) == "На паузе"
+    status["collector_state"] = "stopped"
+    assert TelegramScreen._collector_state(status, None) == "Остановлен"
+    status["telegram_account"]["state"] = "login_required"
+    assert TelegramScreen._collector_state(status, None) == "Требуется подключение"
+    assert TelegramScreen._collector_state(status, "socket closed") == "Служба недоступна"
+
+
+@pytest.mark.asyncio
+async def test_telegram_status_polling_has_one_request_and_stops_when_hidden(monkeypatch):
+    monkeypatch.setattr(TelegramScreen, "POLL_INTERVAL", 0.03)
+    api = FakeAPI()
+    app = HoardApp(api)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await wait_for_startup(app, pilot)
+        api.delay = 0.06
+        baseline = api.status_calls
+        app.open_section("telegram")
+        await wait_for_condition(pilot, lambda: api.status_calls > baseline)
+        status_screen = app.screen
+        first_timer = status_screen.poll_timer
+        await pilot.pause(0.16)
+        assert first_timer is not None
+        assert api.max_active_calls == 1
+
+        app.open_section("archive")
+        await pilot.pause(0.12)
+        assert status_screen.poll_timer is None
+        hidden_count = api.status_calls
+        await pilot.pause(0.12)
+        assert api.status_calls == hidden_count
+
+        app.open_section("telegram")
+        await wait_for_condition(pilot, lambda: api.status_calls > hidden_count)
+        assert app.screen.poll_timer is not None
+        assert app.screen.poll_timer is not first_timer
+        assert api.max_active_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_telegram_statistics_refresh_is_serial_and_preserves_previous_snapshot():
+    api = FakeAPI()
+    app = HoardApp(api)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await wait_for_startup(app, pilot)
+        app.open_section("telegram")
+        await wait_for_condition(
+            pilot,
+            lambda: "Обновлено:" in str(
+                app.screen.query_one("#telegram-statistics", Static).content
+            ),
+        )
+        initial_calls = [name for name, _ in api.calls].count("telegram_statistics_get")
+        assert initial_calls == 1
+        app._render_current()
+        await pilot.resize_terminal(80, 24)
+        await pilot.pause()
+        assert [name for name, _ in api.calls].count("telegram_statistics_get") == 1
+
+        api.operation_delay = 0.08
+        api.queue("telegram_statistics_get", RuntimeError("statistics unavailable"))
+        button = app.screen.query_one("#telegram-statistics-refresh", Button)
+        button.press()
+        button.press()
+        await wait_for_condition(
+            pilot,
+            lambda: "Данные предыдущего обновления" in str(
+                app.screen.query_one("#telegram-statistics", Static).content
+            ),
+        )
+        assert [name for name, _ in api.calls].count("telegram_statistics_get") == 2
+        statistics = str(app.screen.query_one("#telegram-statistics", Static).content)
+        assert "statistics unavailable" in statistics
+        assert "31" in statistics and "13" in statistics
+        assert button.disabled is False
+
+        app.open_section("home")
+        await pilot.pause()
+        app.open_section("telegram")
+        await wait_for_condition(
+            pilot,
+            lambda: [name for name, _ in api.calls].count("telegram_statistics_get") == 3,
+        )
+
+
+@pytest.mark.asyncio
+async def test_hidden_statistics_result_is_discarded_and_reloaded_on_return():
+    api = FakeAPI()
+    api.operation_delay = 0.08
+    app = HoardApp(api)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await wait_for_startup(app, pilot)
+        app.open_section("telegram")
+        await wait_for_condition(
+            pilot,
+            lambda: [name for name, _ in api.calls].count("telegram_statistics_get") == 1,
+        )
+        app.open_section("home")
+        await pilot.pause()
+        app.open_section("telegram")
+        await wait_for_condition(
+            pilot,
+            lambda: [name for name, _ in api.calls].count("telegram_statistics_get") == 2,
+        )
+        await wait_for_condition(
+            pilot,
+            lambda: "Обновлено:" in str(
+                app.screen.query_one("#telegram-statistics", Static).content
+            ),
+        )
+        assert app.notice is None
+
+
+@pytest.mark.asyncio
+async def test_telegram_status_remains_scrollable_without_horizontal_overflow():
+    app = HoardApp(FakeAPI())
+    async with app.run_test(size=(120, 35)) as pilot:
+        await wait_for_startup(app, pilot)
+        app.open_section("telegram")
+        for size in ((120, 35), (80, 24), (60, 20), (40, 16)):
+            await pilot.resize_terminal(*size)
+            await pilot.pause()
+            workspace = app.screen.query_one("#workspace")
+            assert workspace.virtual_size.width <= workspace.size.width
+            assert len(app.screen.query("#collector-start")) == 1
+            assert len(app.screen.query("#telegram-statistics-refresh")) == 1
+
+
+@pytest.mark.asyncio
+async def test_first_telegram_entry_checks_web_once_without_starting_or_opening_it():
+    api = FakeAPI()
+    app = HoardApp(api)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await wait_for_startup(app, pilot)
+        app.open_section("telegram")
+        await wait_for_condition(
+            pilot, lambda: [name for name, _ in api.calls].count("web_status") == 1
+        )
+        app._render_current()
+        app._render_current()
+        await pilot.pause()
+        names = [name for name, _ in api.calls]
+        assert names.count("web_status") == 1
+        assert "start_web" not in names
+        assert "open_web" not in names
+
+
+@pytest.mark.asyncio
+async def test_late_web_probe_cannot_overwrite_newer_command_state():
+    class SlowWebAPI(FakeAPI):
+        def __init__(self) -> None:
+            super().__init__()
+            self.web_started = asyncio.Event()
+            self.web_release = asyncio.Event()
+
+        async def web_status(self) -> dict:
+            self.calls.append(("web_status", {}))
+            self.web_started.set()
+            await self.web_release.wait()
+            return {"state": "stopped"}
+
+    api = SlowWebAPI()
+    app = HoardApp(api)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await wait_for_startup(app, pilot)
+        probe = asyncio.create_task(app.refresh_web_state())
+        await asyncio.wait_for(api.web_started.wait(), timeout=1)
+        app.remember_web_state({"state": "ready", "port": 45678})
+        api.web_release.set()
+        await probe
+        await pilot.pause()
+        assert app.web_state == {"state": "ready", "port": 45678}
 
 
 @pytest.mark.asyncio
@@ -1818,7 +2065,11 @@ async def test_header_breadcrumb_and_footer_hints_follow_the_screen():
         await wait_for_startup(app, pilot)
         header = str(app.screen.query_one(HoardHeader).content)
         footer = app.screen.query_one(HoardStatusBar).content
-        assert "Главная" in header and "работает" in header
+        assert "Главная" in header and "служба доступна" in header
+        app.status = {**(app.status or {}), "running": False, "collector_state": "paused"}
+        app._render_current()
+        header = str(app.screen.query_one(HoardHeader).content)
+        assert "служба доступна" in header and "пауза" not in header.lower()
         assert "выбор" in str(footer) and "команды" in str(footer) and "выход" in str(footer)
         # Each shortcut is a reversed (block) chip.
         assert any("reverse" in str(span.style) for span in footer.spans)
@@ -2062,7 +2313,7 @@ async def test_home_carries_the_program_name_and_picks_a_logo_that_fits():
         big, small = app.screen.query_one("#hero-big"), app.screen.query_one("#hero-small")
         assert big.display and not small.display
         text = str(big.content)
-        assert "v0.7.4.0" in text
+        assert "v0.7.4.1" in text
         assert "локальный архив" not in text
         assert "всё хранится" not in text
         assert "сборщик" not in text

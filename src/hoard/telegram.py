@@ -321,12 +321,13 @@ class TelegramEngine:
             state = "saved"
         else:
             state = "login_required"
+        profile = self.account_info.copy() if state in {"connected", "saved"} else {}
         return {
             "state": state,
             "connected": connected,
             "session_present": session_present,
             "verified": self.session_verified,
-            "profile": self.account_info.copy(),
+            "profile": profile,
         }
 
     async def refresh_account_info(self) -> dict[str, Any]:

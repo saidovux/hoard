@@ -1198,6 +1198,31 @@ class AIStorage:
         ]
         return result
 
+    def telegram_statistics(self) -> dict[str, int]:
+        """Aggregate PSL outcomes only from analyses linked to their actual attempts."""
+        row = self.db.execute(
+            """SELECT
+              COALESCE(SUM(
+                t.state='completed' AND a.result_status='completed'
+              ),0) AS completed_analyses,
+              COUNT(DISTINCT CASE
+                WHEN t.state='completed' AND a.result_status='completed' THEN a.author_id
+              END) AS unique_profiles,
+              COALESCE(SUM(
+                t.state='failed'
+                OR (t.state='completed' AND a.result_status='invalid_result')
+              ),0) AS failed_analyses,
+              COALESCE(SUM(t.state='outcome_unknown'),0) AS unknown_outcome,
+              COALESCE(SUM(a.result_status IN ('insufficient_data','ineligible')),0)
+                AS without_result,
+              COALESCE(SUM(t.state='queued'),0) AS queued,
+              COALESCE(SUM(t.state='running'),0) AS running
+            FROM ai_telegram_analyses AS a
+            JOIN ai_attempts AS t ON t.id=a.attempt_id"""
+        ).fetchone()
+        assert row is not None
+        return {key: int(row[key] or 0) for key in row.keys()}
+
     def telegram_analysis_by_operation(self, operation_key: str) -> dict | None:
         row = self.db.execute(
             "SELECT id FROM ai_telegram_analyses WHERE operation_key=?", (operation_key,)

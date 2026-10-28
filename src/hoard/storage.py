@@ -322,6 +322,43 @@ class Store:
             "profile_photos": profile_photos,
         }
 
+    def telegram_statistics(self) -> dict:
+        """Return bounded archive aggregates for Telegram Status."""
+        sources = self.db.execute(
+            """SELECT COUNT(*) AS total,
+            COALESCE(SUM(enabled=1),0) AS enabled FROM sources"""
+        ).fetchone()
+        media = self.db.execute(
+            """SELECT
+              (SELECT COUNT(*) FROM downloads) AS video_notes,
+              (SELECT COUNT(*) FROM tg_profiles) AS unique_profiles,
+              (SELECT COUNT(*) FROM tg_profile_photos WHERE status='saved') AS profile_photos,
+              COALESCE(SUM(status='saved' AND kind='image'),0) AS post_images,
+              COALESCE(SUM(status='saved' AND kind='video'),0) AS post_videos,
+              COALESCE(SUM(status='saved' AND kind='file'),0) AS post_files
+            FROM tg_post_media"""
+        ).fetchone()
+        assert sources is not None and media is not None
+        source_total = int(sources["total"] or 0)
+        source_enabled = int(sources["enabled"] or 0)
+        return {
+            "sources": {
+                "total": source_total,
+                "enabled": source_enabled,
+                "disabled": source_total - source_enabled,
+            },
+            "media": {
+                "video_notes": int(media["video_notes"] or 0),
+                "post_images": int(media["post_images"] or 0),
+                "post_videos": int(media["post_videos"] or 0),
+                "post_files": int(media["post_files"] or 0),
+                "profile_photos": int(media["profile_photos"] or 0),
+            },
+            "profiles": {"unique": int(media["unique_profiles"] or 0)},
+            "frames": self.telegram.archive_frame_statistics(),
+            "psl": self.ai.telegram_statistics(),
+        }
+
     def queue_stats(self) -> dict[str, int]:
         result = {"queued": 0, "running": 0, "failed": 0}
         for row in self.db.execute(

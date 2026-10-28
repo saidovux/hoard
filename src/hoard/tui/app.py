@@ -190,6 +190,8 @@ class HoardApp(App[None]):
         self.status_error: str | None = None
         self.notice: tuple[str, bool] | None = None
         self.web_state: dict[str, Any] = {"state": "unknown"}
+        self._web_state_revision = 0
+        self._web_check_task: asyncio.Task[dict[str, Any]] | None = None
         self._refresh_lock = asyncio.Lock()
         self._operations: set[str] = set()
         self._startup_complete = False
@@ -213,7 +215,9 @@ class HoardApp(App[None]):
         self._startup_complete = True
         await self.refresh_status(brief=True)
 
-    async def refresh_status(self, *, brief: bool = False, wait: bool = False) -> bool:
+    async def refresh_status(
+        self, *, brief: bool = False, wait: bool = False, render: bool = True
+    ) -> bool:
         """Perform at most one status request at a time."""
         if self._refresh_lock.locked() and not wait:
             return False
@@ -235,7 +239,8 @@ class HoardApp(App[None]):
                 else:
                     self.status = status
                 self.status_error = None
-            self._render_current()
+            if render:
+                self._render_current()
         return True
 
     def _render_current(self) -> None:
@@ -246,6 +251,38 @@ class HoardApp(App[None]):
     def set_notice(self, message: str, *, error: bool = False) -> None:
         self.notice = (message, error)
         self._render_current()
+
+    def remember_web_state(self, value: dict[str, Any]) -> None:
+        """Publish a command result and invalidate any older Web status check."""
+        self._web_state_revision += 1
+        self.web_state = dict(value)
+        self._render_current()
+
+    async def refresh_web_state(self, *, force: bool = False) -> dict[str, Any]:
+        """Share one Web probe and ignore results older than an explicit command."""
+        current = self._web_check_task
+        if current is not None and not current.done() and not force:
+            return await asyncio.shield(current)
+
+        revision = self._web_state_revision
+
+        async def fetch() -> dict[str, Any]:
+            try:
+                result = dict(await self.api.web_status())
+            except Exception as exc:
+                result = {"state": "error", "error": str(exc) or type(exc).__name__}
+            if revision == self._web_state_revision:
+                self.web_state = dict(result)
+                self._render_current()
+            return result
+
+        task = asyncio.create_task(fetch())
+        self._web_check_task = task
+        try:
+            return await asyncio.shield(task)
+        finally:
+            if self._web_check_task is task:
+                self._web_check_task = None
 
     async def execute(
         self,
@@ -280,13 +317,20 @@ class HoardApp(App[None]):
         if isinstance(self.screen, HelpScreen) or section not in self.SCREENS:
             return
         current = getattr(self.screen, "section", None)
-        if workspace(section) == "telegram" and workspace(str(current or "")) is None:
+        entering_telegram = (
+            workspace(section) == "telegram" and workspace(str(current or "")) is None
+        )
+        if entering_telegram:
             current_section = resolve(str(current or "home"))
             self._telegram_return_section = (
                 current_section if current_section in {"home", "archive", "ai"} else "home"
             )
         if current != section:
             self.switch_screen(section)
+            if entering_telegram and str(self.web_state.get("state") or "unknown") == "unknown":
+                self.run_worker(
+                    self.refresh_web_state(), name="telegram-web-initial", exit_on_error=False
+                )
             if section in {"archive", "telegram_sources"}:
                 self.run_worker(
                     self.refresh_status(wait=True),
@@ -737,5 +781,7 @@ class HoardApp(App[None]):
 
     def on_unmount(self) -> None:
         for screen in self.screen_stack:
-            if isinstance(screen, HomeScreen):
+            if isinstance(screen, (HomeScreen, TelegramStatusScreen)):
                 screen.stop_polling()
+        if self._web_check_task is not None and not self._web_check_task.done():
+            self._web_check_task.cancel()

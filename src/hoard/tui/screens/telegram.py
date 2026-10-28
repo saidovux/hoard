@@ -3,17 +3,19 @@
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
+from datetime import datetime
 from typing import Any, ClassVar
 
 from rich.text import Text
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal
+from textual.timer import Timer
 from textual.widgets import Button, DataTable, Static
 
 from ..colors import ACCENT, MUTED, TEXT
 from ..dialogs import ConfirmDialog, SourceDialog
-from ..state import collector_label, progress_lines, telegram_label
+from ..state import format_bytes
 from ..widgets import Panel, Sidebar
 from ..widgets.chrome import Hint
 from .base import WorkspaceScreen
@@ -118,62 +120,301 @@ class _CollectorControls:
 
 class TelegramStatusScreen(_CollectorControls, _TelegramWorkspaceScreen):
     section = "telegram_status"
+    POLL_INTERVAL = 1.5
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.poll_timer: Timer | None = None
+        self._status_error: str | None = None
+        self._statistics: dict[str, Any] | None = None
+        self._statistics_error: str | None = None
+        self._statistics_updated_at = ""
+        self._statistics_loading = False
+        self._statistics_request_active = False
+        self._statistics_request_generation = -1
+        self._statistics_pending_generation: int | None = None
+        self._entry_generation = 0
 
     def compose_workspace(self) -> ComposeResult:
-        with Panel(title="Статус Telegram", id="collector-panel"):
-            yield Static(id="telegram-summary")
+        with Panel(title="Текущая работа", id="collector-panel"):
+            yield Static(id="telegram-current")
             with Horizontal(classes="action-row", id="telegram-actions"):
                 yield Button("Запустить", id="collector-start", variant="primary")
                 yield Button("Пауза", id="collector-pause")
                 yield Button("Остановить", id="collector-stop")
                 yield Button("Перейти ко входу", id="telegram-login")
+        with Panel(title="Статистика Telegram", id="telegram-statistics-panel"):
+            with Horizontal(classes="action-row", id="telegram-statistics-actions"):
+                yield Button("Обновить", id="telegram-statistics-refresh", variant="primary")
+            yield Static(id="telegram-statistics")
+
+    def on_screen_resume(self) -> None:
+        super().on_screen_resume()
+        self._entry_generation += 1
+        if self.poll_timer is None:
+            self.poll_timer = self.set_interval(self.POLL_INTERVAL, self._poll)
+        self.run_worker(self._poll(), name="telegram-status-live", exit_on_error=False)
+        self._request_statistics()
+
+    def on_screen_suspend(self) -> None:
+        self._entry_generation += 1
+        self.stop_polling()
+
+    def on_unmount(self) -> None:
+        self._entry_generation += 1
+        self.stop_polling()
+
+    async def _poll(self) -> None:
+        if self.is_mounted and self.app.screen is self:
+            await self.hoard_app.refresh_status(brief=True, render=False)
+            if self.is_mounted and self.app.screen is self:
+                self.render_status(self.hoard_app.status, self.hoard_app.status_error)
+
+    def stop_polling(self) -> None:
+        if self.poll_timer is not None:
+            self.poll_timer.stop()
+            self.poll_timer = None
+
+    def render_status(self, status: dict | None, error: str | None = None) -> None:
+        self._status_error = error
+        super().render_status(status, error)
+
+    @staticmethod
+    def _count(value: object) -> str:
+        if isinstance(value, bool):
+            return "—"
+        try:
+            number = max(0, int(value))  # type: ignore[arg-type]
+        except (TypeError, ValueError, OverflowError):
+            return "—"
+        return f"{number:,}".replace(",", " ")
+
+    @staticmethod
+    def _collector_state(status: dict, error: str | None) -> str:
+        if error:
+            return "Служба недоступна"
+        account = status.get("telegram_account") or {}
+        if (
+            str(status.get("telegram") or "") != "authorized"
+            or str(account.get("state") or "") != "connected"
+        ):
+            return "Требуется подключение"
+        state = str(status.get("collector_state") or "")
+        if state == "paused":
+            return "На паузе"
+        if state == "stopped" or status.get("running") is False:
+            return "Остановлен"
+        if state == "running" and status.get("running") is True:
+            return "Работает"
+        return "Состояние неизвестно"
+
+    @staticmethod
+    def _stage(status: dict) -> str:
+        if status.get("running") is not True:
+            return "—"
+        progress = status.get("progress") or {}
+        try:
+            active = int(progress.get("active_downloads") or 0)
+        except (TypeError, ValueError):
+            active = 0
+        if active > 0:
+            return "Скачивание медиа"
+        if progress:
+            return "Проверка публикации"
+        return "Ожидание"
 
     def render_data(self, status: dict) -> None:
         account = status.get("telegram_account") or {}
         account_state = str(account.get("state") or "unknown")
-        account_labels = {
-            "connected": "подключён",
-            "saved": "сессия сохранена, соединение не проверено",
-            "login_required": telegram_label(status),
-            "unknown": "состояние неизвестно",
-        }
-        queue = status.get("queue") or {}
+        progress = status.get("progress") or {}
         summary = Text()
-        summary.append("аккаунт".ljust(12), style=MUTED)
-        summary.append(account_labels.get(account_state, telegram_label(status)), style=TEXT)
-        summary.append("\n" + "сборщик".ljust(12), style=MUTED)
-        summary.append(collector_label(status), style=TEXT)
-        summary.append("\n" + "очередь".ljust(12), style=MUTED)
-        summary.append(
-            f"{queue.get('queued', 0)} ожидают · {queue.get('running', 0)} выполняются",
-            style=TEXT,
+        source = str(progress.get("source") or "—")
+        remaining = self._count(progress.get("remaining"))
+        speed = format_bytes(progress.get("aggregate_speed_bps"))
+        if speed != "—":
+            speed += "/s"
+        values = (
+            ("Источник", source),
+            ("Сборщик", self._collector_state(status, self._status_error)),
+            ("Этап", self._stage(status)),
+            ("Проверено", self._count(progress.get("checked"))),
+            ("Скачано", self._count(progress.get("downloaded")) + " новых кружков"),
+            ("Осталось", remaining),
+            ("Загрузки", self._count(progress.get("active_downloads")) + " активных"),
+            ("Скорость", speed),
         )
-        summary.append("\n" + "активность".ljust(12), style=MUTED)
-        summary.append(" · ".join(progress_lines(status)), style=TEXT)
-        error = next(
-            (
-                str(event.get("text") or "")
-                for event in status.get("events") or []
-                if str(event.get("kind") or "") == "error" and event.get("text")
-            ),
-            "",
-        )
-        if error:
-            summary.append("\n" + "ошибка".ljust(12), style=MUTED)
-            summary.append(error, style=ACCENT)
-        self.query_one("#telegram-summary", Static).update(summary)
+        for index, (label, value) in enumerate(values):
+            if index:
+                summary.append("\n")
+            summary.append(label.ljust(14), style=MUTED)
+            summary.append(value, style=TEXT)
+        self.query_one("#telegram-current", Static).update(summary)
 
         running = bool(status.get("running"))
         collector_state = str(status.get("collector_state") or "stopped")
+        unavailable = self._status_error is not None
         self.query_one("#collector-start", Button).label = (
             "Возобновить" if collector_state == "paused" else "Запустить"
         )
-        self.query_one("#collector-start", Button).disabled = running
-        self.query_one("#collector-pause", Button).disabled = not running
+        self.query_one("#collector-start", Button).disabled = unavailable or running
+        self.query_one("#collector-pause", Button).disabled = unavailable or not running
         self.query_one("#collector-stop", Button).disabled = (
-            not running and collector_state == "stopped"
+            unavailable or (not running and collector_state == "stopped")
         )
         self.query_one("#telegram-login", Button).display = account_state != "connected"
+        self.query_one("#telegram-login", Button).disabled = unavailable
+
+    def _request_statistics(self) -> None:
+        generation = self._entry_generation
+        if self._statistics_request_active:
+            if self._statistics_request_generation != generation:
+                self._statistics_pending_generation = generation
+                self._statistics_loading = True
+                self._render_statistics()
+            return
+        self._statistics_request_active = True
+        self._statistics_request_generation = generation
+        self._statistics_loading = True
+        self._statistics_error = None
+        self._render_statistics()
+        self.run_worker(
+            self._load_statistics(generation),
+            name="telegram-statistics",
+            exit_on_error=False,
+        )
+
+    async def _load_statistics(self, generation: int) -> None:
+        try:
+            result = await self.hoard_app.api.telegram_statistics()
+        except Exception as exc:
+            if generation == self._entry_generation and self.app.screen is self:
+                self._statistics_error = str(exc) or type(exc).__name__
+        else:
+            if generation == self._entry_generation and self.app.screen is self:
+                self._statistics = dict(result)
+                self._statistics_error = None
+                self._statistics_updated_at = datetime.now().strftime("%H:%M:%S")
+        finally:
+            self._statistics_request_active = False
+            if generation == self._entry_generation and self.app.screen is self:
+                self._statistics_loading = False
+                self._render_statistics()
+            pending = self._statistics_pending_generation
+            self._statistics_pending_generation = None
+            if (
+                pending == self._entry_generation
+                and self.is_mounted
+                and self.app.screen is self
+            ):
+                self._request_statistics()
+
+    def _render_statistics(self) -> None:
+        if not self.is_mounted:
+            return
+        refresh = self.query_one("#telegram-statistics-refresh", Button)
+        refresh.disabled = self._statistics_loading
+        view = self.query_one("#telegram-statistics", Static)
+        if self._statistics is None:
+            message = (
+                "Загрузка статистики…"
+                if self._statistics_loading
+                else "Статистика недоступна"
+            )
+            if self._statistics_error:
+                message += f"\n{self._statistics_error}"
+            view.update(Text(message, style=ACCENT if self._statistics_error else MUTED))
+            return
+
+        text = Text()
+        groups = (
+            (
+                "ИСТОЧНИКИ",
+                self._statistics.get("sources") or {},
+                (("Всего", "total"), ("Включено", "enabled"), ("Отключено", "disabled")),
+            ),
+            (
+                "МЕДИА",
+                self._statistics.get("media") or {},
+                (
+                    ("Сохранённые кружки", "video_notes"),
+                    ("Фото публикаций", "post_images"),
+                    ("Видео публикаций", "post_videos"),
+                    ("Другие файлы", "post_files"),
+                ),
+            ),
+            (
+                "ПРОФИЛИ",
+                {
+                    **(self._statistics.get("profiles") or {}),
+                    "profile_photos": (self._statistics.get("media") or {}).get(
+                        "profile_photos"
+                    ),
+                },
+                (("Уникальных", "unique"), ("Сохранено фото", "profile_photos")),
+            ),
+            (
+                "КАДРЫ FFMPEG",
+                self._statistics.get("frames") or {},
+                (
+                    ("Обработано кружков", "processed_videos"),
+                    ("Создано кадров", "created_frames"),
+                    ("Ожидают запуска", "waiting"),
+                    ("В очереди", "queued"),
+                    ("Обрабатывается", "processing"),
+                    ("Без кадров", "missing"),
+                    ("Ошибки", "failed"),
+                    ("Устаревшие наборы", "stale"),
+                ),
+            ),
+            (
+                "PSL",
+                self._statistics.get("psl") or {},
+                (
+                    ("Профилей", "unique_profiles"),
+                    ("Успешных анализов", "completed_analyses"),
+                    ("Технических ошибок", "failed_analyses"),
+                    ("Исход неизвестен", "unknown_outcome"),
+                    ("Без результата", "without_result"),
+                    ("В очереди", "queued"),
+                    ("Выполняется", "running"),
+                ),
+            ),
+        )
+        for group_index, (title, data, rows) in enumerate(groups):
+            if group_index:
+                text.append("\n\n")
+            text.append(title, style=f"bold {MUTED}")
+            for label, key in rows:
+                text.append("\n" + label.ljust(22), style=MUTED)
+                text.append(self._count(data.get(key)), style=TEXT)
+        frames = self._statistics.get("frames") or {}
+        text.append("\n" + "FFmpeg".ljust(22), style=MUTED)
+        text.append(
+            "работает" if frames.get("active") else "остановлен",
+            style=TEXT,
+        )
+        mode = {
+            "off": "выключен",
+            "single": "один кружок",
+            "bulk": "архив",
+            "stopping": "останавливается",
+        }.get(str(frames.get("processing_mode") or "off"), "неизвестен")
+        text.append("\n" + "Режим".ljust(22), style=MUTED)
+        text.append(mode, style=TEXT)
+        if self._statistics_updated_at:
+            text.append(f"\n\nОбновлено: {self._statistics_updated_at}", style=MUTED)
+        if self._statistics_loading:
+            text.append(" · обновляется…", style=MUTED)
+        if self._statistics_error:
+            text.append(
+                f"\nДанные предыдущего обновления · {self._statistics_error}",
+                style=ACCENT,
+            )
+        view.update(text)
+
+    def on_app_resize(self) -> None:
+        super().on_app_resize()
+        self._render_statistics()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         actions = {
@@ -181,6 +422,7 @@ class TelegramStatusScreen(_CollectorControls, _TelegramWorkspaceScreen):
             "collector-pause": self._pause,
             "collector-stop": self._stop,
             "telegram-login": lambda: self.hoard_app.open_section("telegram_login"),
+            "telegram-statistics-refresh": self._request_statistics,
         }
         action = actions.get(str(event.button.id))
         if action:
@@ -402,7 +644,6 @@ class TelegramWebScreen(_TelegramWorkspaceScreen):
 
     def __init__(self) -> None:
         super().__init__()
-        self._web_state: dict[str, Any] = {"state": "unknown"}
         self._web_loading = False
 
     def compose_workspace(self) -> ComposeResult:
@@ -426,7 +667,8 @@ class TelegramWebScreen(_TelegramWorkspaceScreen):
         self._render_web()
 
     def _render_web(self) -> None:
-        state = str(self._web_state.get("state") or "unknown")
+        web_state = self.hoard_app.web_state
+        state = str(web_state.get("state") or "unknown")
         labels = {
             "unknown": "проверяем",
             "stopped": "выключен",
@@ -438,12 +680,12 @@ class TelegramWebScreen(_TelegramWorkspaceScreen):
         text = Text()
         text.append("состояние".ljust(11), style=MUTED)
         text.append(labels.get(state, state), style=ACCENT if state == "error" else TEXT)
-        if state == "ready" and self._web_state.get("port"):
+        if state == "ready" and web_state.get("port"):
             text.append("\n" + "адрес".ljust(11), style=MUTED)
-            text.append(f"127.0.0.1:{self._web_state['port']}", style=TEXT)
-        if state == "error" and self._web_state.get("error"):
-            text.append("\n" + str(self._web_state["error"]), style=ACCENT)
-        if state == "ready" and not self._web_state.get("controllable", True):
+            text.append(f"127.0.0.1:{web_state['port']}", style=TEXT)
+        if state == "error" and web_state.get("error"):
+            text.append("\n" + str(web_state["error"]), style=ACCENT)
+        if state == "ready" and not web_state.get("controllable", True):
             text.append(
                 "\nWeb запущен без управляющего канала; перезапусти его вручную",
                 style=ACCENT,
@@ -451,7 +693,7 @@ class TelegramWebScreen(_TelegramWorkspaceScreen):
         self.query_one("#web-summary", Static).update(text)
 
         busy = self._web_loading
-        controllable = bool(self._web_state.get("controllable", True))
+        controllable = bool(web_state.get("controllable", True))
         self.query_one("#web-start", Button).disabled = busy or state in {
             "starting", "ready", "stopping"
         }
@@ -459,10 +701,6 @@ class TelegramWebScreen(_TelegramWorkspaceScreen):
         self.query_one("#web-stop", Button).disabled = busy or state != "ready" or not controllable
         if self.is_mounted:
             self.query_one(Sidebar).set_indicators(web=state)
-
-    def _remember_web_state(self, value: dict[str, Any]) -> None:
-        self._web_state = value
-        self.hoard_app.web_state = dict(value)
 
     def _refresh_web(self) -> None:
         if self._web_loading:
@@ -473,9 +711,7 @@ class TelegramWebScreen(_TelegramWorkspaceScreen):
 
     async def _load_web_state(self) -> None:
         try:
-            self._remember_web_state(await self.hoard_app.api.web_status())
-        except Exception as exc:
-            self._remember_web_state({"state": "error", "error": str(exc) or type(exc).__name__})
+            await self.hoard_app.refresh_web_state()
         finally:
             self._web_loading = False
             if self.is_mounted:
@@ -490,7 +726,8 @@ class TelegramWebScreen(_TelegramWorkspaceScreen):
             "stop": "stopping",
             "open": "ready",
         }[operation]
-        self._remember_web_state({"state": state})
+        if operation != "open":
+            self.hoard_app.remember_web_state({"state": state})
         messages = {
             "start": "Включаем Web Viewer…",
             "open": "Открываем Web Viewer…",
@@ -503,11 +740,12 @@ class TelegramWebScreen(_TelegramWorkspaceScreen):
         )
 
     async def _perform_web_action(self, operation: str) -> None:
+        refreshed = False
         try:
             if operation == "start":
                 await self.hoard_app.api.start_web()
-                ready = await self.hoard_app.api.web_status()
-                self._remember_web_state(ready)
+                ready = await self.hoard_app.refresh_web_state(force=True)
+                refreshed = True
                 if str(ready.get("state") or "") != "ready":
                     raise RuntimeError("Web Viewer не подтвердил готовность")
                 try:
@@ -536,7 +774,11 @@ class TelegramWebScreen(_TelegramWorkspaceScreen):
         except Exception as exc:
             self.hoard_app.set_notice(str(exc) or type(exc).__name__, error=True)
         finally:
-            await self._load_web_state()
+            if not refreshed:
+                await self.hoard_app.refresh_web_state(force=True)
+            self._web_loading = False
+            if self.is_mounted and self.app.screen is self:
+                self._render_web()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         actions = {
@@ -578,13 +820,19 @@ class TelegramLoginScreen(_TelegramWorkspaceScreen):
         summary.append("\n" + "соединение".ljust(14), style=MUTED)
         summary.append("установлено" if account.get("connected") else "отключено", style=TEXT)
         profile = account.get("profile") or {}
-        if profile.get("name"):
+        show_profile = state in {"connected", "saved"}
+        if state == "saved" and profile:
+            summary.append(
+                "\n\nПоследний подтверждённый аккаунт — сейчас не подключён",
+                style=MUTED,
+            )
+        if show_profile and profile.get("name"):
             summary.append("\n" + "имя".ljust(14), style=MUTED)
             summary.append(str(profile["name"]), style=TEXT)
-        if profile.get("username"):
+        if show_profile and profile.get("username"):
             summary.append("\n" + "username".ljust(14), style=MUTED)
             summary.append("@" + str(profile["username"]).lstrip("@"), style=TEXT)
-        if profile.get("id") is not None:
+        if show_profile and profile.get("id") is not None:
             summary.append("\n" + "Telegram ID".ljust(14), style=MUTED)
             summary.append(str(profile["id"]), style=TEXT)
         if bool(status.get("running")):

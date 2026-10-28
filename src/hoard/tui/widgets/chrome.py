@@ -23,7 +23,6 @@ from ..navigation import (
     sections_for,
     workspace,
 )
-from ..state import collector_label
 
 Hint = tuple[str, str]
 
@@ -32,7 +31,7 @@ GLOBAL_HINTS: tuple[Hint, ...] = ((":", "команды"), ("?", "помощь")
 
 
 class HoardHeader(Static):
-    """One quiet line: the product mark, where you are and whether the collector is alive."""
+    """One quiet line: the product mark, location and daemon availability."""
 
     def __init__(self, section: str = "home") -> None:
         super().__init__(id="hoard-header")
@@ -54,10 +53,7 @@ class HoardHeader(Static):
             return Text.assemble(("● ", f"bold {ACCENT}"), ("служба недоступна", ACCENT))
         if self._status is None:
             return Text("○ подключение…", style=MUTED)
-        label = collector_label(self._status)
-        if label == "работает":
-            return Text.assemble(("● ", ACCENT), (label, TEXT))
-        return Text.assemble(("○ ", MUTED), (label, MUTED))
+        return Text.assemble(("● ", GOOD), ("служба доступна", TEXT))
 
     def _paint(self) -> None:
         left = Text(no_wrap=True, overflow="ellipsis")

@@ -17,6 +17,10 @@ Local-first Telegram archive and extensible small-tool core, Python >=3.11. Keep
   queue/archive totals. Its three stable horizontal transfer slots are fed only by bounded
   `status_brief.progress.transfers`; four downloads may keep running while only three are shown.
   Home never opens SQLite or a Telegram client and retains the single 1.5-second polling loop.
+- Telegram Status has two independent refresh lifecycles: current work uses bounded
+  `status_brief` only while visible, while archive/FFmpeg/PSL aggregates use the read-only
+  `telegram_statistics_get` IPC only on entry or explicit refresh. Preserve the last successful
+  aggregate snapshot on errors; never make this page start Telegram, FFmpeg, Web or AI work.
 - Maintain existing XDG session/config/database locations and schema. Never commit sessions, API keys, downloaded media, local archives or real profile data.
 - Preserve `hoard start`, `stop`, `scan`, `status`, `shutdown`, `add`, `retry`, `telegram` and
   `web` and their noninteractive/JSON output. Service commands must not import Textual.

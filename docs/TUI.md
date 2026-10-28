@@ -45,13 +45,13 @@ nested Sources page.
 | Hoard | **Архив** | Кружки / Профили / Задания, catalogue, complete manual frame workflow and existing profile/frame AI actions |
 | Hoard | **Telegram** | entry into the Telegram workspace; defaults to Status |
 | Hoard | **AI** | existing provider settings, records and chat |
-| Telegram | **Статус** | verified account state, collector controls, activity, queued/running counts and latest important error |
+| Telegram | **Статус** | live collector work plus read-only archive, FFmpeg-frame and PSL aggregates |
 | Telegram | **Источники** | table plus add/edit/toggle/selected/global scan and publication-scoped photo/frame PSL actions |
 | Telegram | **Web Viewer** | actual loopback-process state and enable/open/disable actions |
 | Telegram | **Вход** | saved-session/live-connection state, cached public account data and the existing authorization dialog |
 
 ```
- hoard  ›  Telegram  ›  Источники                                 ● работает
+ hoard  ›  Telegram  ›  Источники                         ● служба доступна
  ╭ Telegram ────────╮ ╭ Источники ──────────────────────────────────────────────╮
  │ ← Назад в Hoard  │ │ Добавить  Изменить  Вкл./выкл.  Проверить  Проверить все│
  │ ▎1 Статус        │ │ Источник            Состояние  Кружки  Каждые  …        │
@@ -83,11 +83,13 @@ neutral when state cannot be established.
   table or the sidebar owns the keyboard.
 * When the sidebar is hidden by the responsive breakpoint, focus is moved out of it. It must not
   keep receiving `j`/`k` while invisible.
-* Home polls only bounded `status_brief` data, keeps one request in flight and skips unchanged
-  redraws. Its Telegram monitor consumes the snapshot only; it never queries Telegram, SQLite or
-  files independently. Detailed Archive/Sources data is loaded on entry. Web is checked on its page and is not
-  polled globally; account checks are explicit. Status repaint never rebuilds the sidebar, moves
-  its highlight or steals a field's focus.
+* Home and Telegram Status poll only bounded `status_brief` data while visible, share the app's
+  one-request guard and stop their timers when hidden. The Status archive aggregates use the
+  separate `telegram_statistics_get` request only on entry and explicit refresh; a failed refresh
+  retains and marks the last confirmed snapshot. Neither surface queries Telegram or files.
+  Detailed Archive/Sources data is loaded on entry. Web is checked once on first Telegram-workspace
+  entry and reused by its page, without polling or autostart. Status repaint never rebuilds the
+  sidebar, moves its highlight or steals a field's focus.
 * Opening an AI conversation hides the list workspace, gives the message field focus and scrolls
   the conversation to its top. Returning restores the list and focus.
 * Archive and Telegram Sources tables preserve the selected record across status refreshes, terminal
@@ -117,6 +119,15 @@ another finishes, and the next transfer occupies the free slot. One horizontal s
 three segments. The collector may run four downloads (`HOARD_TG_DOWNLOADS=4`); the fourth remains
 active and is included in the count without displacing the three visible slots. Unknown sizes use
 a neutral activity mark, not a fabricated percentage. Slots are cleared on stop or IPC failure.
+
+## Telegram Status
+
+The upper **Текущая работа** panel reports only current `status_brief` facts: source, collector
+state, scan stage, checked and newly saved counts, active transfers and aggregate speed. Unknown
+remaining work stays `—`. The lower panel is an archival snapshot: all/enabled sources, saved
+media and profile photos, unique profiles, exact saved frame sets and rows, frame-job states, and
+PSL outcomes linked to actual analyses. FFmpeg activity and its explicit processing mode are
+display-only. Refreshing statistics cannot start Telegram, FFmpeg, Web or AI work.
 
 ## Keyboard
 

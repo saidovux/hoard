@@ -216,6 +216,13 @@ async def test_account_snapshot_distinguishes_saved_and_verified_connection(
     assert saved["verified"] is None
     assert saved["connected"] is False
 
+    engine.account_info = {"id": 101, "name": "Cached User", "username": "cached"}
+    engine.session_verified = False
+    invalid = engine.account_snapshot()
+    assert invalid["state"] == "login_required"
+    assert invalid["profile"] == {}
+    engine.session_verified = None
+
     engine.client = AuthClient(authorized=True)
     result = await engine.begin_authorization()
     connected = engine.account_snapshot()

@@ -826,6 +826,7 @@ class Service:
                 state="login_required",
                 connected=False,
                 verified=False,
+                profile={},
             )
         return result
 
@@ -964,6 +965,13 @@ class Service:
             return self._status_snapshot(detailed=True)
         if method == "status_brief":
             return self._status_snapshot(detailed=False)
+        if method == "telegram_statistics_get":
+            statistics = self.store.telegram_statistics()
+            statistics["frames"].update(
+                active=bool(self.media_runner.running),
+                processing_mode=self._frame_mode,
+            )
+            return statistics
         if method == "credentials":
             api_id = int(args.get("api_id", 0))
             api_hash = str(args.get("api_hash", ""))

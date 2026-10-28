@@ -77,6 +77,8 @@ class HoardAPI(Protocol):
         self, method: str, args: dict[str, Any] | None = None
     ) -> dict[str, Any]: ...
 
+    async def telegram_statistics(self) -> dict[str, Any]: ...
+
     async def web_status(self) -> dict[str, Any]: ...
 
     async def start_web(self) -> dict[str, Any]: ...
@@ -199,6 +201,9 @@ class IPCStatusAPI:
             else self.CONTROL_TIMEOUT
         )
         return await request(method, args or {}, timeout=timeout)
+
+    async def telegram_statistics(self) -> dict[str, Any]:
+        return await self.telegram_call("telegram_statistics_get")
 
     async def web_status(self) -> dict[str, Any]:
         from hoard.web import web_status

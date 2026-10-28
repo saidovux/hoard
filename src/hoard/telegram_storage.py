@@ -836,6 +836,46 @@ class TelegramStorage:
             "backfill_cursor": int(row["cursor"] or 0),
         }
 
+    def archive_frame_statistics(self) -> dict[str, int]:
+        """Return exact frame-set/job aggregates without inspecting archive files."""
+        row = self.db.execute(
+            """WITH set_counts AS (
+                SELECT COUNT(*) AS total,
+                  COALESCE(SUM(status='saved'),0) AS saved,
+                  COALESCE(SUM(status='failed'),0) AS failed,
+                  COALESCE(SUM(status='stale'),0) AS stale
+                FROM tg_video_frame_sets
+            ), job_counts AS (
+                SELECT COALESCE(SUM(state='waiting'),0) AS waiting,
+                  COALESCE(SUM(state='queued'),0) AS queued,
+                  COALESCE(SUM(state='running'),0) AS processing
+                FROM jobs WHERE kind='telegram.video_frames'
+            ), saved_frames AS (
+                SELECT COUNT(*) AS amount
+                FROM tg_video_frames AS frame
+                JOIN tg_video_frame_sets AS frame_set
+                  ON frame_set.source_id=frame.source_id
+                 AND frame_set.message_id=frame.message_id
+                WHERE frame_set.status='saved'
+            ), download_counts AS (
+                SELECT COUNT(*) AS total FROM downloads
+            )
+            SELECT set_counts.*,job_counts.*,saved_frames.amount AS created_frames,
+              MAX(download_counts.total-set_counts.total,0) AS missing
+            FROM set_counts,job_counts,saved_frames,download_counts"""
+        ).fetchone()
+        assert row is not None
+        return {
+            "processed_videos": int(row["saved"] or 0),
+            "created_frames": int(row["created_frames"] or 0),
+            "waiting": int(row["waiting"] or 0),
+            "queued": int(row["queued"] or 0),
+            "processing": int(row["processing"] or 0),
+            "missing": int(row["missing"] or 0),
+            "failed": int(row["failed"] or 0),
+            "stale": int(row["stale"] or 0),
+        }
+
     def frame_backfill_active(self) -> bool:
         return self.get_setting("frames_backfill_active", "0") == "1"
 
