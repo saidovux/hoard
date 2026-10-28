@@ -720,9 +720,11 @@ class TelegramEngine:
             "author_username": str(getattr(sender, "username", "") or ""),
         }
 
-    async def _message_identity(self, msg) -> dict[str, Any]:
+    async def _message_identity(
+        self, msg, *, resolve_sender: bool = True
+    ) -> dict[str, Any]:
         sender = getattr(msg, "sender", None)
-        if sender is None:
+        if sender is None and resolve_sender:
             from telethon.errors import FloodWaitError
 
             try:
@@ -796,6 +798,7 @@ class TelegramEngine:
             self._set_auth_state(AuthState.PHONE_REQUIRED)
             raise RuntimeError("Telegram не подключён. Выполни подключение в интерфейсе.")
         post = Post(source["username"], int(source["post_id"]))
+        collect_profiles = str(source.get("collection_mode") or "full") == "full"
         entity = await client.get_entity(post.username)
         if not getattr(entity, "broadcast", False):
             raise ValueError("Ссылка должна указывать на пост канала с комментариями")
@@ -953,7 +956,9 @@ class TelegramEngine:
                     identity: dict[str, Any] | None = None
                     needs_download = False
                     if getattr(msg, "video_note", None) is not None:
-                        identity = await self._message_identity(msg)
+                        identity = await self._message_identity(
+                            msg, resolve_sender=collect_profiles
+                        )
                         if identity["author_id"] is not None:
                             author_id = int(identity["author_id"])
                             self.store.telegram.observe_profile(
@@ -963,7 +968,9 @@ class TelegramEngine:
                                 observed_at=iso_date(getattr(msg, "date", None)),
                                 source_id=int(source["id"]),
                             )
-                            if self.store.telegram.profile_photo_due(author_id):
+                            if collect_profiles and self.store.telegram.profile_photo_due(
+                                author_id
+                            ):
                                 self.store.enqueue(
                                     "telegram.profile_photos",
                                     {"author_id": author_id},

@@ -21,6 +21,14 @@ Local-first Telegram archive and extensible small-tool core, Python >=3.11. Keep
   `status_brief` only while visible, while archive/FFmpeg/PSL aggregates use the read-only
   `telegram_statistics_get` IPC only on entry or explicit refresh. Preserve the last successful
   aggregate snapshot on errors; never make this page start Telegram, FFmpeg, Web or AI work.
+- Telegram Sources uses the bounded, paginated `telegram_sources_overview` IPC rather than
+  compatibility `status.sources`. Keep search/filter/sort in SQLite, preserve stable source-ID
+  selection and do not add polling. Source edits use `source_update`, keep the post identity,
+  enabled state, checkpoint and schedule, and never discard archive relations or media.
+- `sources.collection_mode` defaults to `full`. `minimal` still records message identity,
+  author/source relations and video notes, but must not resolve a missing sender or schedule a new
+  automatic profile-photo job on that source's behalf. A shared author remains eligible through
+  any linked full source; legacy profiles without links keep enrichment compatibility.
 - Maintain existing XDG session/config/database locations and schema. Never commit sessions, API keys, downloaded media, local archives or real profile data.
 - Preserve `hoard start`, `stop`, `scan`, `status`, `shutdown`, `add`, `retry`, `telegram` and
   `web` and their noninteractive/JSON output. Service commands must not import Textual.

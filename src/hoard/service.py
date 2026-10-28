@@ -972,6 +972,22 @@ class Service:
                 processing_mode=self._frame_mode,
             )
             return statistics
+        if method == "telegram_sources_overview":
+            raw_enabled = args.get("enabled")
+            if raw_enabled is not None and not isinstance(raw_enabled, bool):
+                raise ValueError("enabled должен быть true, false или null")
+            return self.store.telegram_sources_overview(
+                limit=int(args.get("limit", 50)),
+                offset=int(args.get("offset", 0)),
+                query=str(args.get("query") or ""),
+                enabled=raw_enabled,
+                sort=str(args.get("sort") or "id_desc"),
+            )
+        if method == "telegram_source_get":
+            source = self.store.source_settings(int(args.get("id") or 0))
+            if source is None:
+                raise ValueError("Источник не найден")
+            return {"source": source}
         if method == "credentials":
             api_id = int(args.get("api_id", 0))
             api_hash = str(args.get("api_hash", ""))
@@ -1052,9 +1068,23 @@ class Service:
                 str(args.get("output", "~/Videos/hoard")),
                 int(args.get("interval", 120)),
                 title=str(args.get("title", "")),
+                collection_mode=str(args.get("collection_mode") or "full"),
             )
             self.runner.wakeup()
             return {"message": f"Добавлен источник #{source_id}: {post.link}"}
+        if method == "source_update":
+            source_id = int(args.get("id") or 0)
+            source = self.store.update_source(
+                source_id,
+                title=str(args.get("title") or ""),
+                output=str(args.get("output") or ""),
+                interval=int(args.get("interval", 120)),
+                collection_mode=str(args.get("collection_mode") or ""),
+            )
+            return {
+                "message": f"Параметры источника #{source_id} обновлены",
+                "source": source,
+            }
         if method == "source_enable":
             self.store.set_enabled(int(args["id"]), bool(args["enabled"]))
             self.runner.wakeup()
@@ -1144,14 +1174,13 @@ class Service:
                     unique_key=f"telegram-enrich:{source['id']}",
                 )
                 jobs += 1
-            for author_id in self.store.telegram.profile_ids():
-                if self.store.telegram.profile_photo_due(author_id):
-                    self.store.enqueue(
-                        "telegram.profile_photos",
-                        {"author_id": author_id},
-                        unique_key=f"telegram-profile-photos:{author_id}",
-                    )
-                    jobs += 1
+            for author_id in self.store.telegram.enrichment_profile_photo_ids():
+                self.store.enqueue(
+                    "telegram.profile_photos",
+                    {"author_id": author_id},
+                    unique_key=f"telegram-profile-photos:{author_id}",
+                )
+                jobs += 1
             self.runner.wakeup()
             suffix = "" if self.running else "; запусти обработчик"
             return {"message": f"Telegram enrichment в очереди: {jobs}{suffix}"}

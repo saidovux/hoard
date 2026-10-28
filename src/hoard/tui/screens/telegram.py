@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable
 from datetime import datetime
 from typing import Any, ClassVar
@@ -11,7 +12,7 @@ from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal
 from textual.timer import Timer
-from textual.widgets import Button, DataTable, Static
+from textual.widgets import Button, DataTable, Input, Select, Static
 
 from ..colors import ACCENT, MUTED, TEXT
 from ..dialogs import ConfirmDialog, SourceDialog
@@ -20,10 +21,23 @@ from ..widgets import Panel, Sidebar
 from ..widgets.chrome import Hint
 from .base import WorkspaceScreen
 
-SOURCE_COLUMNS = ("Источник", "Состояние", "Кружки", "Каждые", "Проверка", "Результат")
-DENSE_SOURCE_COLUMNS = (0, 1, 2, 5)
-COMPACT_SOURCE_COLUMNS = (0, 1, 2)
-SOURCE_HINTS: tuple[Hint, ...] = (("a", "добавить"), ("e", "изменить"), ("s", "проверить"))
+SOURCE_COLUMNS = (
+    "Источник",
+    "Состояние",
+    "Кружки",
+    "Профили",
+    "FFmpeg",
+    "PSL",
+    "Проверка",
+)
+DENSE_SOURCE_COLUMNS = (0, 2, 3, 1)
+COMPACT_SOURCE_COLUMNS = (0, 2)
+SOURCE_HINTS: tuple[Hint, ...] = (
+    ("a", "добавить"),
+    ("e", "изменить"),
+    ("s", "проверить"),
+    ("r", "обновить"),
+)
 
 
 def _short_time(value: object) -> str:
@@ -35,19 +49,20 @@ def _source_widths(columns: tuple[int, ...], table_width: int) -> tuple[int, ...
     """Fixed widths keep long usernames/errors from creating horizontal scrolling."""
     count = len(columns)
     available = max(count * 4, table_width - count * 2 - 1)
-    if count == 6:
-        state, downloads, interval, checked = 9, 6, 7, 16
-        source = max(8, int(available * 0.32))
-        result = max(8, available - source - state - downloads - interval - checked)
-        return source, state, downloads, interval, checked, result
+    if count == 7:
+        state, downloads, profiles, frames, psl, checked = 9, 7, 7, 7, 5, 16
+        source = max(
+            8,
+            available - state - downloads - profiles - frames - psl - checked,
+        )
+        return source, state, downloads, profiles, frames, psl, checked
     if count == 4:
-        state, downloads = 9, 6
-        source = max(8, int(available * 0.36))
-        result = max(7, available - source - state - downloads)
-        return source, state, downloads, result
-    state, downloads = 8, 6
-    source = max(7, available - state - downloads)
-    return source, state, downloads
+        downloads, profiles, state = 7, 7, 9
+        source = max(8, available - downloads - profiles - state)
+        return source, downloads, profiles, state
+    downloads = 7
+    source = max(7, available - downloads)
+    return source, downloads
 
 
 class _TelegramWorkspaceScreen(WorkspaceScreen):
@@ -431,41 +446,118 @@ class TelegramStatusScreen(_CollectorControls, _TelegramWorkspaceScreen):
 
 class TelegramSourcesScreen(_TelegramWorkspaceScreen):
     section = "telegram_sources"
+    PAGE_SIZE = 50
+    SEARCH_DEBOUNCE = 0.3
     BINDINGS = [
         Binding("a", "add_source", "Добавить"),
         Binding("e", "edit_source", "Изменить"),
         Binding("s", "scan_source", "Проверить"),
+        Binding("r", "refresh_sources", "Обновить"),
     ]
 
     def __init__(self) -> None:
         super().__init__()
+        self._items: list[dict[str, Any]] = []
         self._source_ids: list[int] = []
         self._source_layout: tuple[tuple[int, ...], tuple[int, ...]] | None = None
+        self._selected_source_id: int | None = None
+        self._total = 0
+        self._offset = 0
+        self._query = ""
+        self._enabled: bool | None = None
+        self._sort = "id_desc"
+        self._catalog_error = ""
+        self._loading = False
+        self._request_active = False
+        self._pending_reload = False
+        self._query_generation = 0
+        self._entry_generation = 0
+        self._search_timer: Timer | None = None
+        self._resumed_once = False
+        self._edit_loading = False
 
     def compose_workspace(self) -> ComposeResult:
         with Panel(title="Источники", hints=SOURCE_HINTS, id="sources-panel"):
+            with Horizontal(id="source-filters"):
+                yield Input(placeholder="Поиск по публикациям", id="source-search")
+                yield Select(
+                    (("Все", "all"), ("Включённые", "enabled"), ("Отключённые", "disabled")),
+                    value="all",
+                    allow_blank=False,
+                    id="source-filter",
+                )
+                yield Select(
+                    (
+                        ("Сначала новые", "id_desc"),
+                        ("Последняя проверка", "last_checked_desc"),
+                        ("Больше кружков", "downloads_desc"),
+                    ),
+                    value="id_desc",
+                    allow_blank=False,
+                    id="source-sort",
+                )
+            yield DataTable(id="sources-table", cursor_type="row")
+            with Horizontal(id="source-pagination"):
+                yield Static("0 из 0", id="source-range")
+                yield Button("Назад", id="source-prev")
+                yield Button("Далее", id="source-next")
+                yield Button("Обновить", id="source-refresh")
+        with Panel(title="Выбранный источник", id="source-summary-panel"):
             with Horizontal(classes="action-row", id="source-actions"):
                 yield Button("Добавить", id="source-add", variant="primary")
                 yield Button("Изменить", id="source-edit")
-                yield Button("Вкл./выкл.", id="source-toggle")
+                yield Button("Отключить", id="source-toggle")
                 yield Button("Проверить", id="source-scan")
                 yield Button("Проверить все", id="source-scan-all")
-                yield Button("Анализ профилей", id="source-ai")
             with Horizontal(classes="action-row", id="source-ai-actions"):
+                yield Button("AI: фото", id="source-ai")
                 yield Button("AI: кадры", id="source-ai-frames")
                 yield Button("AI: кадры + фото", id="source-ai-combined")
-            yield DataTable(id="sources-table", cursor_type="row")
+            yield Static("Выберите публикацию в таблице.", id="source-summary")
 
     def on_mount(self) -> None:
         super().on_mount()
         self.call_after_refresh(self._focus_initial)
+        self._request_catalog()
+
+    def on_screen_resume(self) -> None:
+        super().on_screen_resume()
+        if self._resumed_once:
+            self._entry_generation += 1
+            self._request_catalog()
+        self._resumed_once = True
+
+    def on_screen_suspend(self) -> None:
+        self._entry_generation += 1
+        self._pending_reload = False
+        self._cancel_search_timer()
+
+    def on_unmount(self) -> None:
+        self._entry_generation += 1
+        self._pending_reload = False
+        self._cancel_search_timer()
 
     def _focus_initial(self) -> None:
         self.focus_working_surface(self.query_one("#sources-table", DataTable))
 
     def render_data(self, status: dict) -> None:
+        del status
+        self._render_catalog()
+
+    @staticmethod
+    def _count(value: object) -> str:
+        try:
+            number = max(0, int(value))  # type: ignore[arg-type]
+        except (TypeError, ValueError, OverflowError):
+            return "—"
+        return f"{number:,}".replace(",", " ")
+
+    def _render_catalog(self) -> None:
+        if not self.is_mounted:
+            return
         table = self.query_one("#sources-table", DataTable)
-        selected = self.selected_source_id
+        selected = self._selected_source_id
+        old_row = table.cursor_row
         compact = self.hoard_app.has_class("compact")
         dense = self.hoard_app.has_class("medium")
         keep = COMPACT_SOURCE_COLUMNS if compact else DENSE_SOURCE_COLUMNS if dense else tuple(
@@ -484,10 +576,9 @@ class TelegramSourcesScreen(_TelegramWorkspaceScreen):
                 table.add_column(SOURCE_COLUMNS[index], width=width)
             self._source_layout = layout
         table.clear()
-        sources = list(status.get("sources") or [])
         self._source_ids = []
         short_labels = self.hoard_app.has_class("narrow") or compact
-        for source in sources:
+        for source in self._items:
             source_id = int(source.get("id") or 0)
             self._source_ids.append(source_id)
             title = str(source.get("title") or "")
@@ -505,36 +596,220 @@ class TelegramSourcesScreen(_TelegramWorkspaceScreen):
             cells = (
                 label,
                 "включён" if source.get("enabled") else "отключён",
-                str(source.get("download_count", 0)),
-                f"{source.get('interval', '—')} с",
+                self._count(source.get("download_count")),
+                self._count(source.get("profile_count")),
+                self._count(source.get("frame_set_count")),
+                self._count(source.get("psl_count")),
                 _short_time(source.get("last_checked_at")),
-                str(source.get("last_error") or source.get("last_result") or "—"),
             )
             table.add_row(*(cells[index] for index in keep), key=str(source_id))
-        if not sources:
-            empty = ("Источников пока нет", "—", "0", "—", "—", "Добавьте пост")
+        if not self._items:
+            empty_label = "Загрузка…" if self._loading else "Источники не найдены"
+            empty = (empty_label, "—", "0", "0", "0", "0", "—")
             table.add_row(*(empty[index] for index in keep))
         elif selected in self._source_ids:
             table.move_cursor(row=self._source_ids.index(selected))
+        else:
+            row = min(max(old_row, 0), len(self._source_ids) - 1)
+            table.move_cursor(row=row)
+            self._selected_source_id = self._source_ids[row]
+        self._render_pagination()
+        self._render_summary()
 
     @property
     def selected_source_id(self) -> int | None:
-        table = self.query_one("#sources-table", DataTable)
-        row = table.cursor_row
-        if 0 <= row < len(self._source_ids):
-            return self._source_ids[row]
-        return None
+        return self._selected_source_id if self._selected_source_id in self._source_ids else None
 
     def selected_source(self) -> dict[str, Any] | None:
         source_id = self.selected_source_id
         return next(
-            (
-                source
-                for source in (self.hoard_app.status or {}).get("sources", [])
-                if int(source.get("id") or 0) == source_id
-            ),
+            (source for source in self._items if int(source.get("id") or 0) == source_id),
             None,
         )
+
+    def _render_pagination(self) -> None:
+        if self._items:
+            first = self._offset + 1
+            last = self._offset + len(self._items)
+            label = f"{first}–{last} из {self._total}"
+        else:
+            label = f"0 из {self._total}"
+        if self._catalog_error:
+            label += " · ошибка обновления"
+        elif self._loading:
+            label += " · обновляется…"
+        self.query_one("#source-range", Static).update(label)
+        self.query_one("#source-prev", Button).disabled = self._loading or self._offset <= 0
+        self.query_one("#source-next", Button).disabled = (
+            self._loading or self._offset + len(self._items) >= self._total
+        )
+
+    def _render_summary(self) -> None:
+        source = self.selected_source()
+        actions = (
+            "source-edit",
+            "source-toggle",
+            "source-scan",
+            "source-ai",
+            "source-ai-frames",
+            "source-ai-combined",
+        )
+        for button_id in actions:
+            self.query_one(f"#{button_id}", Button).disabled = source is None
+        if source is None:
+            message = self._catalog_error or "Выберите публикацию в таблице."
+            self.query_one("#source-summary", Static).update(message)
+            return
+        mode = "Полный" if source.get("collection_mode") == "full" else "Минимальный"
+        title = str(source.get("title") or "").strip()
+        username = str(source.get("username") or "")
+        heading = f"@{username} / {source.get('post_id', '—')}"
+        if title:
+            heading = f"{title} · {heading}"
+        values = (
+            ("Состояние", "Включён" if source.get("enabled") else "Отключён"),
+            ("Сбор профилей", mode),
+            ("Интервал", f"{source.get('interval', '—')} секунд"),
+            ("Последняя", _short_time(source.get("last_checked_at"))),
+            ("Результат", str(source.get("last_result") or "—")),
+            ("Ошибка", str(source.get("last_error") or "—")),
+            ("Кружки", self._count(source.get("download_count"))),
+            ("Профили", self._count(source.get("profile_count"))),
+            ("Фото связанных авторов", self._count(source.get("profile_photo_count"))),
+            (
+                "FFmpeg",
+                f"наборов {self._count(source.get('frame_set_count'))}, "
+                f"кадров {self._count(source.get('frame_count'))}, "
+                f"ошибок {self._count(source.get('frame_failed_count'))}, "
+                f"устарело {self._count(source.get('frame_stale_count'))}",
+            ),
+            ("PSL", self._count(source.get("psl_count"))),
+        )
+        text = Text(heading, style=TEXT)
+        for label, value in values:
+            text.append("\n" + label.ljust(23), style=MUTED)
+            text.append(value, style=TEXT)
+        self.query_one("#source-summary", Static).update(text)
+        self.query_one("#source-toggle", Button).label = (
+            "Отключить" if source.get("enabled") else "Включить"
+        )
+
+    def _cancel_search_timer(self) -> None:
+        if self._search_timer is not None:
+            self._search_timer.stop()
+            self._search_timer = None
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id != "source-search":
+            return
+        self._cancel_search_timer()
+        self._search_timer = self.set_timer(self.SEARCH_DEBOUNCE, self._apply_search)
+
+    def _apply_search(self) -> None:
+        self._search_timer = None
+        value = self.query_one("#source-search", Input).value.strip()
+        if value == self._query:
+            return
+        self._query = value
+        self._reset_query()
+
+    def on_select_changed(self, event: Select.Changed) -> None:
+        value = str(event.value)
+        if event.select.id == "source-filter":
+            enabled = {"all": None, "enabled": True, "disabled": False}.get(value)
+            if value not in {"all", "enabled", "disabled"} or enabled == self._enabled:
+                return
+            self._enabled = enabled
+            self._reset_query()
+        elif event.select.id == "source-sort" and value != self._sort:
+            self._sort = value
+            self._reset_query()
+
+    def _reset_query(self) -> None:
+        self._offset = 0
+        self._selected_source_id = None
+        self._items = []
+        self._total = 0
+        self._render_catalog()
+        self._request_catalog()
+
+    def _request_catalog(self) -> None:
+        self._query_generation += 1
+        if self._request_active:
+            self._pending_reload = True
+            return
+        self._start_catalog_request(self._query_generation)
+
+    def _start_catalog_request(self, generation: int) -> None:
+        self._request_active = True
+        self._pending_reload = False
+        self._loading = True
+        self._catalog_error = ""
+        self._render_pagination()
+        entry_generation = self._entry_generation
+        self.run_worker(
+            self._load_catalog(generation, entry_generation),
+            name="sources-overview",
+            exit_on_error=False,
+        )
+
+    async def _load_catalog(self, generation: int, entry_generation: int) -> None:
+        try:
+            result = await self.hoard_app.api.telegram_sources_overview(
+                limit=self.PAGE_SIZE,
+                offset=self._offset,
+                query=self._query,
+                enabled=self._enabled,
+                sort=self._sort,
+            )
+            if (
+                not self.is_mounted
+                or self.app.screen is not self
+                or generation != self._query_generation
+                or entry_generation != self._entry_generation
+            ):
+                return
+            total = max(0, int(result.get("total") or 0))
+            if total and self._offset >= total:
+                self._offset = ((total - 1) // self.PAGE_SIZE) * self.PAGE_SIZE
+                self._query_generation += 1
+                self._pending_reload = True
+                return
+            self._items = list(result.get("items") or [])
+            self._total = total
+            self._catalog_error = ""
+            self._render_catalog()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if (
+                self.is_mounted
+                and self.app.screen is self
+                and generation == self._query_generation
+                and entry_generation == self._entry_generation
+            ):
+                self._catalog_error = str(exc) or type(exc).__name__
+                self._render_catalog()
+        finally:
+            self._request_active = False
+            self._loading = False
+            if self.is_mounted:
+                self._render_pagination()
+            if (
+                self._pending_reload
+                and self.is_mounted
+                and self.app.screen is self
+            ):
+                self._start_catalog_request(self._query_generation)
+
+    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        if event.data_table.id != "sources-table":
+            return
+        row = event.data_table.cursor_row
+        self._selected_source_id = (
+            self._source_ids[row] if 0 <= row < len(self._source_ids) else None
+        )
+        self._render_summary()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         actions = {
@@ -546,6 +821,9 @@ class TelegramSourcesScreen(_TelegramWorkspaceScreen):
             "source-ai": self._analyze_profiles,
             "source-ai-frames": lambda: self._analyze_profiles("frames"),
             "source-ai-combined": lambda: self._analyze_profiles("combined"),
+            "source-prev": self._previous_page,
+            "source-next": self._next_page,
+            "source-refresh": self.action_refresh_sources,
         }
         action = actions.get(str(event.button.id))
         if action:
@@ -569,11 +847,31 @@ class TelegramSourcesScreen(_TelegramWorkspaceScreen):
         self.hoard_app.ensure_telegram(lambda: self._open_source_dialog(None))
 
     def action_edit_source(self) -> None:
-        source = self.selected_source()
-        if source is None:
+        source_id = self.selected_source_id
+        if source_id is None:
             self.hoard_app.set_notice("Сначала выбери источник.", error=True)
             return
-        self.hoard_app.ensure_telegram(lambda: self._open_source_dialog(source))
+        if self._edit_loading:
+            self.hoard_app.set_notice("Параметры источника уже загружаются.", error=True)
+            return
+        self._edit_loading = True
+        self.run_worker(
+            self._load_source_dialog(source_id),
+            name="source-settings",
+            exit_on_error=False,
+        )
+
+    async def _load_source_dialog(self, source_id: int) -> None:
+        self.hoard_app.set_notice("Загружаем актуальные параметры источника…")
+        try:
+            result = await self.hoard_app.api.telegram_source(source_id)
+        except Exception as exc:
+            self.hoard_app.set_notice(str(exc) or type(exc).__name__, error=True)
+            return
+        finally:
+            self._edit_loading = False
+        if self.is_mounted and self.app.screen is self and self.selected_source_id == source_id:
+            self._open_source_dialog(dict(result["source"]))
 
     def _open_source_dialog(self, source: dict[str, Any] | None) -> None:
         status = self.hoard_app.status or {}
@@ -585,9 +883,7 @@ class TelegramSourcesScreen(_TelegramWorkspaceScreen):
 
     def _source_dialog_closed(self, changed: bool | None) -> None:
         if changed:
-            self.run_worker(
-                self.hoard_app.refresh_status(), name="source-refresh", exit_on_error=False
-            )
+            self._request_catalog()
 
     def _toggle(self) -> None:
         source = self.selected_source()
@@ -597,14 +893,21 @@ class TelegramSourcesScreen(_TelegramWorkspaceScreen):
         source_id = int(source["id"])
         enabled = not bool(source.get("enabled"))
         self.run_worker(
-            self.hoard_app.execute(
-                f"source-toggle:{source_id}",
-                lambda: self.hoard_app.api.set_source_enabled(source_id, enabled),
-                pending="Обновляем состояние источника…",
-            ),
+            self._toggle_source(source_id, enabled),
             name="source-toggle",
             exit_on_error=False,
         )
+
+    async def _toggle_source(self, source_id: int, enabled: bool) -> None:
+        result = await self.hoard_app.execute(
+            f"source-toggle:{source_id}",
+            lambda: self.hoard_app.api.set_source_enabled(source_id, enabled),
+            pending="Обновляем состояние источника…",
+            refresh=False,
+        )
+        if result is not None and self.is_mounted and self.app.screen is self:
+            self._selected_source_id = source_id
+            self._request_catalog()
 
     def action_scan_source(self) -> None:
         source_id = self.selected_source_id
@@ -619,6 +922,7 @@ class TelegramSourcesScreen(_TelegramWorkspaceScreen):
                 f"source-scan:{source_id}",
                 lambda: self.hoard_app.api.scan_source(source_id),
                 pending=f"Назначаем проверку только источника #{source_id}…",
+                refresh=False,
             ),
             name="source-scan",
             exit_on_error=False,
@@ -633,10 +937,35 @@ class TelegramSourcesScreen(_TelegramWorkspaceScreen):
                 "source-scan-all",
                 self.hoard_app.api.scan_all,
                 pending="Назначаем проверку всех включённых источников…",
+                refresh=False,
             ),
             name="source-scan-all",
             exit_on_error=False,
         )
+
+    def _previous_page(self) -> None:
+        if self._loading or self._offset <= 0:
+            return
+        self._offset = max(0, self._offset - self.PAGE_SIZE)
+        self._selected_source_id = None
+        self._items = []
+        self._render_catalog()
+        self._request_catalog()
+
+    def _next_page(self) -> None:
+        if self._loading or self._offset + len(self._items) >= self._total:
+            return
+        self._offset += self.PAGE_SIZE
+        self._selected_source_id = None
+        self._items = []
+        self._render_catalog()
+        self._request_catalog()
+
+    def action_refresh_sources(self) -> None:
+        self._request_catalog()
+
+    def on_app_resize(self) -> None:
+        self._render_catalog()
 
 
 class TelegramWebScreen(_TelegramWorkspaceScreen):

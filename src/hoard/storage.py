@@ -33,6 +33,7 @@ class Store:
               next_at REAL NOT NULL DEFAULT 0, last_error TEXT NOT NULL DEFAULT '',
               title TEXT NOT NULL DEFAULT '', last_checked_at TEXT NOT NULL DEFAULT '',
               last_result TEXT NOT NULL DEFAULT '',
+              collection_mode TEXT NOT NULL DEFAULT 'full',
               UNIQUE(username,post_id)
           );
           CREATE TABLE IF NOT EXISTS downloads (
@@ -69,6 +70,7 @@ class Store:
             "title": "TEXT NOT NULL DEFAULT ''",
             "last_checked_at": "TEXT NOT NULL DEFAULT ''",
             "last_result": "TEXT NOT NULL DEFAULT ''",
+            "collection_mode": "TEXT NOT NULL DEFAULT 'full'",
         }
         for name, declaration in additions.items():
             if name not in columns:
@@ -95,27 +97,23 @@ class Store:
         interval: int = 120,
         *,
         title: str = "",
+        collection_mode: str = "full",
     ) -> int:
-        if not 30 <= interval <= 86400:
-            raise ValueError("Интервал должен быть от 30 секунд до 24 часов")
-        if not output.strip():
-            raise ValueError("Укажи каталог для архива")
-        directory = Path(output).expanduser().resolve()
-        if directory.exists() and not directory.is_dir():
-            raise ValueError("Путь архива должен указывать на каталог")
+        directory = self._validate_source_settings(output, interval)
+        mode = self._collection_mode(collection_mode)
         # No directory is created on add, so typos don't create unused directories.
         with self.db:
-            self.db.execute("""INSERT INTO sources(username,post_id,url,output,interval,title)
-              VALUES(?,?,?,?,?,?) ON CONFLICT(username,post_id)
-              DO UPDATE SET output=excluded.output, interval=excluded.interval,
-              title=CASE WHEN excluded.title='' THEN sources.title ELSE excluded.title END,
-              enabled=1, next_at=0""", (
+            self.db.execute("""INSERT INTO sources(
+              username,post_id,url,output,interval,title,collection_mode)
+              VALUES(?,?,?,?,?,?,?) ON CONFLICT(username,post_id)
+              DO NOTHING""", (
                 post.username,
                 post.message_id,
                 post.link,
                 str(directory),
                 interval,
                 title.strip()[:200],
+                mode,
             ))
         row = self.db.execute(
             "SELECT id FROM sources WHERE username=? AND post_id=?",
@@ -124,6 +122,233 @@ class Store:
         self.telegram.ensure_archive_root(directory)
         self.telegram.set_catalog_dirty()
         return int(row["id"])
+
+    @staticmethod
+    def _collection_mode(value: object) -> str:
+        mode = str(value or "").strip().lower()
+        if mode not in {"full", "minimal"}:
+            raise ValueError("Режим сбора профилей должен быть full или minimal")
+        return mode
+
+    @staticmethod
+    def _validate_source_settings(output: str, interval: int) -> Path:
+        if not 30 <= int(interval) <= 86400:
+            raise ValueError("Интервал должен быть от 30 секунд до 24 часов")
+        if not str(output).strip():
+            raise ValueError("Укажи каталог для архива")
+        directory = Path(output).expanduser().resolve()
+        if directory.exists() and not directory.is_dir():
+            raise ValueError("Путь архива должен указывать на каталог")
+        return directory
+
+    def update_source(
+        self,
+        source_id: int,
+        *,
+        title: str,
+        output: str,
+        interval: int,
+        collection_mode: str,
+    ) -> dict:
+        """Update local source settings without changing identity or scheduling state."""
+        directory = self._validate_source_settings(output, interval)
+        mode = self._collection_mode(collection_mode)
+        with self.db:
+            cursor = self.db.execute(
+                """UPDATE sources SET title=?,output=?,interval=?,collection_mode=?
+                WHERE id=?""",
+                (title.strip()[:200], str(directory), int(interval), mode, int(source_id)),
+            )
+            if cursor.rowcount == 0:
+                raise ValueError("Источник не найден")
+        self.telegram.ensure_archive_root(directory)
+        self.telegram.set_catalog_dirty()
+        source = self.source(int(source_id))
+        assert source is not None
+        return source
+
+    def source_settings(self, source_id: int) -> dict | None:
+        """Return one editable source record without archive/media details."""
+        row = self.db.execute(
+            """SELECT id,username,post_id,url,title,output,interval,enabled,
+            collection_mode,last_id,next_at FROM sources WHERE id=?""",
+            (int(source_id),),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    @staticmethod
+    def _overview_text(value: object, max_bytes: int = 56) -> str:
+        """Keep a UTF-8-safe presentation snippet inside the bounded IPC page."""
+        text = str(value or "")
+        encoded = text.encode("utf-8")
+        if len(encoded) <= max_bytes:
+            return text
+        return encoded[: max_bytes - 3].decode("utf-8", errors="ignore") + "…"
+
+    def telegram_sources_overview(
+        self,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+        query: str = "",
+        enabled: bool | None = None,
+        sort: str = "id_desc",
+    ) -> dict:
+        """Return one bounded source page plus batch-computed publication statistics."""
+        page_limit = int(limit)
+        page_offset = int(offset)
+        if not 1 <= page_limit <= 100:
+            raise ValueError("limit должен быть от 1 до 100")
+        if page_offset < 0:
+            raise ValueError("offset не может быть отрицательным")
+        needle = str(query or "").strip()
+        if len(needle) > 200:
+            raise ValueError("Поисковый запрос не должен превышать 200 символов")
+        order_by = {
+            "id_desc": "s.id DESC",
+            "id_asc": "s.id ASC",
+            "last_checked_desc": "s.last_checked_at DESC,s.id DESC",
+            "last_checked_asc": "s.last_checked_at ASC,s.id ASC",
+            "downloads_desc": "download_count DESC,s.id DESC",
+            "downloads_asc": "download_count ASC,s.id ASC",
+        }.get(str(sort))
+        if order_by is None:
+            raise ValueError("Неизвестный порядок сортировки источников")
+
+        clauses = ["1=1"]
+        parameters: list[object] = []
+        if enabled is not None:
+            clauses.append("s.enabled=?")
+            parameters.append(int(enabled))
+        if needle:
+            folded = needle.casefold()
+            pattern = f"%{folded}%"
+            username_pattern = f"%{folded.lstrip('@')}%"
+            clauses.append(
+                """(lower(s.username) LIKE ? OR lower(s.title) LIKE ? OR
+                CAST(s.post_id AS TEXT) LIKE ? OR lower(s.url) LIKE ?)"""
+            )
+            parameters.extend((username_pattern, pattern, pattern, pattern))
+        where = " AND ".join(clauses)
+        total = int(
+            self.db.execute(
+                f"SELECT COUNT(*) FROM sources s WHERE {where}", parameters
+            ).fetchone()[0]
+        )
+        source_fields = """s.id,s.username,s.post_id,s.url,s.title,s.interval,s.enabled,
+            s.collection_mode,s.last_checked_at,s.last_result,s.last_error"""
+        if str(sort).startswith("downloads_"):
+            page_query = f"""SELECT {source_fields},COUNT(d.message_id) AS download_count
+                FROM sources s LEFT JOIN downloads d ON d.source_id=s.id
+                WHERE {where} GROUP BY s.id ORDER BY {order_by} LIMIT ? OFFSET ?"""
+        else:
+            page_query = f"""SELECT {source_fields},0 AS download_count FROM sources s
+                WHERE {where} ORDER BY {order_by} LIMIT ? OFFSET ?"""
+        page = [
+            dict(row)
+            for row in self.db.execute(
+                page_query,
+                (*parameters, page_limit, page_offset),
+            )
+        ]
+        for item in page:
+            for field in (
+                "username",
+                "url",
+                "title",
+                "last_checked_at",
+                "last_result",
+                "last_error",
+            ):
+                item[field] = self._overview_text(item.get(field))
+        source_ids = [int(item["id"]) for item in page]
+        if source_ids:
+            placeholders = ",".join("?" for _ in source_ids)
+            download_stats = {
+                int(row["source_id"]): int(row["download_count"])
+                for row in self.db.execute(
+                    f"""SELECT source_id,COUNT(*) AS download_count FROM downloads
+                    WHERE source_id IN ({placeholders}) GROUP BY source_id""",
+                    source_ids,
+                )
+            }
+            profile_stats = {
+                int(row["source_id"]): dict(row)
+                for row in self.db.execute(
+                    f"""SELECT links.source_id,COUNT(DISTINCT links.author_id) AS profile_count,
+                    COUNT(DISTINCT CASE WHEN photos.status='saved' THEN
+                        links.author_id || ':' || photos.photo_id END) AS profile_photo_count
+                    FROM tg_profile_sources links
+                    LEFT JOIN tg_profile_photos photos ON photos.author_id=links.author_id
+                    WHERE links.source_id IN ({placeholders}) GROUP BY links.source_id""",
+                    source_ids,
+                )
+            }
+            frame_stats = {
+                int(row["source_id"]): dict(row)
+                for row in self.db.execute(
+                    f"""SELECT sets.source_id,
+                    COUNT(DISTINCT CASE WHEN sets.status='saved'
+                        THEN sets.message_id END) AS frame_set_count,
+                    COUNT(frames.position) AS frame_count,
+                    COUNT(DISTINCT CASE WHEN sets.status='failed'
+                        THEN sets.message_id END) AS frame_failed_count,
+                    COUNT(DISTINCT CASE WHEN sets.status='stale'
+                        THEN sets.message_id END) AS frame_stale_count
+                    FROM tg_video_frame_sets sets
+                    LEFT JOIN tg_video_frames frames
+                      ON frames.source_id=sets.source_id
+                     AND frames.message_id=sets.message_id
+                    WHERE sets.source_id IN ({placeholders}) GROUP BY sets.source_id""",
+                    source_ids,
+                )
+            }
+            psl_stats = {
+                int(row["source_id"]): int(row["psl_count"])
+                for row in self.db.execute(
+                    f"""WITH source_links(source_id,analysis_id) AS (
+                      SELECT batches.source_id,items.analysis_id
+                      FROM ai_telegram_batches batches
+                      JOIN ai_telegram_batch_items items ON items.batch_id=batches.id
+                      WHERE batches.source_id IN ({placeholders})
+                        AND items.analysis_id IS NOT NULL
+                      UNION
+                      SELECT video_source_id,id FROM ai_telegram_analyses
+                      WHERE video_source_id IN ({placeholders})
+                      UNION
+                      SELECT source_id,analysis_id FROM ai_telegram_analysis_photos
+                      WHERE source_id IN ({placeholders})
+                    )
+                    SELECT links.source_id,COUNT(DISTINCT links.analysis_id) AS psl_count
+                    FROM source_links links
+                    JOIN ai_telegram_analyses analyses ON analyses.id=links.analysis_id
+                    JOIN ai_attempts attempts ON attempts.id=analyses.attempt_id
+                    WHERE attempts.state='completed' AND analyses.result_status='completed'
+                    GROUP BY links.source_id""",
+                    (*source_ids, *source_ids, *source_ids),
+                )
+            }
+            for item in page:
+                source_id = int(item["id"])
+                profiles = profile_stats.get(source_id, {})
+                frames = frame_stats.get(source_id, {})
+                item.update(
+                    download_count=int(download_stats.get(source_id, 0)),
+                    profile_count=int(profiles.get("profile_count") or 0),
+                    profile_photo_count=int(profiles.get("profile_photo_count") or 0),
+                    frame_set_count=int(frames.get("frame_set_count") or 0),
+                    frame_count=int(frames.get("frame_count") or 0),
+                    frame_failed_count=int(frames.get("frame_failed_count") or 0),
+                    frame_stale_count=int(frames.get("frame_stale_count") or 0),
+                    psl_count=int(psl_stats.get(source_id, 0)),
+                )
+        return {
+            "items": page,
+            "total": total,
+            "limit": page_limit,
+            "offset": page_offset,
+            "has_more": page_offset + len(page) < total,
+        }
 
     def sources(self) -> list[dict]:
         return [

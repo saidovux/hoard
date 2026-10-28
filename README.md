@@ -1,9 +1,25 @@
-# Hoard 0.7.4.1
+# Hoard 0.7.4.2
 
 Hoard is a local-first Linux and Windows archive for Telegram posts, profiles and video notes
 found in a channel post's comments. It uses Telethon, SQLite, an autonomous offline HTML catalog
 and terminal interfaces. A private background daemon performs all Telegram work; closing an
 interface does not stop downloads.
+
+The 0.7.4.2 release turns **Telegram → Источники** into a paginated publication catalog backed by
+the dedicated `telegram_sources_overview` IPC operation. Search, enabled-state filtering and
+stable sorting run in SQLite before the bounded 50-row page is returned. Each row and its compact
+selection summary use publication-scoped download/profile/frame counts; PSL counts include only
+unique analyses with a confirmed source link, a completed AI attempt and
+`result_status='completed'`. No Telegram lookup, file scan, FFmpeg or periodic heavy refresh is
+performed by the catalog.
+
+Each source now stores `collection_mode=full|minimal`; existing rows migrate to `full`. Full mode
+retains automatic profile-photo scheduling. Minimal mode still saves ordinary message identity,
+the author/source relation and video notes, but performs no extra sender lookup and schedules no
+new automatic photo job on that source's behalf. Shared authors remain global: any related full
+source may schedule the one deduplicated photo job, while legacy profiles without source links
+retain enrichment compatibility. Editing uses stable source ID and cannot change its post,
+enable a disabled source, reset its checkpoint/next run or delete historical archive data.
 
 The 0.7.4.1 release turns **Telegram → Статус** into a compact monitoring page. Its live area
 polls only bounded `status_brief` data while visible; its archive statistics use a separate
@@ -213,14 +229,16 @@ group, **Telegram** and **AI**. Opening Telegram switches the same sidebar to it
 profiles, jobs, catalog actions and the complete video-frame workflow.
 
 Telegram Status owns collector start/pause/stop, a live current-work summary, and archive
-statistics refreshed only on entry or request;
-Sources keeps validation, editing, selected/global scans and publication-scoped PSL actions.
+statistics refreshed only on entry or request. Sources is a paginated local catalog with search,
+enabled-state filtering, stable sorting, editing, selected/global scans and publication-scoped PSL
+actions.
 Login reuses the daemon authorization flow, shows cached public account details, and separates a
 saved but unverified session from a verified live connection. Web Viewer starts/opens/stops only
 the separate loopback process. All operations use private daemon IPC; the TUI never opens SQLite
 or creates a Telegram client. Visible Home and Telegram Status each own a bounded compact-status
-timer only while on screen. Detailed source/archive data is fetched on entry; Web readiness is
-checked once on first entry to the Telegram workspace. See `docs/TUI.md`.
+timer only while on screen. Archive details are fetched on entry; Sources uses its dedicated
+bounded IPC without polling. Web readiness is checked once on first entry to the Telegram
+workspace. See `docs/TUI.md`.
 
 The interface keeps the entire Textual surface, including navigation, focus, hover, palette and
 help modal states, on `#000000`. Text is white, secondary text `#888888`, frames `#7B4B23`,
@@ -260,7 +278,7 @@ For development, install the test tools with `python -m pip install -e '.[dev]'`
 
 An upgrade keeps the existing XDG configuration, database, Telegram session and archive.
 If an older daemon is still running, execute `hoard shutdown` before starting the upgraded
-installation. The 0.7.4.1 client accepts only a daemon reporting the same application version and
+installation. The 0.7.4.2 client accepts only a daemon reporting the same application version and
 IPC protocol `1`; it reports the mismatch instead of starting a competing service. If a matching
 daemon already owns the service lock but is still initializing, clients wait for it and show a
 specific startup diagnostic.
@@ -313,12 +331,16 @@ Open **Telegram → Источники** → **Добавить**. The wizard:
 2. connects Telegram if needed and verifies that the account can access the post;
 3. asks for the archive folder;
 4. uses a 120-second interval or lets you enter 30–86400 seconds;
-5. saves or updates the source, schedules its nearest check and offers to start the collector.
+5. chooses full or minimal profile collection;
+6. saves the new source, schedules its nearest check and offers to start the collector.
 
 **Проверить выбранный** queues only the highlighted post and uses the same unique job key as the
 scheduler, so repeated presses cannot create parallel duplicate scans. **Проверить все** keeps the
-existing global behavior. Editing preserves the current archive directory until it is explicitly
-changed and never moves or deletes existing files.
+existing global behavior. Editing is a separate local operation: the post URL is immutable, while
+title, archive directory, interval and collection mode may change. It preserves enabled state,
+checkpoint and next run and never moves or deletes existing files. Full collection schedules the
+existing bounded profile-photo checks. Minimal collection saves visible sender identity and the
+source relation but performs no additional profile lookup or automatic photo scheduling.
 
 Hoard reads the linked comment thread and stores Telegram round video messages. Each MP4 gets a
 JSON sidecar containing the source post, comment link, message ID, date and the visible sender

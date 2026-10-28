@@ -270,9 +270,74 @@ OptionList > .option-list--separator {
     min-height: 9;
 }
 
+#source-summary-panel {
+    height: auto;
+    margin-top: 1;
+}
+
+#source-filters {
+    width: 100%;
+    height: 3;
+    margin-bottom: 1;
+}
+
+#source-search {
+    width: 1fr;
+}
+
+#source-filter {
+    width: 18;
+    margin-left: 2;
+}
+
+#source-sort {
+    width: 24;
+    margin-left: 2;
+}
+
 #sources-table {
     height: 1fr;
     min-height: 3;
+}
+
+#source-pagination {
+    width: 100%;
+    height: 1;
+    margin-top: 1;
+}
+
+#source-range {
+    width: 1fr;
+    height: 1;
+    color: #888888;
+}
+
+#source-pagination Button {
+    margin-left: 3;
+}
+
+#source-summary {
+    height: auto;
+    min-height: 1;
+    margin-bottom: 1;
+}
+
+.short #sources-panel {
+    height: auto;
+}
+
+.short #sources-table, .tiny #sources-table {
+    height: 5;
+}
+
+.compact #source-filters {
+    layout: vertical;
+    height: 9;
+}
+
+.compact #source-search, .compact #source-filter, .compact #source-sort {
+    width: 100%;
+    margin-left: 0;
 }
 
 /* ── Archive ────────────────────────────────────────────────────────────── */
@@ -388,7 +453,7 @@ Button:disabled {
 }
 
 #source-actions {
-    grid-size: 6;
+    grid-size: 5;
 }
 
 #web-actions {
@@ -808,6 +873,11 @@ PaletteScreen {
 }
 
 .dialog Input {
+    width: 100%;
+    margin-bottom: 0;
+}
+
+.dialog Select {
     width: 100%;
     margin-bottom: 0;
 }

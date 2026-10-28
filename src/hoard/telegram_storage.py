@@ -1594,6 +1594,27 @@ class TelegramStorage:
             )
         ]
 
+    def enrichment_profile_photo_ids(self) -> list[int]:
+        """Return due profiles allowed by at least one full source or legacy ownership."""
+        return [
+            int(row["author_id"])
+            for row in self.db.execute(
+                """SELECT profiles.author_id FROM tg_profiles profiles
+                WHERE profiles.photos_retry_at<=? AND (
+                  NOT EXISTS (
+                    SELECT 1 FROM tg_profile_sources links
+                    WHERE links.author_id=profiles.author_id
+                  ) OR EXISTS (
+                    SELECT 1 FROM tg_profile_sources links
+                    JOIN sources ON sources.id=links.source_id
+                    WHERE links.author_id=profiles.author_id
+                      AND sources.collection_mode='full'
+                  )
+                ) ORDER BY profiles.photos_retry_at,profiles.author_id""",
+                (time.time(),),
+            )
+        ]
+
     def profile_photo_due(self, author_id: int) -> bool:
         row = self.db.execute(
             "SELECT photos_retry_at FROM tg_profiles WHERE author_id=?", (int(author_id),)

@@ -21,7 +21,7 @@ background service.
   reusable widgets and TCSS remain separate. The package imports neither storage nor Telethon, and
   never creates a Telegram client. See `docs/TUI.md`.
 - `ipc.py` starts the daemon detached when required and sends one JSON request per private
-  Unix-socket connection. Client and daemon must both report Hoard 0.7.4.1 and IPC protocol `1`.
+  Unix-socket connection. Client and daemon must both report Hoard 0.7.4.2 and IPC protocol `1`.
   A held instance lock with no ready socket means initialization is in progress, so the client
   waits for that owner instead of spawning a second daemon.
 - `service.py` owns the database, three independently limited job runners and the sole
@@ -92,9 +92,11 @@ both request bounded `status_brief` snapshots through the app's single in-flight
 Telegram monitor uses only that snapshot, updates changed content without rebuilding navigation,
 and clears transfer slots when the collector stops or IPC becomes unavailable. Telegram Status
 loads archival aggregates separately through read-only `telegram_statistics_get` on entry or
-manual refresh, never from its live timer. Archive and
-Telegram Sources request detailed status only when opened; recent collections are bounded and an oversized
-compatibility response is explicitly truncated before the 64 KiB IPC boundary. Screen suspension, unmount and app exit
+manual refresh, never from its live timer. Archive requests detailed status only when opened;
+recent collections are bounded and an oversized compatibility response is explicitly truncated
+before the 64 KiB IPC boundary. Telegram Sources uses its own bounded
+`telegram_sources_overview` request and does not depend on that compatibility array. Screen
+suspension, unmount and app exit
 stop their timers. IPC startup and request errors render inside the stable black workspace so a slow
 or unavailable daemon never produces an unexplained empty screen. Exiting the client sends no
 collector, frame-stop, shutdown or Telegram command; previously started frame/Web work stays alive.
@@ -188,6 +190,11 @@ leaves files and `sources.last_id` untouched. Unique constraints make the operat
 Old media may stay outside `telegram/`; the report emits a relative path or a `file:` URI when
 Windows drives differ. It never creates an implicit second media archive.
 
+`sources.collection_mode` is an additive non-null column with default `full`, so every historical
+source preserves the old collection policy. `source_update` changes only title, output, interval
+and this validated mode by stable ID; username/post identity, enabled state, `last_id`, `next_at`,
+relations and archive rows are untouched. A different post is always a new source.
+
 Every successful video-note checkpoint writes a `tg_video_frame_sets` row and one durable
 `telegram.video_frames` job in state `waiting` in the same SQLite transaction. Waiting records show
 what still needs work but carry no permission to execute. Daemon/TUI startup, download completion,
@@ -247,6 +254,15 @@ does not reuse the global `scan` command and cannot create a second queued/runni
 selected post. The status response includes bounded profile summaries with photo/source counts so
 the TUI never needs direct database access.
 
+`telegram_sources_overview` validates a maximum 100-row page, non-negative offset, a bounded search
+string, nullable enabled filter and a closed sort whitelist. It first selects the source page, then
+batch-aggregates only those IDs from `downloads`, `tg_profile_sources`, shared profile photos and
+frame tables. PSL attribution unions confirmed `ai_telegram_batches.source_id`,
+`ai_telegram_analyses.video_source_id` and analysis-image `source_id`, counts distinct analysis IDs,
+and accepts only completed attempts with a completed domain result. Author membership alone never
+attributes PSL to a publication. The response contains no media rows, result JSON, credentials or
+archive file paths and stays under the existing 64 KiB IPC limit.
+
 Profile photo enumeration is capped at 30 per check. Saved Telegram photo IDs prevent duplicate
 downloads. Telegram may expose an animated avatar through `video_sizes`; Hoard downloads the
 largest still `PhotoSize` sibling instead, so the `.jpg` file is decodable by the HTML gallery.
@@ -256,6 +272,12 @@ failures without rewinding any source checkpoint. Privacy/RPC failures and Flood
 are recorded on the profile and do not fail the source scan. Authorization loss, inaccessible
 peers, privacy/access restrictions, FloodWait and network failures have distinct retry classes;
 local filesystem write failures fail the photo job and are never mislabeled as network trouble.
+A full source keeps the existing due-photo scheduling. A minimal source observes only identity
+already carried by the message (including stable sender ID), records `tg_profile_sources` and
+downloads the video note, but neither resolves a missing sender nor creates a photo job. Global
+enrichment selects a due author only when at least one linked source is full; profiles with no
+source relation keep the legacy policy. Existing queued work and saved shared photos are retained,
+and the active unique key still deduplicates an author shared by minimal and full sources.
 A Telegram transfer with no **increasing received-byte counter** for two minutes is cancelled as
 a retryable network stall; repeated callbacks that report the same count do not refresh the timer,
 so a dropped connection cannot leave one scan task alive forever. Cancellation is awaited until

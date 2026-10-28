@@ -11,7 +11,7 @@ from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, VerticalScroll
 from textual.screen import ModalScreen
-from textual.widgets import Button, Input, Label, Static
+from textual.widgets import Button, Input, Label, Select, Static
 from textual.worker import Worker
 
 from .api import AuthResult, HoardAPI, SourceValidation
@@ -306,7 +306,7 @@ class AuthDialog(ModalScreen[bool]):
 
 
 class SourceDialog(ModalScreen[bool]):
-    """Validate, configure and upsert one Telegram source."""
+    """Validate and create, or locally update, one Telegram source."""
 
     BINDINGS = [Binding("escape", "cancel", "Отмена")]
 
@@ -321,7 +321,7 @@ class SourceDialog(ModalScreen[bool]):
         self.api = api
         self.source = source
         self.default_output = default_output
-        self.step = "link"
+        self.step = "parameters" if source is not None else "link"
         self.validation: SourceValidation | None = None
         self._busy = False
         self._worker: Worker[Any] | None = None
@@ -350,6 +350,13 @@ class SourceDialog(ModalScreen[bool]):
             yield Input(value=str(source.get("output") or self.default_output), id="source-output")
             yield Label("Интервал, секунд", id="source-interval-label", classes="field-label")
             yield Input(value=str(source.get("interval") or 120), id="source-interval")
+            yield Label("Сбор профилей", id="source-mode-label", classes="field-label")
+            yield Select(
+                (("Полный", "full"), ("Минимальный", "minimal")),
+                value=str(source.get("collection_mode") or "full"),
+                allow_blank=False,
+                id="source-mode",
+            )
             yield Static(id="source-error", classes="dialog-error")
             with Horizontal(classes="dialog-actions"):
                 yield Button("Проверить доступ", id="source-primary", variant="primary")
@@ -359,14 +366,19 @@ class SourceDialog(ModalScreen[bool]):
 
     def on_mount(self) -> None:
         self._show_step()
-        self.query_one("#source-url", Input).focus()
+        if self.source is None:
+            self.query_one("#source-url", Input).focus()
+        else:
+            self.query_one("#source-title", Input).focus()
 
     def _show_step(self) -> None:
         parameters = self.step in {"parameters", "done"}
-        for field in ("source-title", "source-output", "source-interval"):
+        for field in ("source-title", "source-output", "source-interval", "source-mode"):
             self.query_one(f"#{field}").display = parameters
             self.query_one(f"#{field}-label").display = parameters
-        self.query_one("#source-url", Input).disabled = self.step == "done"
+        self.query_one("#source-url", Input).disabled = (
+            self.source is not None or self.step == "done"
+        )
         primary = self.query_one("#source-primary", Button)
         primary.disabled = self._busy
         primary.label = {
@@ -374,8 +386,12 @@ class SourceDialog(ModalScreen[bool]):
             "parameters": "Сохранить",
             "done": "Закрыть",
         }[self.step]
-        self.query_one("#source-back", Button).display = self.step == "parameters"
-        self.query_one("#source-start", Button).display = self.step == "done"
+        self.query_one("#source-back", Button).display = (
+            self.source is None and self.step == "parameters"
+        )
+        self.query_one("#source-start", Button).display = (
+            self.source is None and self.step == "done"
+        )
         self.query_one("#source-cancel", Button).label = (
             "Закрыть" if self.step == "done" else "Отмена"
         )
@@ -455,18 +471,37 @@ class SourceDialog(ModalScreen[bool]):
         output = self.query_one("#source-output", Input).value.strip()
         title = self.query_one("#source-title", Input).value.strip()
         raw_interval = self.query_one("#source-interval", Input).value.strip()
+        collection_mode = str(self.query_one("#source-mode", Select).value or "full")
         try:
             interval = int(raw_interval)
         except ValueError as exc:
             raise ValueError("Интервал должен быть целым числом секунд.") from exc
-        result = await self.api.add_source(url, output, interval, title=title)
+        if self.source is None:
+            result = await self.api.add_source(
+                url,
+                output,
+                interval,
+                title=title,
+                collection_mode=collection_mode,
+            )
+        else:
+            result = await self.api.update_source(
+                int(self.source["id"]),
+                title=title,
+                output=output,
+                interval=interval,
+                collection_mode=collection_mode,
+            )
         if not self.is_mounted:
             return
         self.step = "done"
         message = str(result.get("message") or "Источник сохранён")
-        self.query_one("#source-message", Static).update(
-            message + "\nИсточник уже назначен на ближайшую проверку; отдельный дубль не создан."
+        suffix = (
+            "\nИсточник уже назначен на ближайшую проверку; отдельный дубль не создан."
+            if self.source is None
+            else "\nСостояние, checkpoint и расписание источника сохранены."
         )
+        self.query_one("#source-message", Static).update(message + suffix)
         self._show_step()
 
     async def _start_collector(self) -> None:

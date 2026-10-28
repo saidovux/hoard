@@ -52,7 +52,35 @@ class HoardAPI(Protocol):
     async def validate_source(self, url: str) -> SourceValidation: ...
 
     async def add_source(
-        self, url: str, output: str, interval: int, *, title: str = ""
+        self,
+        url: str,
+        output: str,
+        interval: int,
+        *,
+        title: str = "",
+        collection_mode: str = "full",
+    ) -> dict[str, Any]: ...
+
+    async def update_source(
+        self,
+        source_id: int,
+        *,
+        title: str,
+        output: str,
+        interval: int,
+        collection_mode: str,
+    ) -> dict[str, Any]: ...
+
+    async def telegram_source(self, source_id: int) -> dict[str, Any]: ...
+
+    async def telegram_sources_overview(
+        self,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+        query: str = "",
+        enabled: bool | None = None,
+        sort: str = "id_desc",
     ) -> dict[str, Any]: ...
 
     async def set_source_enabled(self, source_id: int, enabled: bool) -> dict[str, Any]: ...
@@ -151,12 +179,68 @@ class IPCStatusAPI:
         return await request("source_validate", {"url": url}, timeout=self.NETWORK_TIMEOUT)
 
     async def add_source(
-        self, url: str, output: str, interval: int, *, title: str = ""
+        self,
+        url: str,
+        output: str,
+        interval: int,
+        *,
+        title: str = "",
+        collection_mode: str = "full",
     ) -> dict[str, Any]:
         return await request(
             "source_add",
-            {"url": url, "output": output, "interval": interval, "title": title},
+            {
+                "url": url,
+                "output": output,
+                "interval": interval,
+                "title": title,
+                "collection_mode": collection_mode,
+            },
             timeout=self.CONTROL_TIMEOUT,
+        )
+
+    async def update_source(
+        self,
+        source_id: int,
+        *,
+        title: str,
+        output: str,
+        interval: int,
+        collection_mode: str,
+    ) -> dict[str, Any]:
+        return await request(
+            "source_update",
+            {
+                "id": source_id,
+                "title": title,
+                "output": output,
+                "interval": interval,
+                "collection_mode": collection_mode,
+            },
+            timeout=self.CONTROL_TIMEOUT,
+        )
+
+    async def telegram_source(self, source_id: int) -> dict[str, Any]:
+        return await self.telegram_call("telegram_source_get", {"id": source_id})
+
+    async def telegram_sources_overview(
+        self,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+        query: str = "",
+        enabled: bool | None = None,
+        sort: str = "id_desc",
+    ) -> dict[str, Any]:
+        return await self.telegram_call(
+            "telegram_sources_overview",
+            {
+                "limit": limit,
+                "offset": offset,
+                "query": query,
+                "enabled": enabled,
+                "sort": sort,
+            },
         )
 
     async def set_source_enabled(self, source_id: int, enabled: bool) -> dict[str, Any]:

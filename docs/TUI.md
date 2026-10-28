@@ -46,7 +46,7 @@ nested Sources page.
 | Hoard | **Telegram** | entry into the Telegram workspace; defaults to Status |
 | Hoard | **AI** | existing provider settings, records and chat |
 | Telegram | **Статус** | live collector work plus read-only archive, FFmpeg-frame and PSL aggregates |
-| Telegram | **Источники** | table plus add/edit/toggle/selected/global scan and publication-scoped photo/frame PSL actions |
+| Telegram | **Источники** | paginated publication catalog, local search/filter/sort, stable edit/toggle/scan and publication-scoped photo/frame PSL actions |
 | Telegram | **Web Viewer** | actual loopback-process state and enable/open/disable actions |
 | Telegram | **Вход** | saved-session/live-connection state, cached public account data and the existing authorization dialog |
 
@@ -92,8 +92,9 @@ neutral when state cannot be established.
   sidebar, moves its highlight or steals a field's focus.
 * Opening an AI conversation hides the list workspace, gives the message field focus and scrolls
   the conversation to its top. Returning restores the list and focus.
-* Archive and Telegram Sources tables preserve the selected record across status refreshes, terminal
-  resizes and profile multi-selection.
+* Archive and Telegram Sources tables preserve the selected record across refreshes and terminal
+  resizes. Sources keys records by stable `sources.id`; a changed query clears an obsolete
+  selection before any action can use it.
 
 The Home wordmark comes in two sizes (`widgets/hero.py`): six rows when the terminal is at least
 30 rows tall and 76 columns wide, three rows below that, and none under 22 rows — the header
@@ -128,6 +129,28 @@ remaining work stays `—`. The lower panel is an archival snapshot: all/enabled
 media and profile photos, unique profiles, exact saved frame sets and rows, frame-job states, and
 PSL outcomes linked to actual analyses. FFmpeg activity and its explicit processing mode are
 display-only. Refreshing statistics cannot start Telegram, FFmpeg, Web or AI work.
+
+## Telegram Sources
+
+Sources is a bounded catalog rather than a rendering of compatibility `status.sources`. On entry,
+explicit refresh and mutations it requests at most 50 rows through `telegram_sources_overview`;
+the daemon caps every request at 100. Search covers saved username, title, post ID and post URL.
+The all/enabled/disabled filter and the added/last-check/download-count sort are applied in SQLite
+before pagination. Search uses a 300 ms debounce, requests are serialized, and generation checks
+discard stale results or replies that arrive after leaving the page. There is no polling timer.
+
+Wide terminals show source, state, video notes, unique linked profiles, successfully saved FFmpeg
+sets, confirmed PSL analyses and last check. Medium terminals keep source, video notes, profiles
+and state; narrow terminals keep source and video notes. The selected-source panel adds interval,
+collection mode, last result/error, photos of linked authors, actual frame rows and separate
+failed/stale set counts. It is intentionally a summary, not the Round 5 media/profile viewer.
+
+Creation retains the access-validation wizard. Editing first reads the current source by stable ID,
+keeps the link immutable and calls `source_update` locally; enabled state, checkpoint, next run and
+historical relations/media are unchanged. `Полный` schedules the existing profile-photo workflow.
+`Минимальный` stores ordinary message identity and author/source links but does not fetch missing
+sender details or schedule new automatic photo work. A shared author can still be scheduled once by
+another full source. Existing photos are never copied or removed.
 
 ## Keyboard
 

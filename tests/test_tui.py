@@ -148,7 +148,15 @@ def status_fixture(*, total: int | None = 4096) -> dict[str, Any]:
                 "output": "/tmp/archive",
                 "interval": 120,
                 "enabled": 1,
+                "collection_mode": "full",
                 "download_count": 31,
+                "profile_count": 14,
+                "profile_photo_count": 9,
+                "frame_set_count": 5,
+                "frame_count": 13,
+                "frame_failed_count": 0,
+                "frame_stale_count": 0,
+                "psl_count": 8,
                 "last_checked_at": "2026-10-21 10:12:13",
                 "last_result": "Проверено: 17",
                 "last_error": "",
@@ -297,12 +305,115 @@ class FakeAPI:
             },
         )
 
-    async def add_source(self, url: str, output: str, interval: int, *, title: str = "") -> dict:
+    async def add_source(
+        self,
+        url: str,
+        output: str,
+        interval: int,
+        *,
+        title: str = "",
+        collection_mode: str = "full",
+    ) -> dict:
         return await self._operation(
             "add_source",
-            {"url": url, "output": output, "interval": interval, "title": title},
+            {
+                "url": url,
+                "output": output,
+                "interval": interval,
+                "title": title,
+                "collection_mode": collection_mode,
+            },
             {"message": "Источник сохранён"},
         )
+
+    async def update_source(
+        self,
+        source_id: int,
+        *,
+        title: str,
+        output: str,
+        interval: int,
+        collection_mode: str,
+    ) -> dict:
+        source = next(item for item in self.result["sources"] if item["id"] == source_id)
+        source.update(
+            title=title,
+            output=output,
+            interval=interval,
+            collection_mode=collection_mode,
+        )
+        return await self._operation(
+            "update_source",
+            {
+                "id": source_id,
+                "title": title,
+                "output": output,
+                "interval": interval,
+                "collection_mode": collection_mode,
+            },
+            {"message": "Параметры источника обновлены", "source": dict(source)},
+        )
+
+    async def telegram_source(self, source_id: int) -> dict:
+        source = next(item for item in self.result["sources"] if item["id"] == source_id)
+        return await self._operation(
+            "telegram_source_get", {"id": source_id}, {"source": dict(source)}
+        )
+
+    async def telegram_sources_overview(
+        self,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+        query: str = "",
+        enabled: bool | None = None,
+        sort: str = "id_desc",
+    ) -> dict:
+        parameters = {
+            "limit": limit,
+            "offset": offset,
+            "query": query,
+            "enabled": enabled,
+            "sort": sort,
+        }
+        queued = self.responses.get("telegram_sources_overview", [])
+        if queued:
+            return await self._operation("telegram_sources_overview", parameters)
+        needle = query.casefold()
+        items = [
+            dict(item)
+            for item in self.result.get("sources", [])
+            if (enabled is None or bool(item.get("enabled")) is enabled)
+            and (
+                not needle
+                or needle in str(item.get("username") or "").casefold()
+                or needle in str(item.get("title") or "").casefold()
+                or needle in str(item.get("post_id") or "").casefold()
+                or needle in str(item.get("url") or "").casefold()
+            )
+        ]
+        if sort == "downloads_desc":
+            items.sort(
+                key=lambda item: (int(item.get("download_count") or 0), item["id"]),
+                reverse=True,
+            )
+        elif sort == "last_checked_desc":
+            items.sort(
+                key=lambda item: (str(item.get("last_checked_at") or ""), item["id"]),
+                reverse=True,
+            )
+        else:
+            items.sort(key=lambda item: item["id"], reverse=True)
+        total = len(items)
+        page = items[offset : offset + limit]
+        self.calls.append(("telegram_sources_overview", parameters))
+        return {
+            "items": page,
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "has_more": offset + len(page) < total,
+        }
 
     async def set_source_enabled(self, source_id: int, enabled: bool) -> dict:
         for source in self.result.get("sources", []):
@@ -1177,7 +1288,7 @@ async def test_login_page_refuses_disconnect_while_collector_runs():
 
 
 @pytest.mark.asyncio
-async def test_source_flow_validates_upserts_and_does_not_create_duplicate_scan():
+async def test_source_flow_validates_create_and_updates_without_duplicate_scan():
     api = FakeAPI()
     app = HoardApp(api)
     async with app.run_test(size=(100, 30)) as pilot:
@@ -1212,10 +1323,10 @@ async def test_source_flow_validates_upserts_and_does_not_create_duplicate_scan(
         await wait_for_condition(pilot, lambda: isinstance(app.screen, SourceDialog))
         dialog = app.screen
         assert dialog.query_one("#source-url", Input).value.endswith("/42")
-        dialog.query_one("#source-primary").press()
-        await wait_for_condition(pilot, lambda: getattr(app.screen, "step", None) == "parameters")
-        await wait_for_condition(pilot, lambda: not dialog._busy)
+        assert dialog.step == "parameters"
+        assert dialog.query_one("#source-url", Input).disabled
         dialog.query_one("#source-interval", Input).value = "600"
+        dialog.query_one("#source-mode").value = "minimal"
         dialog.query_one("#source-primary").press()
         await wait_for_condition(pilot, lambda: getattr(app.screen, "step", None) == "done")
         await wait_for_condition(pilot, lambda: not dialog._busy)
@@ -1223,8 +1334,10 @@ async def test_source_flow_validates_upserts_and_does_not_create_duplicate_scan(
         await wait_for_condition(pilot, lambda: isinstance(app.screen, TelegramSourcesScreen))
 
     names = [name for name, _ in api.calls]
-    assert names.count("validate_source") == 2
-    assert names.count("add_source") == 2
+    assert names.count("validate_source") == 1
+    assert names.count("add_source") == 1
+    assert names.count("telegram_source_get") == 1
+    assert names.count("update_source") == 1
     assert names.count("start_collector") == 1
     assert "scan_source" not in names
 
@@ -1254,6 +1367,107 @@ async def test_sources_toggle_targeted_and_global_scan_are_distinct():
         await pilot.click("#source-scan-all")
         await wait_for_condition(pilot, lambda: any(name == "scan_all" for name, _ in api.calls))
     assert ("scan_source", {"id": 1}) in api.calls
+
+
+@pytest.mark.asyncio
+async def test_sources_catalog_search_filter_sort_and_server_pagination():
+    status = status_fixture()
+    template = status["sources"][0]
+    status["sources"] = [
+        {
+            **template,
+            "id": source_id,
+            "username": f"channel_{source_id}",
+            "post_id": 1000 + source_id,
+            "url": f"https://t.me/channel_{source_id}/{1000 + source_id}",
+            "title": f"Publication {source_id}",
+            "enabled": int(source_id % 2 == 0),
+            "download_count": source_id,
+        }
+        for source_id in range(1, 61)
+    ]
+    api = FakeAPI(status)
+    app = HoardApp(api)
+    async with app.run_test(size=(120, 35)) as pilot:
+        await wait_for_startup(app, pilot)
+        app.open_section("telegram_sources")
+        await wait_for_condition(pilot, lambda: getattr(app.screen, "_total", 0) == 60)
+        assert len(app.screen._items) == 50
+        assert "1–50 из 60" in str(app.screen.query_one("#source-range", Static).content)
+
+        app.screen.query_one("#source-next").press()
+        await wait_for_condition(pilot, lambda: getattr(app.screen, "_offset", 0) == 50)
+        await wait_for_condition(pilot, lambda: len(getattr(app.screen, "_items", [])) == 10)
+        assert "51–60 из 60" in str(app.screen.query_one("#source-range", Static).content)
+
+        app.screen.query_one("#source-filter").value = "disabled"
+        await wait_for_condition(pilot, lambda: getattr(app.screen, "_total", 0) == 30)
+        assert app.screen._offset == 0
+        assert all(not item["enabled"] for item in app.screen._items)
+
+        app.screen.query_one("#source-sort").value = "downloads_desc"
+        await wait_for_condition(
+            pilot,
+            lambda: any(
+                name == "telegram_sources_overview" and args.get("sort") == "downloads_desc"
+                for name, args in api.calls
+            ),
+        )
+        search = app.screen.query_one("#source-search", Input)
+        search.value = "Publication 3"
+        await pilot.pause(0.35)
+        await wait_for_condition(pilot, lambda: getattr(app.screen, "_total", 0) == 6)
+        assert all("publication 3" in item["title"].casefold() for item in app.screen._items)
+
+
+@pytest.mark.asyncio
+async def test_sources_catalog_ignores_stale_search_response_and_late_page_response():
+    api = FakeAPI()
+    app = HoardApp(api)
+    async with app.run_test(size=(120, 35)) as pilot:
+        await wait_for_startup(app, pilot)
+        app.open_section("telegram_sources")
+        await wait_for_condition(pilot, lambda: bool(getattr(app.screen, "_items", [])))
+        template = dict(app.screen._items[0])
+        old = {**template, "id": 11, "username": "old", "title": "Old response"}
+        new = {**template, "id": 12, "username": "new", "title": "New response"}
+        api.operation_delay = 0.5
+        api.queue(
+            "telegram_sources_overview",
+            {"items": [old], "total": 1, "limit": 50, "offset": 0, "has_more": False},
+            {"items": [new], "total": 1, "limit": 50, "offset": 0, "has_more": False},
+        )
+        search = app.screen.query_one("#source-search", Input)
+        search.value = "old"
+        await pilot.pause(0.35)
+        search.value = "new"
+        await pilot.pause(0.35)
+        await wait_for_condition(
+            pilot,
+            lambda: [item.get("id") for item in getattr(app.screen, "_items", [])] == [12],
+        )
+        assert app.screen.selected_source_id == 12
+
+        search.value = "leave"
+        await pilot.pause(0.35)
+        app.open_section("home")
+        await pilot.pause(0.6)
+        assert isinstance(app.screen, HomeScreen)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("size", ((40, 16), (60, 20), (80, 24), (120, 35)))
+async def test_sources_catalog_fits_required_terminal_sizes(size):
+    app = HoardApp(FakeAPI())
+    async with app.run_test(size=size) as pilot:
+        await wait_for_startup(app, pilot)
+        app.open_section("telegram_sources")
+        await wait_for_condition(pilot, lambda: bool(getattr(app.screen, "_items", [])))
+        table = app.screen.query_one("#sources-table", DataTable)
+        assert table.virtual_size.width <= table.size.width
+        assert app.screen.query_one("#source-add").display
+        assert app.screen.query_one("#source-ai-combined").display
+        assert app.screen.selected_source_id == 1
 
 
 @pytest.mark.asyncio
@@ -1655,11 +1869,13 @@ async def test_context_navigation_keeps_tables_native_and_hidden_sidebar_reachab
         await pilot.press("enter")
         await wait_for_condition(pilot, lambda: isinstance(app.screen, SourceDialog))
         source_input = app.screen.query_one("#source-url", Input)
-        source_input.focus()
-        previous = source_input.value
+        assert source_input.disabled
+        title_input = app.screen.query_one("#source-title", Input)
+        title_input.focus()
+        previous = title_input.value
         await pilot.press("q")
-        assert "q" in source_input.value
-        assert source_input.value != previous
+        assert "q" in title_input.value
+        assert title_input.value != previous
         assert app.is_running
         await pilot.press("escape")
 
@@ -2313,7 +2529,7 @@ async def test_home_carries_the_program_name_and_picks_a_logo_that_fits():
         big, small = app.screen.query_one("#hero-big"), app.screen.query_one("#hero-small")
         assert big.display and not small.display
         text = str(big.content)
-        assert "v0.7.4.1" in text
+        assert "v0.7.4.2" in text
         assert "локальный архив" not in text
         assert "всё хранится" not in text
         assert "сборщик" not in text
@@ -2360,7 +2576,15 @@ async def test_sources_table_is_compact_and_trims_timestamps():
         await pilot.pause()
         table = app.screen.query_one("#sources-table", DataTable)
         labels = [str(column.label) for column in table.columns.values()]
-        assert labels == ["Источник", "Состояние", "Кружки", "Каждые", "Проверка", "Результат"]
+        assert labels == [
+            "Источник",
+            "Состояние",
+            "Кружки",
+            "Профили",
+            "FFmpeg",
+            "PSL",
+            "Проверка",
+        ]
         row = [str(cell) for cell in table.get_row_at(0)]
         assert "2026-10-21 10:12" in row and "2026-10-21 10:12:13" not in row
         assert table.virtual_size.width <= table.size.width  # no horizontal scrollbar at 120 cols
@@ -2376,16 +2600,16 @@ async def test_sources_table_drops_schedule_columns_instead_of_scrolling_sideway
         table = app.screen.query_one("#sources-table", DataTable)
         assert [str(column.label) for column in table.columns.values()] == [
             "Источник",
-            "Состояние",
             "Кружки",
-            "Результат",
+            "Профили",
+            "Состояние",
         ]
         assert table.virtual_size.width <= table.size.width
         assert app.screen.selected_source_id == 1
         await pilot.resize_terminal(130, 35)
         await pilot.pause()
         table = app.screen.query_one("#sources-table", DataTable)
-        assert len(table.columns) == 6
+        assert len(table.columns) == 7
         assert app.screen.selected_source_id == 1
         await pilot.resize_terminal(80, 24)
         await pilot.pause()
@@ -2446,6 +2670,9 @@ async def test_telegram_web_controls_reflect_state_and_are_nonblocking():
         await wait_for_condition(
             pilot,
             lambda: "работает" in str(app.screen.query_one("#web-summary", Static).content),
+        )
+        await wait_for_condition(
+            pilot, lambda: [name for name, _ in api.calls].count("open_web") == 1
         )
         assert [name for name, _ in api.calls].count("open_web") == 1
         assert screen.query_one("#web-start", Button).disabled is True
