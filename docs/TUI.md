@@ -47,6 +47,7 @@ nested Sources page.
 | Hoard | **AI** | existing provider settings, records and chat |
 | Telegram | **Статус** | live collector work plus read-only archive, FFmpeg-frame and PSL aggregates |
 | Telegram | **Источники** | paginated publication catalog, local search/filter/sort, stable edit/toggle/scan and publication-scoped photo/frame PSL actions |
+| Telegram context | **Публикация** | four source-scoped read-only tabs: Кружки / Профили / Кадры / PSL |
 | Telegram | **Web Viewer** | actual loopback-process state and enable/open/disable actions |
 | Telegram | **Вход** | saved-session/live-connection state, cached public account data and the existing authorization dialog |
 
@@ -94,7 +95,8 @@ neutral when state cannot be established.
   the conversation to its top. Returning restores the list and focus.
 * Archive and Telegram Sources tables preserve the selected record across refreshes and terminal
   resizes. Sources keys records by stable `sources.id`; a changed query clears an obsolete
-  selection before any action can use it.
+  selection before any action can use it. Opening a publication keeps that Sources screen instance
+  alive, so returning restores its query, filter, sort, offset, cursor and scroll.
 
 The Home wordmark comes in two sizes (`widgets/hero.py`): six rows when the terminal is at least
 30 rows tall and 76 columns wide, three rows below that, and none under 22 rows — the header
@@ -143,7 +145,9 @@ Wide terminals show source, state, video notes, unique linked profiles, successf
 sets, confirmed PSL analyses and last check. Medium terminals keep source, video notes, profiles
 and state; narrow terminals keep source and video notes. The selected-source panel adds interval,
 collection mode, last result/error, photos of linked authors, actual frame rows and separate
-failed/stale set counts. It is intentionally a summary, not the Round 5 media/profile viewer.
+failed/stale set counts. Enter or `l` opens the contextual publication viewer; `e` still opens
+source settings. The viewer inherits the Sources navigation entry, never appears as a fifth
+sidebar/palette item, and renders `Telegram › Источники › @channel/post` in the breadcrumb.
 
 Creation retains the access-validation wizard. Editing first reads the current source by stable ID,
 keeps the link immutable and calls `source_update` locally; enabled state, checkpoint, next run and
@@ -152,12 +156,32 @@ historical relations/media are unchanged. `Полный` schedules the existing 
 sender details or schedule new automatic photo work. A shared author can still be scheduled once by
 another full source. Existing photos are never copied or removed.
 
+## Telegram Publication
+
+Publication is one screen with four local tabs. Кружки and Кадры use source-filtered daemon IPC in
+stable `message_id DESC` order; Профили reuses `profile_summaries(source_id=...)` and its local
+username/name/ID search; PSL uses the union of batch, video and analysis-photo source links with
+distinct analysis IDs and batch-author consistency. Each tab requests 50 rows, the daemon caps
+pages at 100, and switching tabs does not prefetch the other three.
+
+The frame table reads saved SQLite status only, including video notes with no frame-set row. Deep
+MP4/size/mtime/SHA-256 validation runs only after explicitly opening one set, and the reused
+`VideoFramesDialog` is view-only here. Failed, stale, ineligible, insufficient, invalid and
+outcome-unknown PSL rows never expose scores. The detail view omits prompts, raw responses, costs,
+tokens and private paths.
+
+Video, photo and frame buttons send stable IDs rather than paths. The daemon checks publication
+ownership, global-photo author membership, archive-root containment after symlink resolution,
+regular-file type and known size before calling the platform opener without `shell=True`. No tab,
+detail card or media action starts Telegram, Web, FFmpeg/FFprobe or AI.
+
 ## Keyboard
 
 `j`/`k`, arrows — move · `l`, Enter — open · `h`, Esc — back · `tab` — next panel ·
 `[` `]` — previous/next section of the current level · `1`–`9` — jump within the current visible
 level · `:` or Ctrl+K — command palette · `b` — toggle sidebar · `?` — help · `q` — quit (the
-daemon keeps running). From Sources/Web/Login, back opens Status; from Status it restores the
+daemon keeps running). From Publication, back opens Sources. From Sources/Web/Login, back opens
+Status; from Status it restores the
 global section from which Telegram was entered, falling back to Home. The explicit sidebar back
 always leaves Telegram. Modals consume Escape first. Global keys are disabled in modals and while
 typing, and `j`/`k`/arrows remain native to focused tables and lists.

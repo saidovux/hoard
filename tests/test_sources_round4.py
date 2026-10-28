@@ -236,7 +236,7 @@ def test_sources_overview_has_source_scoped_counts_and_confirmed_psl(tmp_path):
             source_id,message_id,video_path,status,frame_count)
             VALUES(?,?,?,?,?)""",
             (
-                (first, 1, "/a/1", "saved", 2),
+                (first, 1, "/a/1", "saved", 3),
                 (first, 2, "/a/2", "failed", 0),
                 (first, 4, "/a/4", "stale", 1),
             ),
@@ -244,7 +244,13 @@ def test_sources_overview_has_source_scoped_counts_and_confirmed_psl(tmp_path):
         store.db.executemany(
             """INSERT INTO tg_video_frames(source_id,message_id,position,file_path)
             VALUES(?,?,?,?)""",
-            ((first, 1, 1, "/f/1"), (first, 1, 2, "/f/2"), (first, 4, 1, "/f/3")),
+            (
+                (first, 1, 1, "/f/1"),
+                (first, 1, 2, "/f/2"),
+                (first, 1, 3, "/f/3"),
+                (first, 4, 1, "/f/stale"),
+                (first, 2, 1, "/f/failed"),
+            ),
         )
 
     prompt = store.ai.ensure_psl_prompt()["current_version"]["id"]

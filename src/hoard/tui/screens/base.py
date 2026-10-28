@@ -117,6 +117,9 @@ class WorkspaceScreen(Screen):
         else:
             self.set_focus(None)
 
+    def open_selected(self) -> None:
+        """Optional screen-local fallback when no visible control owns Enter/l."""
+
     def on_sidebar_navigate(self, message: Sidebar.Navigate) -> None:
         if message.section == Sidebar.BACK:
             self.hoard_app.leave_workspace()

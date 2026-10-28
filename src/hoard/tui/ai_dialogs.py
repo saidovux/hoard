@@ -361,10 +361,19 @@ class VideoFramesDialog(ModalScreen[dict[str, Any] | None]):
 
     BINDINGS = [Binding("escape", "cancel", "Отмена")]
 
-    def __init__(self, details: dict[str, Any] | None, *, video_id: str = "") -> None:
+    def __init__(
+        self,
+        details: dict[str, Any] | None,
+        *,
+        video_id: str = "",
+        view_only: bool = False,
+        open_frame: Callable[[int], None] | None = None,
+    ) -> None:
         super().__init__()
         self.details = details or {}
         self.video_id = video_id or str(self.details.get("video_id") or "")
+        self.view_only = bool(view_only)
+        self.open_frame = open_frame
 
     def compose(self) -> ComposeResult:
         status = str(self.details.get("status") or "missing")
@@ -405,12 +414,13 @@ class VideoFramesDialog(ModalScreen[dict[str, Any] | None]):
                         f"Открыть кадр {item.get('position')}",
                         id=f"frames-open-{int(item.get('position') or 0)}",
                     )
-                yield Button(
-                    "Анализировать кадры",
-                    id="frames-analyze",
-                    variant="primary",
-                    disabled=not bool(self.details.get("valid")),
-                )
+                if not self.view_only:
+                    yield Button(
+                        "Анализировать кадры",
+                        id="frames-analyze",
+                        variant="primary",
+                        disabled=not bool(self.details.get("valid")),
+                    )
                 yield Button("Закрыть", id="frames-close")
             yield Static(id="frames-error", classes="dialog-error")
 
@@ -432,13 +442,17 @@ class VideoFramesDialog(ModalScreen[dict[str, Any] | None]):
         if identifier.startswith("frames-open-"):
             try:
                 position = int(identifier.rsplit("-", 1)[-1])
-                frame = next(
-                    item
-                    for item in self.details.get("frames") or []
-                    if int(item.get("position") or 0) == position
-                )
-                path = Path(str(frame["file_path"])).resolve(strict=True)
-                opened = webbrowser.open(path.as_uri(), new=2)
+                if self.open_frame is not None:
+                    self.open_frame(position)
+                    opened = True
+                else:
+                    frame = next(
+                        item
+                        for item in self.details.get("frames") or []
+                        if int(item.get("position") or 0) == position
+                    )
+                    path = Path(str(frame["file_path"])).resolve(strict=True)
+                    opened = webbrowser.open(path.as_uri(), new=2)
             except (OSError, ValueError, StopIteration):
                 opened = False
             if not opened:

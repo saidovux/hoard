@@ -25,6 +25,12 @@ Local-first Telegram archive and extensible small-tool core, Python >=3.11. Keep
   compatibility `status.sources`. Keep search/filter/sort in SQLite, preserve stable source-ID
   selection and do not add polling. Source edits use `source_update`, keep the post identity,
   enabled state, checkpoint and schedule, and never discard archive relations or media.
+- The contextual `telegram_publication` route belongs to Telegram Sources but is not a fifth
+  sidebar or palette entry. Enter opens it, `e` edits, and back restores the existing Sources
+  screen state. Its four tabs are read-only, source-scoped and independently paginated; reuse
+  `ai_telegram_profile_list` for profiles, never deep-check every frame row, and never attribute
+  PSL by author membership alone. Media opening must use stable IDs through daemon validation of
+  ownership, resolved archive-root containment, regular-file type and size, never a TUI path.
 - `sources.collection_mode` defaults to `full`. `minimal` still records message identity,
   author/source relations and video notes, but must not resolve a missing sender or schedule a new
   automatic profile-photo job on that source's behalf. A shared author remains eligible through

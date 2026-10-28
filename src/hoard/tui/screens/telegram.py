@@ -841,7 +841,12 @@ class TelegramSourcesScreen(_TelegramWorkspaceScreen):
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         if event.data_table.id == "sources-table" and self.selected_source_id is not None:
-            self.action_edit_source()
+            self.open_selected()
+
+    def open_selected(self) -> None:
+        source = self.selected_source()
+        if source is not None:
+            self.hoard_app.open_publication(source)
 
     def action_add_source(self) -> None:
         self.hoard_app.ensure_telegram(lambda: self._open_source_dialog(None))

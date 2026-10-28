@@ -14,6 +14,8 @@ background service.
   `request()` boundary. `navigation.py` declares the four-entry global level and the Telegram
   workspace (former Overview/Activity map to Home; Sources maps to Telegram Sources) used by the
   contextual sidebar, breadcrumb, level-local digits/cycling and palette;
+  `screens/telegram_publication.py` is an internal route whose navigation parent is Sources, so
+  dynamic source IDs never enter the global section registry;
   `colors.py` owns the Noir palette; `palette.py` searches sections and app commands;
   `widgets/panel.py`, `widgets/hero.py`, `widgets/status.py`, `widgets/telegram_monitor.py` and
   `widgets/chrome.py` provide the framed-panel layout, wordmark, figures, the compact Home transfer
@@ -21,7 +23,7 @@ background service.
   reusable widgets and TCSS remain separate. The package imports neither storage nor Telethon, and
   never creates a Telegram client. See `docs/TUI.md`.
 - `ipc.py` starts the daemon detached when required and sends one JSON request per private
-  Unix-socket connection. Client and daemon must both report Hoard 0.7.4.2 and IPC protocol `1`.
+  Unix-socket connection. Client and daemon must both report Hoard 0.7.4.3 and IPC protocol `1`.
   A held instance lock with no ready socket means initialization is in progress, so the client
   waits for that owner instead of spawning a second daemon.
 - `service.py` owns the database, three independently limited job runners and the sole
@@ -262,6 +264,28 @@ frame tables. PSL attribution unions confirmed `ai_telegram_batches.source_id`,
 and accepts only completed attempts with a completed domain result. Author membership alone never
 attributes PSL to a publication. The response contains no media rows, result JSON, credentials or
 archive file paths and stays under the existing 64 KiB IPC limit.
+
+The contextual viewer adds bounded read-only `telegram_publication_get`,
+`telegram_publication_downloads_list`, `telegram_publication_download_get`,
+`telegram_publication_frames_list`, `telegram_publication_profile_get`,
+`telegram_publication_psl_list` and `telegram_publication_psl_get` operations; the existing
+`ai_telegram_profile_list` remains the profile page and `telegram_frames_get` remains the explicit
+deep frame inspection. List queries are source-filtered and page before returning metadata. Frame
+pages perform no file stats or hashes. PSL attribution unions batch, analysis-video and
+analysis-photo links, checks batch-item author consistency and deduplicates analysis IDs; detail
+lookups repeat source membership before returning safe scalar fields.
+
+`telegram_publication_media_open` accepts only stable video/photo/frame IDs. `Store` resolves the
+SQLite row, verifies publication ownership (and profile membership for globally owned photos),
+resolves symlinks, checks the regular file and known size under remembered archive roots, and only
+then calls the platform opener without a shell. Bulk responses and detail cards never expose an
+absolute path. Explicit frame resolution retains the existing three-position, MP4 fingerprint and
+SHA-256 contract; the list never invokes it.
+
+Duplicate source insertion uses a compatibility-preserving integer `Store.add_source()` over an
+internal `(id, created)` result. Archive-root/catalog dirty side effects and runner wakeup occur
+only for a real INSERT. Sources frame aggregation counts frame rows only when their set is saved;
+failed and stale sets remain separate counters.
 
 Profile photo enumeration is capped at 30 per check. Saved Telegram photo IDs prevent duplicate
 downloads. Telegram may expose an animated avatar through `video_sizes`; Hoard downloads the

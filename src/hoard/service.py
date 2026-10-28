@@ -10,6 +10,7 @@ import shutil
 import signal
 import tempfile
 import uuid
+from collections.abc import Callable
 from functools import partial
 from pathlib import Path
 
@@ -26,6 +27,7 @@ from .integrations.media import download, validate_media
 from .integrations.rclone import upload, validate_upload
 from .ipc import IPC_MAX_BYTES, IPC_PROTOCOL, encode_ipc_message
 from .jobs import JobRunner
+from .media_open import open_local_file
 from .models import parse_post_url
 from .paths import db_path, endpoint_path, ensure_private, socket_path, state_dir
 from .platform_support import is_windows, remove_endpoint_if_owned, single_instance, write_endpoint
@@ -47,6 +49,7 @@ class Service:
         store: Store | None = None,
         engine: TelegramEngine | None = None,
         ai_core: AICore | None = None,
+        media_opener: Callable[[Path], bool] | None = None,
     ):
         self.store = store or Store(db_path())
         self.progress: dict = {}
@@ -55,6 +58,7 @@ class Service:
         self._stop_lock = asyncio.Lock()
         self._mode_lock = asyncio.Lock()
         self.engine = engine or TelegramEngine(self.store, self._progress)
+        self._media_opener = media_opener or open_local_file
         self.runner = JobRunner(
             self.store,
             {
@@ -988,6 +992,60 @@ class Service:
             if source is None:
                 raise ValueError("Источник не найден")
             return {"source": source}
+        if method == "telegram_publication_get":
+            return {"publication": self.store.telegram_publication(int(args.get("source_id") or 0))}
+        if method == "telegram_publication_downloads_list":
+            return self.store.telegram_publication_downloads(
+                int(args.get("source_id") or 0),
+                limit=int(args.get("limit", 50)),
+                offset=int(args.get("offset", 0)),
+            )
+        if method == "telegram_publication_download_get":
+            return {
+                "download": self.store.telegram_publication_download_details(
+                    int(args.get("source_id") or 0), int(args.get("message_id") or 0)
+                )
+            }
+        if method == "telegram_publication_frames_list":
+            return self.store.telegram_publication_frames(
+                int(args.get("source_id") or 0),
+                limit=int(args.get("limit", 50)),
+                offset=int(args.get("offset", 0)),
+            )
+        if method == "telegram_publication_profile_get":
+            return {
+                "profile": self.store.telegram_publication_profile(
+                    int(args.get("source_id") or 0), int(args.get("author_id") or 0)
+                )
+            }
+        if method == "telegram_publication_psl_list":
+            return self.store.telegram_publication_psl(
+                int(args.get("source_id") or 0),
+                limit=int(args.get("limit", 50)),
+                offset=int(args.get("offset", 0)),
+            )
+        if method == "telegram_publication_psl_get":
+            return {
+                "analysis": self.store.telegram_publication_psl_details(
+                    int(args.get("source_id") or 0), str(args.get("analysis_id") or "")
+                )
+            }
+        if method == "telegram_publication_media_open":
+            path = self.store.resolve_publication_media(
+                int(args.get("source_id") or 0),
+                str(args.get("kind") or ""),
+                message_id=(
+                    int(args["message_id"]) if args.get("message_id") is not None else None
+                ),
+                author_id=(
+                    int(args["author_id"]) if args.get("author_id") is not None else None
+                ),
+                photo_id=(str(args["photo_id"]) if args.get("photo_id") is not None else None),
+                position=(int(args["position"]) if args.get("position") is not None else None),
+            )
+            if not self._media_opener(path):
+                raise RuntimeError("Внешнее приложение не подтвердило открытие файла")
+            return {"opened": True, "message": "Локальный файл открыт во внешнем приложении"}
         if method == "credentials":
             api_id = int(args.get("api_id", 0))
             api_hash = str(args.get("api_hash", ""))
@@ -1063,15 +1121,19 @@ class Service:
                 return await self.engine.validate_post(post)
         if method == "source_add":
             post = parse_post_url(str(args.get("url", "")))
-            source_id = self.store.add_source(
+            source_id, created = self.store.add_source_result(
                 post,
                 str(args.get("output", "~/Videos/hoard")),
                 int(args.get("interval", 120)),
                 title=str(args.get("title", "")),
                 collection_mode=str(args.get("collection_mode") or "full"),
             )
-            self.runner.wakeup()
-            return {"message": f"Добавлен источник #{source_id}: {post.link}"}
+            if created:
+                self.runner.wakeup()
+                message = f"Добавлен источник #{source_id}: {post.link}"
+            else:
+                message = f"Источник #{source_id} уже существует: {post.link}"
+            return {"message": message, "created": created, "source_id": source_id}
         if method == "source_update":
             source_id = int(args.get("id") or 0)
             source = self.store.update_source(

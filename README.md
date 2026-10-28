@@ -1,9 +1,23 @@
-# Hoard 0.7.4.2
+# Hoard 0.7.4.3
 
 Hoard is a local-first Linux and Windows archive for Telegram posts, profiles and video notes
 found in a channel post's comments. It uses Telethon, SQLite, an autonomous offline HTML catalog
 and terminal interfaces. A private background daemon performs all Telegram work; closing an
 interface does not stop downloads.
+
+The 0.7.4.3 release adds the contextual **Telegram → Источники → Публикация** viewer. Enter opens
+one saved publication while `e` remains edit; returning preserves the Sources query, filter, sort,
+page and stable source selection. Four independently paginated tabs expose only that source's
+video notes, linked profiles, lightweight stored frame states and confirmed PSL attribution. The
+screen is read-only: opening it never contacts Telegram or starts FFmpeg, FFprobe or AI.
+
+Local MP4s, profile photos and valid frames open only after an explicit action. The TUI sends
+stable object IDs; the daemon resolves them through SQLite, verifies source/profile ownership,
+resolved symlink containment in remembered archive roots, regular-file type and recorded size,
+then invokes the platform opener without a shell. Frame lists do not hash files; deep three-frame
+validation remains limited to explicitly opened sets. This release also excludes stale/failed
+frame rows from Sources' saved-frame count and makes duplicate `source_add` side-effect-free while
+reporting `created=false`.
 
 The 0.7.4.2 release turns **Telegram → Источники** into a paginated publication catalog backed by
 the dedicated `telegram_sources_overview` IPC operation. Search, enabled-state filtering and
@@ -231,7 +245,8 @@ profiles, jobs, catalog actions and the complete video-frame workflow.
 Telegram Status owns collector start/pause/stop, a live current-work summary, and archive
 statistics refreshed only on entry or request. Sources is a paginated local catalog with search,
 enabled-state filtering, stable sorting, editing, selected/global scans and publication-scoped PSL
-actions.
+actions. Enter opens the selected publication viewer; `e` edits it. The viewer's Кружки, Профили,
+Кадры and PSL tabs load one bounded server page at a time and retain their own offsets.
 Login reuses the daemon authorization flow, shows cached public account details, and separates a
 saved but unverified session from a verified live connection. Web Viewer starts/opens/stops only
 the separate loopback process. All operations use private daemon IPC; the TUI never opens SQLite
@@ -245,8 +260,9 @@ help modal states, on `#000000`. Text is white, secondary text `#888888`, frames
 hairlines `#262626` and the accent `#F79646`. Pages are framed panels with titles in the border;
 the focused panel lights up, the footer shows key chips, tables and buttons use an orange selection
 block. Use `j`/`k` or arrows to move, `l` or Enter to open, and `h` or Esc to return.
-Inside Telegram, back moves from a nested page to Status and from Status to the previous Hoard
-section. `1`–`9` and `[`/`]` address only the visible navigation level. Use `:` or Ctrl+K for the
+Inside Telegram, back moves from Publication to Sources, from other nested pages to Status and
+from Status to the previous Hoard section. `1`–`9` and `[`/`]` address only the visible navigation
+level. Use `:` or Ctrl+K for the
 command palette, `?` for help, `b` to toggle the sidebar and `q` to close only the UI. Section
 cycling keeps working when the sidebar is hidden;
 `Ctrl+PageUp` / `Ctrl+PageDown` scroll the current page. On terminals narrower than 60 columns the
@@ -278,7 +294,7 @@ For development, install the test tools with `python -m pip install -e '.[dev]'`
 
 An upgrade keeps the existing XDG configuration, database, Telegram session and archive.
 If an older daemon is still running, execute `hoard shutdown` before starting the upgraded
-installation. The 0.7.4.2 client accepts only a daemon reporting the same application version and
+installation. The 0.7.4.3 client accepts only a daemon reporting the same application version and
 IPC protocol `1`; it reports the mismatch instead of starting a competing service. If a matching
 daemon already owns the service lock but is still initializing, clients wait for it and show a
 specific startup diagnostic.

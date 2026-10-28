@@ -83,6 +83,10 @@ TELEGRAM_SECTIONS = (
 WORKSPACES: dict[str, tuple[Section, ...]] = {"telegram": TELEGRAM_SECTIONS}
 ALL_SECTIONS = (*SECTIONS, *TELEGRAM_SECTIONS)
 
+# Context screens inherit a real navigation entry without becoming a fifth
+# sidebar/palette destination. Dynamic object labels stay in the screen state.
+CONTEXT_PARENTS = {"telegram_publication": "telegram_sources"}
+
 # Retired public route keys.  The outer ``telegram`` entry is handled by its
 # target so callers using ``open_section('telegram')`` keep working too.
 ALIASES = {
@@ -104,7 +108,13 @@ def resolve(key: str) -> str:
 
 
 def get_section(key: str) -> Section | None:
-    return _find(resolve(key))
+    return _find(navigation_parent(key))
+
+
+def navigation_parent(key: str) -> str:
+    """Return the concrete sidebar entry representing a contextual route."""
+    resolved = resolve(key)
+    return CONTEXT_PARENTS.get(resolved, resolved)
 
 
 def workspace(key: str) -> str | None:
@@ -120,8 +130,8 @@ def sections_for(key: str) -> tuple[Section, ...]:
 
 
 def section_index(key: str) -> int:
-    resolved = resolve(key)
-    entries = sections_for(resolved)
+    resolved = navigation_parent(key)
+    entries = sections_for(key)
     return next(
         (index for index, item in enumerate(entries) if resolve(item.key) == resolved),
         0,
@@ -151,6 +161,7 @@ def palette_sections() -> tuple[Section, ...]:
 __all__ = [
     "ALIASES",
     "ALL_SECTIONS",
+    "CONTEXT_PARENTS",
     "CORE",
     "GROUP_TITLES",
     "SECTIONS",
@@ -160,6 +171,7 @@ __all__ = [
     "Section",
     "breadcrumb",
     "get_section",
+    "navigation_parent",
     "palette_sections",
     "resolve",
     "section_index",

@@ -340,6 +340,81 @@ OptionList > .option-list--separator {
     margin-left: 0;
 }
 
+/* Contextual publication viewer: one active table, independent server pages. */
+#publication-summary-panel, #publication-object-panel {
+    height: auto;
+}
+
+#publication-content-panel {
+    height: 1fr;
+    min-height: 8;
+    margin-top: 1;
+}
+
+#publication-summary, #publication-object {
+    height: auto;
+    min-height: 1;
+    margin-bottom: 1;
+}
+
+#publication-table {
+    height: 1fr;
+    min-height: 3;
+}
+
+#publication-profile-search {
+    display: none;
+    width: 100%;
+    margin-bottom: 1;
+}
+
+#publication-pagination {
+    width: 100%;
+    height: 1;
+    margin-top: 1;
+}
+
+#publication-range {
+    width: 1fr;
+    height: 1;
+    color: #888888;
+}
+
+#publication-pagination Button {
+    margin-left: 3;
+}
+
+#publication-actions {
+    grid-size: 5;
+}
+
+.short #publication-content-panel {
+    height: auto;
+}
+
+.short #publication-table, .tiny #publication-table {
+    height: 4;
+}
+
+.medium #publication-actions {
+    grid-size: 3;
+}
+
+.compact #publication-actions {
+    grid-size: 2;
+}
+
+.compact #publication-modes {
+    layout: grid;
+    grid-size: 2;
+    grid-columns: 1fr 1fr;
+    height: auto;
+}
+
+.compact #publication-modes Button {
+    margin-right: 0;
+}
+
 /* ── Archive ────────────────────────────────────────────────────────────── */
 
 #archive-main {

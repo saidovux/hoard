@@ -7,8 +7,11 @@ import stat
 import time
 from collections.abc import Collection
 from pathlib import Path
+from typing import Any
 
+from .ai.psl import psl_failure_category
 from .ai.storage import AIStorage
+from .archive_paths import path_is_within
 from .models import Post
 from .paths import ensure_private
 from .telegram_storage import TelegramStorage, utc_now
@@ -99,11 +102,35 @@ class Store:
         title: str = "",
         collection_mode: str = "full",
     ) -> int:
+        source_id, _created = self.add_source_result(
+            post,
+            output,
+            interval,
+            title=title,
+            collection_mode=collection_mode,
+        )
+        return source_id
+
+    def add_source_result(
+        self,
+        post: Post,
+        output: str,
+        interval: int = 120,
+        *,
+        title: str = "",
+        collection_mode: str = "full",
+    ) -> tuple[int, bool]:
+        """Add one source and report whether this call created it.
+
+        ``add_source`` intentionally keeps its historical integer return value.
+        Creation-only side effects stay behind the INSERT result so a duplicate
+        cannot change archive roots or schedule a catalog publication.
+        """
         directory = self._validate_source_settings(output, interval)
         mode = self._collection_mode(collection_mode)
         # No directory is created on add, so typos don't create unused directories.
         with self.db:
-            self.db.execute("""INSERT INTO sources(
+            cursor = self.db.execute("""INSERT INTO sources(
               username,post_id,url,output,interval,title,collection_mode)
               VALUES(?,?,?,?,?,?,?) ON CONFLICT(username,post_id)
               DO NOTHING""", (
@@ -119,9 +146,12 @@ class Store:
             "SELECT id FROM sources WHERE username=? AND post_id=?",
             (post.username, post.message_id),
         ).fetchone()
-        self.telegram.ensure_archive_root(directory)
-        self.telegram.set_catalog_dirty()
-        return int(row["id"])
+        assert row is not None
+        created = cursor.rowcount == 1
+        if created:
+            self.telegram.ensure_archive_root(directory)
+            self.telegram.set_catalog_dirty()
+        return int(row["id"]), created
 
     @staticmethod
     def _collection_mode(value: object) -> str:
@@ -290,7 +320,8 @@ class Store:
                     f"""SELECT sets.source_id,
                     COUNT(DISTINCT CASE WHEN sets.status='saved'
                         THEN sets.message_id END) AS frame_set_count,
-                    COUNT(frames.position) AS frame_count,
+                    COUNT(CASE WHEN sets.status='saved'
+                        THEN frames.position END) AS frame_count,
                     COUNT(DISTINCT CASE WHEN sets.status='failed'
                         THEN sets.message_id END) AS frame_failed_count,
                     COUNT(DISTINCT CASE WHEN sets.status='stale'
@@ -310,6 +341,9 @@ class Store:
                       SELECT batches.source_id,items.analysis_id
                       FROM ai_telegram_batches batches
                       JOIN ai_telegram_batch_items items ON items.batch_id=batches.id
+                      JOIN ai_telegram_analyses batch_analyses
+                        ON batch_analyses.id=items.analysis_id
+                       AND batch_analyses.author_id=items.author_id
                       WHERE batches.source_id IN ({placeholders})
                         AND items.analysis_id IS NOT NULL
                       UNION
@@ -349,6 +383,377 @@ class Store:
             "offset": page_offset,
             "has_more": page_offset + len(page) < total,
         }
+
+    @staticmethod
+    def _publication_page(limit: int = 50, offset: int = 0) -> tuple[int, int]:
+        page_limit = int(limit)
+        page_offset = int(offset)
+        if not 1 <= page_limit <= 100:
+            raise ValueError("limit должен быть от 1 до 100")
+        if page_offset < 0:
+            raise ValueError("offset не может быть отрицательным")
+        return page_limit, page_offset
+
+    def _require_publication(self, source_id: int) -> int:
+        identifier = int(source_id)
+        if identifier <= 0 or self.db.execute(
+            "SELECT 1 FROM sources WHERE id=?", (identifier,)
+        ).fetchone() is None:
+            raise ValueError("Публикация не найдена в локальном архиве")
+        return identifier
+
+    @staticmethod
+    def _publication_links_cte() -> str:
+        """Confirmed source attribution shared by publication PSL readers."""
+        return """WITH source_links(source_id,analysis_id,attribution) AS (
+          SELECT batches.source_id,items.analysis_id,'batch'
+          FROM ai_telegram_batches batches
+          JOIN ai_telegram_batch_items items ON items.batch_id=batches.id
+          JOIN ai_telegram_analyses batch_analyses
+            ON batch_analyses.id=items.analysis_id
+           AND batch_analyses.author_id=items.author_id
+          WHERE items.analysis_id IS NOT NULL
+          UNION
+          SELECT video_source_id,id,'video' FROM ai_telegram_analyses
+          WHERE video_source_id IS NOT NULL
+          UNION
+          SELECT source_id,analysis_id,'photo' FROM ai_telegram_analysis_photos
+          WHERE source_id IS NOT NULL
+        ), scoped_links AS (
+          SELECT analysis_id,GROUP_CONCAT(attribution) AS attribution
+          FROM source_links WHERE source_id=? GROUP BY analysis_id
+        )"""
+
+    def telegram_publication(self, source_id: int) -> dict[str, Any]:
+        """Return one source and its source-scoped, read-only aggregates."""
+        identifier = self._require_publication(source_id)
+        row = self.db.execute(
+            self._publication_links_cte()
+            + """ SELECT s.id,s.username,s.post_id,s.url,s.title,s.interval,s.enabled,
+            s.collection_mode,s.last_checked_at,s.last_result,s.last_error,
+            (SELECT COUNT(*) FROM downloads d WHERE d.source_id=s.id) AS download_count,
+            (SELECT COUNT(DISTINCT author_id) FROM tg_profile_sources links
+              WHERE links.source_id=s.id) AS profile_count,
+            (SELECT COUNT(*) FROM tg_video_frames frames
+              JOIN tg_video_frame_sets sets
+                ON sets.source_id=frames.source_id AND sets.message_id=frames.message_id
+              WHERE frames.source_id=s.id AND sets.status='saved') AS frame_count,
+            (SELECT COUNT(*) FROM scoped_links links
+              JOIN ai_telegram_analyses analyses ON analyses.id=links.analysis_id
+              JOIN ai_attempts attempts ON attempts.id=analyses.attempt_id
+              WHERE attempts.state='completed'
+                AND analyses.result_status='completed') AS psl_count
+            FROM sources s WHERE s.id=?""",
+            (identifier, identifier),
+        ).fetchone()
+        assert row is not None
+        return dict(row)
+
+    def telegram_publication_downloads(
+        self, source_id: int, *, limit: int = 50, offset: int = 0
+    ) -> dict[str, Any]:
+        """Return one stable source-scoped page without touching media files."""
+        identifier = self._require_publication(source_id)
+        page_limit, page_offset = self._publication_page(limit, offset)
+        total = int(
+            self.db.execute(
+                "SELECT COUNT(*) FROM downloads WHERE source_id=?", (identifier,)
+            ).fetchone()[0]
+        )
+        items = [
+            dict(row)
+            for row in self.db.execute(
+                """SELECT d.message_id,d.author_id,d.author_username,d.author_name,
+                d.date,d.media_url,d.size,d.state,
+                COALESCE(sets.status,'missing') AS frame_status,
+                COALESCE(sets.frame_count,0) AS frame_count,
+                sets.error_code AS frame_error_code
+                FROM downloads d LEFT JOIN tg_video_frame_sets sets
+                  ON sets.source_id=d.source_id AND sets.message_id=d.message_id
+                WHERE d.source_id=? ORDER BY d.message_id DESC LIMIT ? OFFSET ?""",
+                (identifier, page_limit, page_offset),
+            )
+        ]
+        return {
+            "items": items,
+            "total": total,
+            "limit": page_limit,
+            "offset": page_offset,
+            "has_more": page_offset + len(items) < total,
+        }
+
+    def telegram_publication_download_details(
+        self, source_id: int, message_id: int
+    ) -> dict[str, Any]:
+        """Inspect one selected MP4 without exposing its absolute path."""
+        identifier = self._require_publication(source_id)
+        row = self.db.execute(
+            """SELECT d.message_id,d.author_id,d.author_username,d.author_name,
+            d.date,d.media_url,d.file_path,d.size,d.state,
+            COALESCE(sets.status,'missing') AS frame_status,
+            COALESCE(sets.frame_count,0) AS frame_count,
+            sets.error AS frame_error,sets.error_code AS frame_error_code
+            FROM downloads d LEFT JOIN tg_video_frame_sets sets
+              ON sets.source_id=d.source_id AND sets.message_id=d.message_id
+            WHERE d.source_id=? AND d.message_id=?""",
+            (identifier, int(message_id)),
+        ).fetchone()
+        if row is None:
+            raise ValueError("Видеокружок не найден в выбранной публикации")
+        item = dict(row)
+        try:
+            self._validated_media_path(str(item.pop("file_path")), int(item["size"] or 0))
+        except ValueError as exc:
+            item["available"] = False
+            item["availability_error"] = str(exc)
+        else:
+            item["available"] = True
+            item["availability_error"] = ""
+        return item
+
+    def telegram_publication_frames(
+        self, source_id: int, *, limit: int = 50, offset: int = 0
+    ) -> dict[str, Any]:
+        """Return lightweight stored frame state; never hash or stat page rows."""
+        identifier = self._require_publication(source_id)
+        page_limit, page_offset = self._publication_page(limit, offset)
+        total = int(
+            self.db.execute(
+                "SELECT COUNT(*) FROM downloads WHERE source_id=?", (identifier,)
+            ).fetchone()[0]
+        )
+        items = [
+            dict(row)
+            for row in self.db.execute(
+                """SELECT d.message_id,d.author_id,d.author_username,d.author_name,d.date,
+                COALESCE(sets.status,'missing') AS frame_status,
+                COALESCE(sets.frame_count,0) AS frame_count,sets.duration,
+                sets.error,sets.error_code,sets.updated_at,
+                COALESCE((SELECT jobs.state FROM jobs
+                  WHERE jobs.unique_key=('video-frames:' || d.source_id || ':' || d.message_id)
+                    AND jobs.state IN ('waiting','queued','running')
+                  ORDER BY jobs.id DESC LIMIT 1),'') AS job_state
+                FROM downloads d LEFT JOIN tg_video_frame_sets sets
+                  ON sets.source_id=d.source_id AND sets.message_id=d.message_id
+                WHERE d.source_id=? ORDER BY d.message_id DESC LIMIT ? OFFSET ?""",
+                (identifier, page_limit, page_offset),
+            )
+        ]
+        return {
+            "items": items,
+            "total": total,
+            "limit": page_limit,
+            "offset": page_offset,
+            "has_more": page_offset + len(items) < total,
+        }
+
+    @staticmethod
+    def _safe_psl_row(row: Any) -> dict[str, Any]:
+        item = dict(row)
+        item["failure_category"] = psl_failure_category(
+            item.get("attempt_state"), item.pop("error_code", None), item.get("result_status")
+        )
+        successful = (
+            item.get("attempt_state") == "completed"
+            and item.get("result_status") == "completed"
+            and item.get("presentation") == "female"
+            and isinstance(item.get("estimated_age"), int)
+            and int(item["estimated_age"]) >= 18
+        )
+        if not successful:
+            item["estimated_age"] = None
+            for key in ("raw_psl_min", "raw_psl_max", "boosted_psl"):
+                item[key] = None
+        return item
+
+    def telegram_publication_psl(
+        self, source_id: int, *, limit: int = 50, offset: int = 0
+    ) -> dict[str, Any]:
+        identifier = self._require_publication(source_id)
+        page_limit, page_offset = self._publication_page(limit, offset)
+        cte = self._publication_links_cte()
+        total = int(
+            self.db.execute(
+                cte + " SELECT COUNT(*) FROM scoped_links", (identifier,)
+            ).fetchone()[0]
+        )
+        rows = self.db.execute(
+            cte
+            + """ SELECT analyses.id AS analysis_id,analyses.author_id,
+            profiles.current_username,profiles.display_name,analyses.created_at,
+            analyses.analyzed_at,analyses.image_mode,attempts.state AS attempt_state,
+            attempts.error_code,analyses.result_status,analyses.presentation,
+            analyses.estimated_age,analyses.raw_psl_min,analyses.raw_psl_max,
+            analyses.boosted_psl,links.attribution
+            FROM scoped_links links
+            JOIN ai_telegram_analyses analyses ON analyses.id=links.analysis_id
+            JOIN ai_attempts attempts ON attempts.id=analyses.attempt_id
+            LEFT JOIN tg_profiles profiles ON profiles.author_id=analyses.author_id
+            ORDER BY COALESCE(analyses.analyzed_at,analyses.created_at) DESC,
+              analyses.id DESC LIMIT ? OFFSET ?""",
+            (identifier, page_limit, page_offset),
+        )
+        items = [self._safe_psl_row(row) for row in rows]
+        return {
+            "items": items,
+            "total": total,
+            "limit": page_limit,
+            "offset": page_offset,
+            "has_more": page_offset + len(items) < total,
+        }
+
+    def telegram_publication_psl_details(
+        self, source_id: int, analysis_id: str
+    ) -> dict[str, Any]:
+        identifier = self._require_publication(source_id)
+        analysis = str(analysis_id or "").strip()
+        if not analysis:
+            raise ValueError("Нужен ID анализа")
+        row = self.db.execute(
+            self._publication_links_cte()
+            + """ SELECT analyses.id AS analysis_id,analyses.author_id,
+            profiles.current_username,profiles.display_name,analyses.created_at,
+            analyses.analyzed_at,analyses.image_mode,attempts.state AS attempt_state,
+            attempts.error_code,analyses.result_status,analyses.presentation,
+            analyses.estimated_age,analyses.raw_psl_min,analyses.raw_psl_max,
+            analyses.boosted_psl,links.attribution
+            FROM scoped_links links
+            JOIN ai_telegram_analyses analyses ON analyses.id=links.analysis_id
+            JOIN ai_attempts attempts ON attempts.id=analyses.attempt_id
+            LEFT JOIN tg_profiles profiles ON profiles.author_id=analyses.author_id
+            WHERE analyses.id=?""",
+            (identifier, analysis),
+        ).fetchone()
+        if row is None:
+            raise ValueError("Анализ не относится к выбранной публикации")
+        result = self._safe_psl_row(row)
+        result["image_types"] = [
+            str(item["source_kind"])
+            for item in self.db.execute(
+                """SELECT DISTINCT source_kind FROM ai_telegram_analysis_photos
+                WHERE analysis_id=? ORDER BY source_kind""",
+                (analysis,),
+            )
+        ]
+        return result
+
+    def telegram_publication_profile(
+        self, source_id: int, author_id: int
+    ) -> dict[str, Any]:
+        identifier = self._require_publication(source_id)
+        author = int(author_id)
+        linked = self.db.execute(
+            "SELECT 1 FROM tg_profile_sources WHERE source_id=? AND author_id=?",
+            (identifier, author),
+        ).fetchone()
+        if linked is None:
+            raise ValueError("Профиль не относится к выбранной публикации")
+        profile = self.telegram.get_profile_identity(author)
+        profile["username_history"] = [
+            dict(row)
+            for row in self.db.execute(
+                """SELECT username,first_seen,last_seen FROM tg_username_history
+                WHERE author_id=? ORDER BY last_seen DESC,username LIMIT 100""",
+                (author,),
+            )
+        ]
+        profile["photo_total"] = int(
+            self.db.execute(
+                """SELECT COUNT(*) FROM tg_profile_photos
+                WHERE author_id=? AND status='saved'""",
+                (author,),
+            ).fetchone()[0]
+        )
+        profile["photos"] = self.telegram.profile_photos(author, limit=100)
+        profile["source_video_count"] = int(
+            self.db.execute(
+                "SELECT COUNT(*) FROM downloads WHERE source_id=? AND author_id=?",
+                (identifier, author),
+            ).fetchone()[0]
+        )
+        latest = self.db.execute(
+            self._publication_links_cte()
+            + """ SELECT analyses.id AS analysis_id,analyses.author_id,
+            analyses.created_at,analyses.analyzed_at,analyses.image_mode,
+            attempts.state AS attempt_state,attempts.error_code,analyses.result_status,
+            analyses.presentation,analyses.estimated_age,analyses.raw_psl_min,
+            analyses.raw_psl_max,analyses.boosted_psl,links.attribution
+            FROM scoped_links links
+            JOIN ai_telegram_analyses analyses ON analyses.id=links.analysis_id
+            JOIN ai_attempts attempts ON attempts.id=analyses.attempt_id
+            WHERE analyses.author_id=?
+            ORDER BY COALESCE(analyses.analyzed_at,analyses.created_at) DESC,
+              analyses.id DESC LIMIT 1""",
+            (identifier, author),
+        ).fetchone()
+        profile["psl"] = self._safe_psl_row(latest) if latest is not None else None
+        return profile
+
+    def _validated_media_path(self, filename: str, expected_size: int) -> Path:
+        if not filename or "\x00" in filename:
+            raise ValueError("Локальный файл недоступен")
+        try:
+            path = Path(filename).expanduser().resolve(strict=True)
+            file_stat = path.stat()
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise ValueError("Локальный файл отсутствует") from exc
+        roots = self.telegram.allowed_media_roots(self.telegram.archive_root())
+        if not any(path_is_within(path, root) for root in roots):
+            raise ValueError("Путь к локальному файлу запрещён")
+        if not stat.S_ISREG(file_stat.st_mode):
+            raise ValueError("Локальный объект не является обычным файлом")
+        if int(expected_size or 0) > 0 and file_stat.st_size != int(expected_size):
+            raise ValueError("Локальный файл повреждён или изменён")
+        return path
+
+    def resolve_publication_media(
+        self,
+        source_id: int,
+        kind: str,
+        *,
+        message_id: int | None = None,
+        author_id: int | None = None,
+        photo_id: str | None = None,
+        position: int | None = None,
+    ) -> Path:
+        """Resolve a stable publication object identifier to one verified local file."""
+        identifier = self._require_publication(source_id)
+        media_kind = str(kind or "")
+        if media_kind == "video":
+            row = self.db.execute(
+                """SELECT file_path,size FROM downloads
+                WHERE source_id=? AND message_id=?""",
+                (identifier, int(message_id or 0)),
+            ).fetchone()
+        elif media_kind == "photo":
+            author = int(author_id or 0)
+            row = self.db.execute(
+                """SELECT photos.file_path,photos.size FROM tg_profile_photos photos
+                JOIN tg_profile_sources links ON links.author_id=photos.author_id
+                WHERE links.source_id=? AND photos.author_id=? AND photos.photo_id=?
+                  AND photos.status='saved'""",
+                (identifier, author, str(photo_id or "")),
+            ).fetchone()
+        elif media_kind == "frame":
+            message = int(message_id or 0)
+            frame_position = int(position or 0)
+            details = self.telegram.frame_details(identifier, message)
+            if details is None or not details.get("valid"):
+                raise ValueError("Набор кадров недоступен или повреждён")
+            selected = next(
+                (
+                    frame
+                    for frame in details.get("frames") or []
+                    if int(frame.get("position") or 0) == frame_position
+                ),
+                None,
+            )
+            row = selected
+        else:
+            raise ValueError("Неизвестный тип локального медиа")
+        if row is None:
+            raise ValueError("Локальное медиа не найдено в выбранной публикации")
+        return self._validated_media_path(str(row["file_path"]), int(row["size"] or 0))
 
     def sources(self) -> list[dict]:
         return [

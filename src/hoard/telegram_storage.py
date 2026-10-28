@@ -1371,7 +1371,11 @@ class TelegramStorage:
         return dict(row)
 
     def profile_photos(
-        self, author_id: int, *, include_path: bool = False
+        self,
+        author_id: int,
+        *,
+        include_path: bool = False,
+        limit: int | None = None,
     ) -> list[dict[str, Any]]:
         profile = self.db.execute(
             "SELECT 1 FROM tg_profiles WHERE author_id=?", (int(author_id),)
@@ -1380,10 +1384,18 @@ class TelegramStorage:
             raise ValueError("Telegram-профиль не найден в локальном архиве")
         roots = self.allowed_media_roots(self.archive_root())
         result: list[dict[str, Any]] = []
+        query = """SELECT * FROM tg_profile_photos WHERE author_id=? AND status='saved'
+            ORDER BY photo_date DESC,photo_id"""
+        parameters: tuple[Any, ...] = (int(author_id),)
+        if limit is not None:
+            page_limit = int(limit)
+            if not 1 <= page_limit <= 100:
+                raise ValueError("limit должен быть от 1 до 100")
+            query += " LIMIT ?"
+            parameters = (*parameters, page_limit)
         for row in self.db.execute(
-            """SELECT * FROM tg_profile_photos WHERE author_id=? AND status='saved'
-            ORDER BY photo_date DESC,photo_id""",
-            (int(author_id),),
+            query,
+            parameters,
         ):
             item = dict(row)
             try:

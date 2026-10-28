@@ -19,6 +19,7 @@ from ..navigation import (
     TELEGRAM_SECTIONS,
     Section,
     breadcrumb,
+    navigation_parent,
     resolve,
     sections_for,
     workspace,
@@ -39,6 +40,12 @@ class HoardHeader(Static):
         self._status: dict | None = None
         self._error: str | None = None
         self._shown = False
+        self._detail = ""
+
+    def set_detail(self, value: str) -> None:
+        self._detail = str(value or "")
+        if self._shown:
+            self._paint()
 
     def show_status(self, status: dict | None, error: str | None = None) -> None:
         self._status, self._error, self._shown = status, error, True
@@ -60,9 +67,12 @@ class HoardHeader(Static):
         left.append("hoard", style=f"bold {ACCENT}")
         crumbs = breadcrumb(self.section)
         for position, crumb in enumerate(crumbs):
-            last = position == len(crumbs) - 1
+            last = position == len(crumbs) - 1 and not self._detail
             left.append("  ›  ", style=MUTED)
             left.append(crumb.label, style=f"bold {TEXT}" if last else MUTED)
+        if self._detail:
+            left.append("  ›  ", style=MUTED)
+            left.append(self._detail, style=f"bold {TEXT}")
         right = self._indicator()
         gap = max(2, self.content_size.width - left.cell_len - right.cell_len)
         left.append(" " * gap)
@@ -114,7 +124,7 @@ class Sidebar(Static):
         return tuple(self.query(OptionList))
 
     def _location(self, key: str) -> tuple[OptionList, int]:
-        key = resolve(key)
+        key = navigation_parent(key)
         for navigation in self._lists():
             try:
                 return navigation, navigation.get_option_index(key)
@@ -157,7 +167,7 @@ class Sidebar(Static):
 
     def _label(self, section: Section, number: int) -> Text:
         """``▎1  Главная``: the digit is the shortcut, the bar marks the open page."""
-        active = resolve(section.key) == self.active
+        active = resolve(section.key) == navigation_parent(self.active)
         label = Text(no_wrap=True, overflow="ellipsis")
         label.append("▎" if active else " ", style=f"bold {ACCENT}")
         label.append(

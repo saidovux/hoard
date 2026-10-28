@@ -47,6 +47,7 @@ from .screens import (
     ArchiveScreen,
     HomeScreen,
     TelegramLoginScreen,
+    TelegramPublicationScreen,
     TelegramSourcesScreen,
     TelegramStatusScreen,
     TelegramWebScreen,
@@ -159,6 +160,7 @@ class HoardApp(App[None]):
         "telegram_sources": TelegramSourcesScreen,
         "telegram_web": TelegramWebScreen,
         "telegram_login": TelegramLoginScreen,
+        "telegram_publication": TelegramPublicationScreen,
         "ai": AIWorkspaceScreen,
     }
     BINDINGS = [
@@ -197,6 +199,7 @@ class HoardApp(App[None]):
         self._startup_complete = False
         self._last_narrow: bool | None = None
         self._telegram_return_section = "home"
+        self.publication_source: dict[str, Any] | None = None
 
     def on_mount(self) -> None:
         self.register_theme(BLACK_THEME)
@@ -337,6 +340,15 @@ class HoardApp(App[None]):
                     name=f"{section}-details",
                     exit_on_error=False,
                 )
+
+    def open_publication(self, source: dict[str, Any]) -> None:
+        """Open one local publication without authorization or network work."""
+        source_id = int(source.get("id") or 0)
+        if source_id <= 0:
+            self.set_notice("Публикация не выбрана.", error=True)
+            return
+        self.publication_source = dict(source)
+        self.open_section("telegram_publication")
 
     def leave_workspace(self) -> None:
         """Return from a tool menu to the outer Hoard level."""
@@ -679,13 +691,17 @@ class HoardApp(App[None]):
             focused.action_press()
         elif sidebar := self._visible_sidebar():
             sidebar.choose()
+        elif isinstance(self.screen, WorkspaceScreen):
+            self.screen.open_selected()
 
     def action_back(self) -> None:
         if self._is_text_entry(self.focused):
             return
         current = str(getattr(self.screen, "section", "home"))
         if workspace(current) == "telegram":
-            if current == "telegram_status":
+            if current == "telegram_publication":
+                self.open_section("telegram_sources")
+            elif current == "telegram_status":
                 self.leave_workspace()
             else:
                 self.open_section("telegram_status")

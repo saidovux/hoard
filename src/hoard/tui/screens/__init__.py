@@ -10,12 +10,14 @@ from .telegram import (
     TelegramStatusScreen,
     TelegramWebScreen,
 )
+from .telegram_publication import TelegramPublicationScreen
 
 __all__ = [
     "AIWorkspaceScreen",
     "ArchiveScreen",
     "HomeScreen",
     "TelegramLoginScreen",
+    "TelegramPublicationScreen",
     "TelegramScreen",
     "TelegramSourcesScreen",
     "TelegramStatusScreen",
