@@ -28,24 +28,24 @@ inverse bar.
 * **Key chips.** In the footer a key is an orange block with the action next to it; the left side
   belongs to the screen, the right side is global (`: команды  ? помощь  q выход`).
 * Actions are plain words in a row; the primary one is orange and the focused one becomes an
-  orange block. Modes (e.g. Archive: Кружки / Профили / Задания) are tabs.
+  orange block. Modes (e.g. Обслуживание: Задания / Профили / Медиа / Операции) are tabs.
 * Numbers fade when they are zero and turn orange when they need attention.
 
 ## Pages and navigation levels
 
-The outer Hoard level remains deliberately small. *Обзор* and *Активность* are **Главная**;
-**Архив** remains separate through Round 7; **Telegram** and **AI** are tools. Opening Telegram
-replaces, rather than duplicates, the sidebar with the tool's own workspace. The old keys still
-resolve: `overview`/`activity` open Home, `telegram` opens Telegram Status and `sources` opens the
-nested Sources page.
+The outer Hoard level has exactly three entries: *Обзор* and *Активность* are compatibility aliases
+for **Главная**, while **Telegram** and **AI** are tools. Opening Telegram replaces, rather than
+duplicates, the sidebar with the tool's own workspace. The old keys still resolve:
+`overview`/`activity` open Home, `telegram` opens Telegram Status, `sources` opens the nested
+Sources page and `archive` opens contextual **Статус → Обслуживание**.
 
 | Level | Page | Contents |
 | --- | --- | --- |
 | Hoard | **Главная** | wordmark, compact Telegram activity monitor and quiet queue/archive totals |
-| Hoard | **Архив** | Кружки / Профили / Задания, catalogue, complete manual frame workflow and existing profile/frame AI actions |
 | Hoard | **Telegram** | entry into the Telegram workspace; defaults to Status |
 | Hoard | **AI** | existing provider settings, records and chat |
 | Telegram | **Статус** | live collector work plus read-only archive, FFmpeg-frame and PSL aggregates |
+| Telegram context | **Обслуживание** | bounded global Jobs / Profiles / Media catalogs and explicit HTML, enrichment and FFmpeg operations |
 | Telegram | **Источники** | paginated publication catalog, local search/filter/sort, stable edit/toggle/scan and publication-scoped photo/frame PSL actions |
 | Telegram context | **Публикация** | four source-scoped read-only tabs: Кружки / Профили / Кадры / PSL |
 | Telegram | **Web Viewer** | actual loopback-process state and enable/open/disable actions |
@@ -75,10 +75,10 @@ neutral when state cannot be established.
 ## Responsive and interactive rules
 
 * Table columns are fitted to the actual page width. Secondary columns are shortened or dropped
-  rather than creating a horizontal scrollbar; the same rule applies to Archive and AI lists.
-* Archive has a compact primary action row. Frame backfill, pause/retry and the less common AI
-  modes live behind the **Ещё…** tab, so opening the page does not turn the action block into a
-  wall of controls. The advanced block is mode-specific and closes when the mode changes.
+  rather than creating a horizontal scrollbar; the same rule applies to Maintenance and AI lists.
+* Maintenance has four compact tabs. Jobs, Profiles and Media request one server-paginated page
+  only on entry, filter change or explicit refresh. Operations keeps HTML, enrichment, global
+  FFmpeg and read-only batch history explicit; simply opening the page starts no work.
 * A table is auto-focused only when it is fully visible. On short terminals the page opens at the
   top (summary and actions first); `Ctrl+PageUp` and `Ctrl+PageDown` scroll the page even while a
   table or the sidebar owns the keyboard.
@@ -88,13 +88,14 @@ neutral when state cannot be established.
   one-request guard and stop their timers when hidden. The Status archive aggregates use the
   separate `telegram_statistics_get` request only on entry and explicit refresh; a failed refresh
   retains and marks the last confirmed snapshot. Neither surface queries Telegram or files.
-  Detailed Archive/Sources data is loaded on entry. Web is checked once on first Telegram-workspace
-  entry and reused by its page, without polling or autostart. Status repaint never rebuilds the
-  sidebar, moves its highlight or steals a field's focus.
+  Detailed Maintenance/Sources data is loaded on entry. Operations reads FFmpeg state once and
+  polls only while a confirmed active session remains visible. Web is checked once on first
+  Telegram-workspace entry and reused by its page, without polling or autostart. Status repaint
+  never rebuilds the sidebar, moves its highlight or steals a field's focus.
 * Opening an AI conversation hides the list workspace, gives the message field focus and scrolls
   the conversation to its top. Returning restores the list and focus.
-* Archive and Telegram Sources tables preserve the selected record across refreshes and terminal
-  resizes. Sources keys records by stable `sources.id`; a changed query clears an obsolete
+* Maintenance and Telegram Sources tables preserve stable-ID selection across refreshes and
+  terminal resizes. Sources keys records by `sources.id`; a changed query clears an obsolete
   selection before any action can use it. Opening a publication keeps that Sources screen instance
   alive, so returning restores its query, filter, sort, offset, cursor and scroll.
 

@@ -161,6 +161,7 @@ class TelegramStatusScreen(_CollectorControls, _TelegramWorkspaceScreen):
         with Panel(title="Статистика Telegram", id="telegram-statistics-panel"):
             with Horizontal(classes="action-row", id="telegram-statistics-actions"):
                 yield Button("Обновить", id="telegram-statistics-refresh", variant="primary")
+                yield Button("Обслуживание", id="telegram-maintenance")
             yield Static(id="telegram-statistics")
 
     def on_screen_resume(self) -> None:
@@ -438,6 +439,9 @@ class TelegramStatusScreen(_CollectorControls, _TelegramWorkspaceScreen):
             "collector-stop": self._stop,
             "telegram-login": lambda: self.hoard_app.open_section("telegram_login"),
             "telegram-statistics-refresh": self._request_statistics,
+            "telegram-maintenance": lambda: self.hoard_app.open_section(
+                "telegram_maintenance"
+            ),
         }
         action = actions.get(str(event.button.id))
         if action:

@@ -755,6 +755,52 @@ class Store:
             raise ValueError("Локальное медиа не найдено в выбранной публикации")
         return self._validated_media_path(str(row["file_path"]), int(row["size"] or 0))
 
+    def resolve_global_media(
+        self,
+        kind: str,
+        *,
+        source_id: int | None = None,
+        message_id: int | None = None,
+        author_id: int | None = None,
+        photo_id: str | None = None,
+        position: int | None = None,
+    ) -> Path:
+        """Resolve one stable archived object while retaining legacy/unlinked access."""
+        media_kind = str(kind or "")
+        row: Any = None
+        if media_kind == "video":
+            row = self.db.execute(
+                """SELECT file_path,size FROM downloads
+                WHERE source_id=? AND message_id=?""",
+                (int(source_id or 0), int(message_id or 0)),
+            ).fetchone()
+        elif media_kind == "photo":
+            row = self.db.execute(
+                """SELECT file_path,size FROM tg_profile_photos
+                WHERE author_id=? AND photo_id=? AND status='saved'""",
+                (int(author_id or 0), str(photo_id or "")),
+            ).fetchone()
+        elif media_kind == "frame":
+            source = int(source_id or 0)
+            message = int(message_id or 0)
+            frame_position = int(position or 0)
+            details = self.telegram.frame_details(source, message)
+            if details is None or not details.get("valid"):
+                raise ValueError("Набор кадров недоступен или повреждён")
+            row = next(
+                (
+                    frame
+                    for frame in details.get("frames") or []
+                    if int(frame.get("position") or 0) == frame_position
+                ),
+                None,
+            )
+        else:
+            raise ValueError("Неизвестный тип локального медиа")
+        if row is None:
+            raise ValueError("Локальное медиа не найдено в архиве")
+        return self._validated_media_path(str(row["file_path"]), int(row["size"] or 0))
+
     def sources(self) -> list[dict]:
         return [
             dict(row)
@@ -934,6 +980,100 @@ class Store:
              AND frames.message_id=downloads.message_id
             ORDER BY downloads.rowid DESC LIMIT ?""", (count,))]
 
+    def telegram_media_list(
+        self,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+        query: str = "",
+        sort: str = "newest",
+    ) -> dict[str, Any]:
+        """Return a bounded global video-note page without filesystem work."""
+        page_limit, page_offset = self._catalog_page(limit, offset)
+        needle = str(query or "").strip().casefold()
+        if len(needle) > 200:
+            raise ValueError("Поиск медиа не должен превышать 200 символов")
+        order_by = {
+            "newest": "d.rowid DESC",
+            "oldest": "d.rowid ASC",
+            "date_desc": "d.date DESC,d.rowid DESC",
+            "size_desc": "d.size DESC,d.rowid DESC",
+        }.get(str(sort or "newest"))
+        if order_by is None:
+            raise ValueError("Неизвестный порядок сортировки медиа")
+        clauses = ["1=1"]
+        parameters: list[Any] = []
+        if needle:
+            pattern = f"%{needle.lstrip('@')}%"
+            clauses.append(
+                """(CAST(d.message_id AS TEXT) LIKE ? OR CAST(d.author_id AS TEXT) LIKE ? OR
+                lower(d.author_username) LIKE ? OR lower(d.author_name) LIKE ? OR
+                lower(COALESCE(s.username,'')) LIKE ? OR lower(COALESCE(s.title,'')) LIKE ? OR
+                CAST(COALESCE(s.post_id,'') AS TEXT) LIKE ?)"""
+            )
+            parameters.extend([pattern] * 7)
+        where = " AND ".join(clauses)
+        total = int(
+            self.db.execute(
+                f"""SELECT COUNT(*) FROM downloads d
+                LEFT JOIN sources s ON s.id=d.source_id WHERE {where}""",
+                parameters,
+            ).fetchone()[0]
+        )
+        items = [
+            dict(row)
+            for row in self.db.execute(
+                f"""SELECT d.source_id,d.message_id,d.author_id,d.author_username,
+                d.author_name,d.date,d.size,d.state,
+                s.username AS source_username,s.title AS source_title,s.post_id,
+                CASE WHEN s.id IS NULL THEN 0 ELSE 1 END AS source_available,
+                COALESCE(frames.status,'missing') AS frame_status,
+                COALESCE(frames.frame_count,0) AS frame_count,
+                frames.error_code AS frame_error_code
+                FROM downloads d LEFT JOIN sources s ON s.id=d.source_id
+                LEFT JOIN tg_video_frame_sets frames
+                  ON frames.source_id=d.source_id AND frames.message_id=d.message_id
+                WHERE {where} ORDER BY {order_by} LIMIT ? OFFSET ?""",
+                (*parameters, page_limit, page_offset),
+            )
+        ]
+        return {
+            "items": items,
+            "total": total,
+            "limit": page_limit,
+            "offset": page_offset,
+            "has_more": page_offset + len(items) < total,
+        }
+
+    def telegram_media_details(self, source_id: int, message_id: int) -> dict[str, Any]:
+        """Inspect one globally selected video without requiring a live source relation."""
+        row = self.db.execute(
+            """SELECT d.source_id,d.message_id,d.author_id,d.author_username,d.author_name,
+            d.date,d.media_url,d.file_path,d.size,d.state,
+            s.username AS source_username,s.title AS source_title,s.post_id,
+            CASE WHEN s.id IS NULL THEN 0 ELSE 1 END AS source_available,
+            COALESCE(frames.status,'missing') AS frame_status,
+            COALESCE(frames.frame_count,0) AS frame_count,
+            frames.error AS frame_error,frames.error_code AS frame_error_code
+            FROM downloads d LEFT JOIN sources s ON s.id=d.source_id
+            LEFT JOIN tg_video_frame_sets frames
+              ON frames.source_id=d.source_id AND frames.message_id=d.message_id
+            WHERE d.source_id=? AND d.message_id=?""",
+            (int(source_id), int(message_id)),
+        ).fetchone()
+        if row is None:
+            raise ValueError("Видеокружок не найден в локальном архиве")
+        item = dict(row)
+        try:
+            self._validated_media_path(str(item.pop("file_path")), int(item["size"] or 0))
+        except ValueError as exc:
+            item["available"] = False
+            item["availability_error"] = str(exc)
+        else:
+            item["available"] = True
+            item["availability_error"] = ""
+        return item
+
     def recent_events(self, count: int = 30) -> list[dict]:
         return [dict(r) for r in self.db.execute(
             "SELECT created_at,kind,text FROM events ORDER BY id DESC LIMIT ?", (count,))]
@@ -1043,6 +1183,92 @@ class Store:
             "FROM jobs ORDER BY id DESC LIMIT ?",
             (count,))]
 
+    @staticmethod
+    def _catalog_page(limit: int = 50, offset: int = 0) -> tuple[int, int]:
+        page_limit = int(limit)
+        page_offset = int(offset)
+        if not 1 <= page_limit <= 100:
+            raise ValueError("limit должен быть от 1 до 100")
+        if page_offset < 0:
+            raise ValueError("offset не может быть отрицательным")
+        return page_limit, page_offset
+
+    @staticmethod
+    def _job_summary(row: Any) -> dict[str, Any]:
+        item = dict(row)
+        item["result"] = Store._overview_text(item.get("result"), 300)
+        item["retryable"] = (
+            item.get("state") == "failed"
+            and not str(item.get("kind") or "").startswith("ai.")
+        )
+        item["manual_permission_required"] = (
+            item.get("kind") == "telegram.video_frames"
+            and item.get("state") == "waiting"
+        )
+        return item
+
+    def jobs_list(
+        self,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+        state: str = "",
+        kind: str = "",
+    ) -> dict[str, Any]:
+        """Return one compact, parameterized page of the global durable queue."""
+        page_limit, page_offset = self._catalog_page(limit, offset)
+        selected_state = str(state or "").strip()
+        if selected_state and selected_state not in {
+            "queued", "running", "waiting", "done", "failed"
+        }:
+            raise ValueError("Неизвестное состояние задания")
+        kind_query = str(kind or "").strip().casefold()
+        if len(kind_query) > 100:
+            raise ValueError("Фильтр типа задания не должен превышать 100 символов")
+        clauses = ["1=1"]
+        parameters: list[Any] = []
+        if selected_state:
+            clauses.append("state=?")
+            parameters.append(selected_state)
+        if kind_query:
+            clauses.append("lower(kind) LIKE ?")
+            parameters.append(f"%{kind_query}%")
+        where = " AND ".join(clauses)
+        total = int(
+            self.db.execute(
+                f"SELECT COUNT(*) FROM jobs WHERE {where}", parameters
+            ).fetchone()[0]
+        )
+        items = [
+            self._job_summary(row)
+            for row in self.db.execute(
+                f"""SELECT id,kind,state,attempts,result,created_at,updated_at
+                FROM jobs WHERE {where} ORDER BY id DESC LIMIT ? OFFSET ?""",
+                (*parameters, page_limit, page_offset),
+            )
+        ]
+        return {
+            "items": items,
+            "total": total,
+            "limit": page_limit,
+            "offset": page_offset,
+            "has_more": page_offset + len(items) < total,
+        }
+
+    def job_details(self, job_id: int) -> dict[str, Any]:
+        """Return safe queue metadata without payloads, paths or credentials."""
+        identifier = int(job_id)
+        if identifier <= 0:
+            raise ValueError("Нужен корректный ID задания")
+        row = self.db.execute(
+            """SELECT id,kind,state,attempts,result,created_at,updated_at
+            FROM jobs WHERE id=?""",
+            (identifier,),
+        ).fetchone()
+        if row is None:
+            raise ValueError("Задание не найдено")
+        return self._job_summary(row)
+
     def mark_running(self, jid: int) -> bool:
         with self.db:
             cur = self.db.execute("""UPDATE jobs SET state='running', attempts=attempts+1,
@@ -1095,11 +1321,21 @@ class Store:
             raise ValueError("Invalid retry target state")
         with self.db:
             row = self.db.execute(
-                "SELECT unique_key FROM jobs WHERE id=? AND state='failed'",
+                "SELECT unique_key,state FROM jobs WHERE id=?",
                 (int(jid),),
             ).fetchone()
             if row is None:
-                raise ValueError("Нужна существующая задача со статусом failed")
+                raise ValueError("Задание не найдено")
+            current_state = str(row["state"] or "")
+            active_states = (
+                {"queued", "running", "waiting"}
+                if target_state == "waiting"
+                else {"queued", "running"}
+            )
+            if current_state in active_states:
+                return int(jid)
+            if current_state != "failed":
+                raise ValueError("Повторить можно только failed-задание")
             unique_key = row["unique_key"]
             if unique_key is not None:
                 states = ("queued", "running", "waiting") if target_state == "waiting" else (

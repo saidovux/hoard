@@ -20,7 +20,7 @@ from .ai.chat_service import AIChatService
 from .ai.config import AIConfig
 from .ai.errors import AIAuthenticationError, AIConfigurationError
 from .ai.ipc_api import AIIPC
-from .archive_paths import telegram_catalog_file
+from .archive_paths import path_is_within, telegram_catalog_file
 from .catalog import build_catalog_from_db
 from .config import read_credentials, write_credentials
 from .integrations.media import download, validate_media
@@ -660,6 +660,10 @@ class Service:
             "source_id": session.get("source_id"),
             "selected_count": int(session.get("selected_count") or 0),
             "completed": int(session.get("completed") or 0),
+            "successful": max(
+                0,
+                int(session.get("completed") or 0) - int(session.get("errors") or 0),
+            ),
             "waiting": counts["waiting"],
             "queued": counts["queued"],
             "running": counts["running"],
@@ -690,8 +694,24 @@ class Service:
             self._schedule_catalog_publish()
         return was_active
 
-    async def _stop_frame_processing(self) -> bool:
+    async def _stop_frame_processing(
+        self,
+        *,
+        expected_session_id: str | None = None,
+        expected_source_id: int | None = None,
+    ) -> bool:
         async with self._mode_lock:
+            session = self._frame_session
+            if expected_session_id is not None:
+                if session is None or str(session.get("id") or "") != expected_session_id:
+                    raise RuntimeError(
+                        "FFmpeg-сессия изменилась; обнови статус и подтверди остановку снова"
+                    )
+            if expected_source_id is not None:
+                if session is None or int(session.get("source_id") or 0) != expected_source_id:
+                    raise RuntimeError(
+                        "FFmpeg-сессия относится к другой публикации; остановка отменена"
+                    )
             return await self._stop_frame_processing_locked(
                 reason="Обработка кадров остановлена пользователем"
             )
@@ -1276,6 +1296,15 @@ class Service:
             return self._status_snapshot(detailed=True)
         if method == "status_brief":
             return self._status_snapshot(detailed=False)
+        if method == "jobs_list":
+            return self.store.jobs_list(
+                limit=int(args.get("limit", 50)),
+                offset=int(args.get("offset", 0)),
+                state=str(args.get("state") or ""),
+                kind=str(args.get("kind") or ""),
+            )
+        if method == "job_get":
+            return {"job": self.store.job_details(int(args.get("id") or 0))}
         if method == "telegram_statistics_get":
             statistics = self.store.telegram_statistics()
             statistics["frames"].update(
@@ -1301,6 +1330,38 @@ class Service:
             return {"source": source}
         if method == "telegram_publication_get":
             return {"publication": self.store.telegram_publication(int(args.get("source_id") or 0))}
+        if method == "telegram_media_list":
+            return self.store.telegram_media_list(
+                limit=int(args.get("limit", 50)),
+                offset=int(args.get("offset", 0)),
+                query=str(args.get("query") or ""),
+                sort=str(args.get("sort") or "newest"),
+            )
+        if method == "telegram_media_get":
+            return {
+                "media": self.store.telegram_media_details(
+                    int(args.get("source_id") or 0),
+                    int(args.get("message_id") or 0),
+                )
+            }
+        if method == "telegram_media_open":
+            path = self.store.resolve_global_media(
+                str(args.get("kind") or ""),
+                source_id=(
+                    int(args["source_id"]) if args.get("source_id") is not None else None
+                ),
+                message_id=(
+                    int(args["message_id"]) if args.get("message_id") is not None else None
+                ),
+                author_id=(
+                    int(args["author_id"]) if args.get("author_id") is not None else None
+                ),
+                photo_id=(str(args["photo_id"]) if args.get("photo_id") is not None else None),
+                position=(int(args["position"]) if args.get("position") is not None else None),
+            )
+            if not self._media_opener(path):
+                raise RuntimeError("Внешнее приложение не подтвердило открытие файла")
+            return {"opened": True, "message": "Локальный файл открыт во внешнем приложении"}
         if method == "telegram_publication_downloads_list":
             return self.store.telegram_publication_downloads(
                 int(args.get("source_id") or 0),
@@ -1472,6 +1533,22 @@ class Service:
                     str(path) for path in self.store.telegram.allowed_media_roots(root)
                 ],
             }
+        if method == "telegram_catalog_open":
+            root = self.store.telegram.archive_root()
+            expected = telegram_catalog_file(root)
+            try:
+                catalog = expected.resolve(strict=True)
+            except (OSError, RuntimeError, ValueError) as exc:
+                raise ValueError("HTML-каталог ещё не создан") from exc
+            if (
+                catalog != expected.absolute()
+                or not path_is_within(catalog, root)
+                or not catalog.is_file()
+            ):
+                raise ValueError("HTML-каталог недоступен или путь изменён")
+            if not self._media_opener(catalog):
+                raise RuntimeError("Внешнее приложение не подтвердило открытие HTML-каталога")
+            return {"opened": True, "message": "HTML-каталог открыт во внешнем приложении"}
         if method in {
             "telegram_frames_get",
             "telegram_frames_process",
@@ -1546,7 +1623,14 @@ class Service:
                     )
                 return await self._start_bulk_frame_processing()
             if method == "telegram_frames_backfill_pause":
-                stopped = await self._stop_frame_processing()
+                raw_session = str(args.get("expected_session_id") or "").strip()
+                raw_source = args.get("expected_source_id")
+                stopped = await self._stop_frame_processing(
+                    expected_session_id=raw_session or None,
+                    expected_source_id=(
+                        int(raw_source) if raw_source not in {None, ""} else None
+                    ),
+                )
                 return {
                     "message": (
                         "FFmpeg остановлен; незавершённое задание ожидает ручного запуска"
@@ -1602,7 +1686,7 @@ class Service:
             return {"message": f"Медиа добавлено в очередь: #{jid}", "job_id": jid}
         if method == "job_retry":
             job = self.store.db.execute(
-                "SELECT kind FROM jobs WHERE id=?", (int(args["id"]),)
+                "SELECT kind,state FROM jobs WHERE id=?", (int(args["id"]),)
             ).fetchone()
             if job is not None and str(job["kind"]).startswith("ai."):
                 raise ValueError("AI-запросы повторяются только через ai_attempt_retry")
@@ -1626,6 +1710,8 @@ class Service:
                     else "Задание возвращено в очередь"
                 )
                 if job_id == int(args["id"])
+                and job is not None
+                and str(job["state"] or "") == "failed"
                 else f"Задание уже выполняется или стоит в очереди: #{job_id}"
             )
             return {"message": message, "job_id": job_id}

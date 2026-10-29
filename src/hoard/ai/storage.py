@@ -1393,6 +1393,14 @@ class AIStorage:
             SUM(CASE WHEN {state_sql}='skipped' THEN 1 ELSE 0 END) AS skipped,
             SUM(CASE WHEN {state_sql} IN ('failed','outcome_unknown') THEN 1 ELSE 0 END)
                 AS errors,
+            SUM(CASE WHEN t.state='completed' AND a.result_status='completed'
+                THEN 1 ELSE 0 END) AS successful,
+            SUM(CASE WHEN a.result_status='insufficient_data' THEN 1 ELSE 0 END)
+                AS insufficient_data,
+            SUM(CASE WHEN a.result_status='ineligible' THEN 1 ELSE 0 END) AS ineligible,
+            SUM(CASE WHEN a.result_status='invalid_result' THEN 1 ELSE 0 END) AS invalid,
+            SUM(CASE WHEN {state_sql}='outcome_unknown' THEN 1 ELSE 0 END)
+                AS outcome_unknown,
             SUM(CASE WHEN t.estimated_cost IS NOT NULL AND t.cost_currency='USD'
                 THEN CAST(t.estimated_cost AS REAL) ELSE NULL END) AS usd_total,
             SUM(CASE WHEN i.analysis_id IS NOT NULL
@@ -1427,13 +1435,24 @@ class AIStorage:
         for item in page:
             if item["item_state"] == "skipped":
                 item["state"] = "skipped"
-                continue
-            state = str(item.get("attempt_state") or item["item_state"])
-            item["state"] = state
-            item["failure_category"] = psl_failure_category(
-                state, item.get("error_code"), item.get("result_status")
-            )
+            else:
+                state = str(item.get("attempt_state") or item["item_state"])
+                item["state"] = state
+                item["failure_category"] = psl_failure_category(
+                    state, item.get("error_code"), item.get("result_status")
+                )
             item.pop("error_code", None)
+            successful = (
+                item.get("state") == "completed"
+                and item.get("result_status") == "completed"
+                and item.get("presentation") == "female"
+                and isinstance(item.get("estimated_age"), int)
+                and int(item["estimated_age"]) >= 18
+            )
+            if not successful:
+                item["estimated_age"] = None
+                for key in ("raw_psl_min", "raw_psl_max", "boosted_psl"):
+                    item[key] = None
         total = int(statistics["total"] or 0)
         queued = int(statistics["queued"] or 0)
         usd_total = (
@@ -1458,12 +1477,101 @@ class AIStorage:
                 "completed": int(statistics["completed"] or 0),
                 "skipped": int(statistics["skipped"] or 0),
                 "errors": int(statistics["errors"] or 0),
+                "successful": int(statistics["successful"] or 0),
+                "insufficient_data": int(statistics["insufficient_data"] or 0),
+                "ineligible": int(statistics["ineligible"] or 0),
+                "invalid": int(statistics["invalid"] or 0),
+                "outcome_unknown": int(statistics["outcome_unknown"] or 0),
                 "estimated_cost_usd": format(usd_total, "f") if usd_total is not None else None,
                 "unknown_cost": int(statistics["unknown_cost"] or 0),
                 "terminal": queued == 0,
             }
         )
         return result
+
+    def telegram_batch_catalog(
+        self,
+        *,
+        active_only: bool = False,
+        limit: Any = 20,
+        offset: Any = 0,
+        source_id: int | None = None,
+    ) -> dict[str, Any]:
+        """Return compact batch summaries without loading participant pages."""
+        page_limit, page_offset = paging(limit, offset)
+        clauses = ["1=1"]
+        parameters: list[Any] = []
+        if source_id is not None:
+            clauses.append("b.source_id=?")
+            parameters.append(int(source_id))
+        state_sql = (
+            "CASE WHEN i.state='skipped' THEN 'skipped' "
+            "WHEN i.technical_failed=1 THEN 'failed' "
+            "ELSE COALESCE(t.state,i.state) END"
+        )
+        active_clause = ""
+        if active_only:
+            active_clause = (
+                f"HAVING SUM(CASE WHEN {state_sql} IN "
+                "('queued','running','pending') THEN 1 ELSE 0 END)>0"
+            )
+        where = " AND ".join(clauses)
+        total_query = f"""SELECT COUNT(*) FROM ai_telegram_batches b WHERE {where}"""
+        if active_only:
+            total_query = f"""SELECT COUNT(*) FROM (
+                SELECT b.id FROM ai_telegram_batches b
+                LEFT JOIN ai_telegram_batch_items i ON i.batch_id=b.id
+                LEFT JOIN ai_telegram_analyses a ON a.id=i.analysis_id
+                LEFT JOIN ai_attempts t ON t.id=a.attempt_id
+                WHERE {where} GROUP BY b.id {active_clause})"""
+        total = int(self.db.execute(total_query, parameters).fetchone()[0])
+        rows = [
+            dict(row)
+            for row in self.db.execute(
+                f"""SELECT b.id,b.source_id,b.selected_count,b.created_at,b.request_payload,
+                COUNT(i.author_id) AS total,
+                SUM(CASE WHEN {state_sql} IN ('queued','running','pending')
+                    THEN 1 ELSE 0 END) AS queued,
+                SUM(CASE WHEN {state_sql}='completed' THEN 1 ELSE 0 END) AS completed,
+                SUM(CASE WHEN {state_sql}='skipped' THEN 1 ELSE 0 END) AS skipped,
+                SUM(CASE WHEN {state_sql} IN ('failed','outcome_unknown')
+                    THEN 1 ELSE 0 END) AS errors,
+                SUM(CASE WHEN t.state='completed' AND a.result_status='completed'
+                    THEN 1 ELSE 0 END) AS successful,
+                SUM(CASE WHEN a.result_status='insufficient_data' THEN 1 ELSE 0 END)
+                    AS insufficient_data,
+                SUM(CASE WHEN a.result_status='ineligible' THEN 1 ELSE 0 END) AS ineligible,
+                SUM(CASE WHEN {state_sql}='outcome_unknown' THEN 1 ELSE 0 END)
+                    AS outcome_unknown
+                FROM ai_telegram_batches b
+                LEFT JOIN ai_telegram_batch_items i ON i.batch_id=b.id
+                LEFT JOIN ai_telegram_analyses a ON a.id=i.analysis_id
+                LEFT JOIN ai_attempts t ON t.id=a.attempt_id
+                WHERE {where} GROUP BY b.id {active_clause}
+                ORDER BY b.created_at DESC,b.id DESC LIMIT ? OFFSET ?""",
+                (*parameters, page_limit, page_offset),
+            )
+        ]
+        for item in rows:
+            request = self._decode(str(item.pop("request_payload") or "{}"))
+            item["image_mode"] = (
+                str(request.get("image_mode") or "photos")
+                if isinstance(request, dict)
+                else "photos"
+            )
+            for key in (
+                "total", "queued", "completed", "skipped", "errors", "successful",
+                "insufficient_data", "ineligible", "outcome_unknown",
+            ):
+                item[key] = int(item.get(key) or 0)
+            item["terminal"] = item["queued"] == 0
+        return {
+            "items": rows,
+            "total": total,
+            "limit": page_limit,
+            "offset": page_offset,
+            "has_more": page_offset + len(rows) < total,
+        }
 
     def list_telegram_batches(
         self,

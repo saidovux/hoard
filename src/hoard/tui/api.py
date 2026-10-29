@@ -101,6 +101,19 @@ class HoardAPI(Protocol):
 
     async def retry_job(self, job_id: int) -> dict[str, Any]: ...
 
+    async def jobs_list(
+        self,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+        state: str = "",
+        kind: str = "",
+    ) -> dict[str, Any]: ...
+
+    async def job_get(self, job_id: int) -> dict[str, Any]: ...
+
+    async def open_catalog(self) -> dict[str, Any]: ...
+
     async def telegram_call(
         self, method: str, args: dict[str, Any] | None = None
     ) -> dict[str, Any]: ...
@@ -273,6 +286,26 @@ class IPCStatusAPI:
 
     async def retry_job(self, job_id: int) -> dict[str, Any]:
         return await request("job_retry", {"id": job_id}, timeout=self.CONTROL_TIMEOUT)
+
+    async def jobs_list(
+        self,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+        state: str = "",
+        kind: str = "",
+    ) -> dict[str, Any]:
+        return await request(
+            "jobs_list",
+            {"limit": limit, "offset": offset, "state": state, "kind": kind},
+            timeout=self.CONTROL_TIMEOUT,
+        )
+
+    async def job_get(self, job_id: int) -> dict[str, Any]:
+        return await request("job_get", {"id": job_id}, timeout=self.CONTROL_TIMEOUT)
+
+    async def open_catalog(self) -> dict[str, Any]:
+        return await request("telegram_catalog_open", timeout=self.CONTROL_TIMEOUT)
 
     async def telegram_call(
         self, method: str, args: dict[str, Any] | None = None

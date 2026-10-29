@@ -201,7 +201,7 @@ class TelegramPublicationScreen(WorkspaceScreen):
                     variant="primary",
                 )
                 yield Button("Анализировать публикацию", id="publication-psl-source")
-                yield Button("Открыть последнюю группу", id="publication-psl-batch")
+                yield Button("История AI-групп", id="publication-psl-batch")
             yield Static("FFmpeg не запущен.", id="publication-frame-status")
             yield Static("AI-групп публикации пока нет.", id="publication-batch-status")
 
@@ -659,6 +659,7 @@ class TelegramPublicationScreen(WorkspaceScreen):
         active = bool(
             self._frame_session
             and str(self._frame_session.get("state") or "") == "running"
+            and int(self._frame_session.get("source_id") or 0) == self.source_id
         )
         self.query_one("#publication-frames-stop", Button).disabled = not active
 
@@ -739,7 +740,14 @@ class TelegramPublicationScreen(WorkspaceScreen):
         elif identifier == "publication-frames-retry":
             self._confirm_frames_retry()
         elif identifier == "publication-frames-stop":
-            self._run_frame_action("telegram_frames_backfill_pause", {})
+            session = self._frame_session or {}
+            self._run_frame_action(
+                "telegram_frames_backfill_pause",
+                {
+                    "expected_session_id": str(session.get("session_id") or ""),
+                    "expected_source_id": self.source_id,
+                },
+            )
         elif identifier == "publication-psl-selected":
             self._analyze_selected_profiles()
         elif identifier == "publication-psl-source":
@@ -894,14 +902,9 @@ class TelegramPublicationScreen(WorkspaceScreen):
         )
 
     def _open_last_batch(self) -> None:
-        batch = self._ai_batch
-        if not batch:
-            self.hoard_app.set_notice("У публикации пока нет AI-групп.")
-            return
-        self.hoard_app.set_notice(
-            f"AI-группа {batch.get('id')}: очередь {batch.get('queued', 0)} · "
-            f"готово {batch.get('completed', 0)} · пропущено {batch.get('skipped', 0)} · "
-            f"ошибки {batch.get('errors', 0)}"
+        self.hoard_app.open_telegram_batch_history(
+            source_id=self.source_id,
+            title=f"AI-группы · {self.publication.get('title') or self.source_id}",
         )
 
     def _switch_mode(self, mode: str) -> None:
@@ -955,7 +958,8 @@ class TelegramPublicationScreen(WorkspaceScreen):
                     "telegram_frames_session_status", {"source_id": source_id}
                 ),
                 self.hoard_app.api.ai_call(
-                    "ai_telegram_batch_list", {"source_id": source_id, "limit": 1}
+                    "ai_telegram_batch_catalog",
+                    {"source_id": source_id, "limit": 1, "offset": 0},
                 ),
                 return_exceptions=True,
             )
@@ -986,13 +990,19 @@ class TelegramPublicationScreen(WorkspaceScreen):
             }.get(str(session.get("session_type") or ""), "ручная сессия")
             source = session.get("source_id")
             scope = "эта публикация" if source == self.source_id else f"источник {source or '—'}"
+            completed = int(session.get("completed") or 0)
+            errors = int(session.get("errors") or 0)
+            successful = int(session.get("successful") or max(0, completed - errors))
             frame_text = (
                 f"FFmpeg · {mode} · {scope} · {session.get('state') or '—'}\n"
-                f"Готово {session.get('completed', 0)} из "
+                f"Завершено {completed} из "
                 f"{session.get('selected_count', 0)} · ожидает "
                 f"{int(session.get('waiting', 0)) + int(session.get('queued', 0))} · "
-                f"в работе {session.get('running', 0)} · ошибки {session.get('errors', 0)}"
+                f"в работе {session.get('running', 0)} · успешно {successful} · "
+                f"ошибки {errors}"
             )
+            if source != self.source_id and str(session.get("state") or "") == "running":
+                frame_text += "\nЭтой сессией можно управлять в Статус → Обслуживание."
             if session.get("current_message_id"):
                 frame_text += f" · текущий {session['current_message_id']}"
         else:

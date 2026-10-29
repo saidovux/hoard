@@ -11,11 +11,12 @@ background service.
 - `tui/` is the only interactive terminal client: a full-screen Textual application. `app.py`
   owns lifecycle, contextual keyboard navigation, named mutation guards and the single in-flight
   status refresh; `api.py` provides typed operations over the existing `ensure_daemon()` /
-  `request()` boundary. `navigation.py` declares the four-entry global level and the Telegram
+  `request()` boundary. `navigation.py` declares the three-entry global level and the Telegram
   workspace (former Overview/Activity map to Home; Sources maps to Telegram Sources) used by the
   contextual sidebar, breadcrumb, level-local digits/cycling and palette;
   `screens/telegram_publication.py` is an internal route whose navigation parent is Sources, so
-  dynamic source IDs never enter the global section registry;
+  dynamic source IDs never enter the global section registry; `screens/telegram_maintenance.py`
+  is the contextual Status child for bounded global catalogs and explicit archive operations;
   `colors.py` owns the Noir palette; `palette.py` searches sections and app commands;
   `widgets/panel.py`, `widgets/hero.py`, `widgets/status.py`, `widgets/telegram_monitor.py` and
   `widgets/chrome.py` provide the framed-panel layout, wordmark, figures, the compact Home transfer
@@ -23,7 +24,7 @@ background service.
   reusable widgets and TCSS remain separate. The package imports neither storage nor Telethon, and
   never creates a Telegram client. See `docs/TUI.md`.
 - `ipc.py` starts the daemon detached when required and sends one JSON request per private
-  Unix-socket connection. Client and daemon must both report Hoard 0.7.4.4 and IPC protocol `1`.
+  Unix-socket connection. Client and daemon must both report Hoard 0.7.4.5 and IPC protocol `1`.
   A held instance lock with no ready socket means initialization is in progress, so the client
   waits for that owner instead of spawning a second daemon.
 - `service.py` owns the database, three independently limited job runners and the sole
@@ -94,9 +95,10 @@ both request bounded `status_brief` snapshots through the app's single in-flight
 Telegram monitor uses only that snapshot, updates changed content without rebuilding navigation,
 and clears transfer slots when the collector stops or IPC becomes unavailable. Telegram Status
 loads archival aggregates separately through read-only `telegram_statistics_get` on entry or
-manual refresh, never from its live timer. Archive requests detailed status only when opened;
-recent collections are bounded and an oversized compatibility response is explicitly truncated
-before the 64 KiB IPC boundary. Telegram Sources uses its own bounded
+manual refresh, never from its live timer. Contextual Maintenance requests server-paginated jobs,
+profiles and media only on entry, filter or explicit refresh; Operations polls only a confirmed
+active FFmpeg session while visible. Recent compatibility collections remain bounded and an
+oversized response is explicitly truncated before the 64 KiB IPC boundary. Telegram Sources uses its own bounded
 `telegram_sources_overview` request and does not depend on that compatibility array. Screen
 suspension, unmount and app exit
 stop their timers. IPC startup and request errors render inside the stable black workspace so a slow
@@ -105,14 +107,15 @@ collector, frame-stop, shutdown or Telegram command; previously started frame/We
 
 The Textual theme sets background, surface and panel to `#000000`; TCSS also fixes computed
 backgrounds for containers, navigation components, focus/hover/selected states, inputs, tables,
-buttons, menus and modals. The outer workspace exposes **Главная**, **Архив**, **Telegram** and
-**AI**. Home keeps the wordmark, one Telegram activity monitor and compact Hoard-wide totals;
+buttons, menus and modals. The outer workspace exposes only **Главная**, **Telegram** and **AI**.
+Home keeps the wordmark, one Telegram activity monitor and compact Hoard-wide totals;
 historical events and tool summaries remain available through their owning screens/data rather
 than global Home panels. Telegram switches that same
 sidebar to **Статус**, **Источники**, and bottom-pinned **Web Viewer** and **Вход** pages; no second
-sidebar is mounted. `telegram` resolves to Status and `sources` directly to Sources. Archive retains
-downloads, profiles, jobs, catalog and video-frame actions, with less frequent AI/frame commands
-behind a mode-specific **Ещё…** block. Tables fit or reduce their columns instead of scrolling sideways, and a table is
+sidebar is mounted. `telegram` resolves to Status, `sources` directly to Sources and the legacy
+`archive` route to contextual **Status → Maintenance**. Maintenance retains bounded Jobs, Profiles
+and Media catalogs plus explicit catalog, enrichment and global-frame actions; read-only AI batch
+history is reachable there and from AI. Tables fit or reduce their columns instead of scrolling sideways, and a table is
 auto-focused only when it is fully visible. The modular AI screen and dialogs expose only
 implemented IPC operations and never import storage, provider transports or Telegram. Every
 surface is a black framed-panel workspace with an orange focus border; tests enforce the palette,

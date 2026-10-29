@@ -8,7 +8,7 @@ Local-first Telegram archive and extensible small-tool core, Python >=3.11. Keep
 - Keep the Noir terminal-native visual language: black surfaces, `#FFFFFF` text, `#888888` hints,
   `#7B4B23` frames at rest, `#262626` hairlines and `#F79646` focus/meaning. Pages are framed
   `Panel`s with titles in the border, shortcuts as key chips and orange block selection. `Home`,
-  `Archive`, `Telegram` and `AI` remain the four global entries. Telegram replaces the
+  `Telegram` and `AI` are the three global entries. Telegram replaces the
   global menu with its `Status`, `Sources`, bottom-pinned `Web Viewer` and `Login` workspace;
   `overview`/`activity`/`sources` remain navigation aliases, with `sources` opening the nested
   Sources page. New controls for existing features must fit this language instead of adding a new
@@ -21,6 +21,11 @@ Local-first Telegram archive and extensible small-tool core, Python >=3.11. Keep
   `status_brief` only while visible, while archive/FFmpeg/PSL aggregates use the read-only
   `telegram_statistics_get` IPC only on entry or explicit refresh. Preserve the last successful
   aggregate snapshot on errors; never make this page start Telegram, FFmpeg, Web or AI work.
+- The contextual `telegram_maintenance` route belongs to Telegram Status and is not a fifth
+  sidebar or palette entry. Its Jobs, Profiles and Media catalogs are bounded, server-paginated
+  and loaded on entry/filter/refresh without polling; Operations may poll only an active FFmpeg
+  session while visible. HTML rebuild/open, enrichment, global FFmpeg and PSL remain explicit.
+  The retired `archive` route is a compatibility alias to this screen; `ArchiveScreen` is gone.
 - Telegram Sources uses the bounded, paginated `telegram_sources_overview` IPC rather than
   compatibility `status.sources`. Keep search/filter/sort in SQLite, preserve stable source-ID
   selection and do not add polling. Source edits use `source_update`, keep the post identity,

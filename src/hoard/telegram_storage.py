@@ -1506,6 +1506,36 @@ class TelegramStorage:
             raise ValueError("Telegram-профиль не найден в локальном архиве")
         result = dict(row)
         result["photos"] = self.profile_photos(author_id)
+        result["username_history"] = [
+            dict(item)
+            for item in self.db.execute(
+                """SELECT username,first_seen,last_seen FROM tg_username_history
+                WHERE author_id=? ORDER BY last_seen DESC,username LIMIT 100""",
+                (int(author_id),),
+            )
+        ]
+        result["sources"] = [
+            dict(item)
+            for item in self.db.execute(
+                """SELECT sources.id,sources.username,sources.post_id,sources.title,
+                links.first_seen,links.last_seen
+                FROM tg_profile_sources links JOIN sources ON sources.id=links.source_id
+                WHERE links.author_id=? ORDER BY links.last_seen DESC,sources.id DESC LIMIT 100""",
+                (int(author_id),),
+            )
+        ]
+        result["video_count"] = int(
+            self.db.execute(
+                "SELECT COUNT(*) FROM downloads WHERE author_id=?", (int(author_id),)
+            ).fetchone()[0]
+        )
+        result["frame_set_count"] = int(
+            self.db.execute(
+                """SELECT COUNT(*) FROM tg_video_frame_sets
+                WHERE author_id=? AND status='saved'""",
+                (int(author_id),),
+            ).fetchone()[0]
+        )
         return result
 
     def get_profile_identity(self, author_id: int) -> dict[str, Any]:

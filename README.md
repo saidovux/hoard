@@ -1,9 +1,22 @@
-# Hoard 0.7.4.4
+# Hoard 0.7.4.5
 
 Hoard is a local-first Linux and Windows archive for Telegram posts, profiles and video notes
 found in a channel post's comments. It uses Telethon, SQLite, an autonomous offline HTML catalog
 and terminal interfaces. A private background daemon performs all Telegram work; closing an
 interface does not stop downloads.
+
+The 0.7.4.5 release completes the TUI migration. The global level is now **Главная**, **Telegram**
+and **AI**; the former Archive screen is replaced by contextual **Telegram → Статус →
+Обслуживание**. Its bounded Jobs, Profiles and Media catalogs expose durable queue details and
+safe retry, legacy/unlinked profiles with global PSL, and all saved video notes without loading
+the archive into the client. Operations retain explicit HTML rebuild/open, Telegram enrichment,
+global FFmpeg backfill/retry/stop and read-only AI batch history. None starts on page entry.
+
+FFmpeg status now separates completed, successful and failed work. A publication cannot stop a
+session owned by another publication or the global archive; the daemon revalidates session ID and
+scope at stop time. Source-scoped and global AI batch history is read-only, paginated and reveals
+PSL fields only for valid eligible adult results. The old `archive` route remains a compatibility
+alias to Maintenance, but it is no longer a sidebar or palette destination.
 
 The 0.7.4.4 release turns the contextual **Telegram → Источники → Публикация** viewer into the
 manual FFmpeg and PSL workspace. Stable multi-selection survives pagination inside one publication
@@ -250,14 +263,13 @@ screen also retains a direct “Открыть HTML” action for an existing lo
 hoard
 ```
 
-The global level has four entries: **Главная** (HOARD wordmark, Telegram activity monitor and
-compact queue/archive figures), **Архив**, and, in the **ИНСТРУМЕНТЫ**
-group, **Telegram** and **AI**. Opening Telegram switches the same sidebar to its workspace:
+The global level has three entries: **Главная** (HOARD wordmark, Telegram activity monitor and
+compact queue/archive figures), **Telegram** and **AI**. Opening Telegram switches the same
+sidebar to its workspace:
 **Статус**, **Источники**, and bottom-pinned **Web Viewer** and **Вход** entries plus a direct
 **Назад в Hoard** action. Former keys remain compatible aliases: `overview`/`activity` open
-**Главная**, `telegram` opens **Telegram → Статус**, and `sources` opens
-**Telegram → Источники**. Archive remains a separate page through Round 7 and keeps downloads,
-profiles, jobs, catalog actions and the complete video-frame workflow.
+**Главная**, `telegram` opens **Telegram → Статус**, `sources` opens
+**Telegram → Источники**, and legacy `archive` opens contextual **Обслуживание**.
 
 Telegram Status owns collector start/pause/stop, a live current-work summary, and archive
 statistics refreshed only on entry or request. Sources is a paginated local catalog with search,
@@ -266,10 +278,12 @@ actions. Enter opens the selected publication viewer; `e` edits it. The viewer's
 Кадры and PSL tabs load one bounded server page at a time and retain their own offsets.
 Login reuses the daemon authorization flow, shows cached public account details, and separates a
 saved but unverified session from a verified live connection. Web Viewer starts/opens/stops only
-the separate loopback process. All operations use private daemon IPC; the TUI never opens SQLite
+the separate loopback process. Status opens contextual **Обслуживание** for paginated global jobs,
+profiles and media plus explicit archive operations. All operations use private daemon IPC; the TUI never opens SQLite
 or creates a Telegram client. Visible Home and Telegram Status each own a bounded compact-status
-timer only while on screen. Archive details are fetched on entry; Sources uses its dedicated
-bounded IPC without polling. Web readiness is checked once on first entry to the Telegram
+timer only while on screen. Maintenance catalogs load only on entry, filtering or explicit refresh;
+only a visible active FFmpeg session is polled. Sources uses its dedicated bounded IPC without
+polling. Web readiness is checked once on first entry to the Telegram
 workspace. See `docs/TUI.md`.
 
 The interface keeps the entire Textual surface, including navigation, focus, hover, palette and
@@ -284,8 +298,7 @@ command palette, `?` for help, `b` to toggle the sidebar and `q` to close only t
 cycling keeps working when the sidebar is hidden;
 `Ctrl+PageUp` / `Ctrl+PageDown` scroll the current page. On terminals narrower than 60 columns the
 sidebar hides automatically. Action grids and table columns adapt to the available width, dropping
-or shortening secondary columns instead of scrolling sideways. Archive’s less frequent frame and
-profile AI commands live behind **Ещё…**, so the primary action row stays compact.
+or shortening secondary columns instead of scrolling sideways.
 
 `hoard ui` and `hoard tui` are compatibility aliases for the same Textual application.
 Scripts and all existing non-interactive commands are unchanged, do not require a TTY and do not
@@ -311,7 +324,7 @@ For development, install the test tools with `python -m pip install -e '.[dev]'`
 
 An upgrade keeps the existing XDG configuration, database, Telegram session and archive.
 If an older daemon is still running, execute `hoard shutdown` before starting the upgraded
-installation. The 0.7.4.4 client accepts only a daemon reporting the same application version and
+installation. The 0.7.4.5 client accepts only a daemon reporting the same application version and
 IPC protocol `1`; it reports the mismatch instead of starting a competing service. If a matching
 daemon already owns the service lock but is still initializing, clients wait for it and show a
 specific startup diagnostic.
@@ -440,8 +453,8 @@ unknown, ineligible or invalid attempt remains in compact history without replac
 Possible-minor ages, provider payloads, chat text, prompt content, memory, API keys and private AI
 attachment paths are never exported. The catalog labels PSL as subjective and non-scientific.
 
-The TUI Archive screen can rebuild the snapshot and shows its path together with downloads,
-profiles and jobs. Open the resulting single HTML file in a local browser when needed.
+**Telegram → Статус → Обслуживание → Операции** can rebuild the snapshot or independently open
+the already published file after daemon-side path and regular-file validation.
 
 For maintainability, source HTML, CSS and JavaScript remain separate and are packaged at
 `src/hoard/templates/telegram/`; the generator assembles them only at report time. Each report
@@ -499,7 +512,8 @@ Progress shows queued, completed, skipped and failed profiles, each skip reason 
 USD cost when a matching user tariff exists. Otherwise cost is explicitly unknown. Finished
 results refresh automatically without a manual HTML rebuild. The browser remembers one active
 batch in `sessionStorage`, resumes polling after reopening the page and keeps the final result
-visible once; the TUI can reopen the newest active group from **Архив → Профили**.
+visible once; the TUI can browse active and historical groups from **AI** or publication-scoped
+history from **Telegram → Источники → Публикация**.
 
 The autonomous `<archive>/telegram_archive.html` does not contain a session, API key or active
 backend configuration and keeps working through `file://` exactly as before. Closing the Web or
@@ -510,8 +524,9 @@ extracted frames; the frame-specific AI action uses that exact local set.
 
 Each newly downloaded video note gets a durable local `waiting` record, not execution permission.
 Daemon/TUI startup, a download, restart and generic job retry never start FFmpeg or FFprobe. In
-**Архив → Кружки**, use **Извлечь кадры** for the selected video or confirm
-**Обработать ожидающие** for a bounded resumable batch. In **Telegram → Источники → Публикация**,
+**Telegram → Источники → Публикация**, use a selected/publication action. For the whole archive,
+confirm the bounded resumable action in **Telegram → Статус → Обслуживание → Операции**. In the
+publication workspace,
 mark one or more visible/local video notes and use **Извлечь выбранные**, or confirm
 **Обработать публикацию** / source-scoped **Повторить ошибки**. A separate one-slot media runner uses
 system `ffprobe` to read the actual duration and `ffmpeg` to save three JPEG frames at 20%, 50%
@@ -648,8 +663,8 @@ paid DeepSeek requests.
 
 ## Telegram AI and subjective PSL
 
-In **Архив → Профили**, analyze one saved profile or mark several and choose **Анализировать
-выбранные**. In **Telegram → Источники → Публикация**, mark up to 100 profiles and choose
+In **Telegram → Статус → Обслуживание → Профили**, analyze one saved profile or mark several and
+choose **Анализировать выбранных**. In **Telegram → Источники → Публикация**, mark up to 100 profiles and choose
 **Анализировать выбранных**, or delegate the complete source selector with **Анализировать
 публикацию**. The same actions are available in `hoard web`. Hoard resolves stable `author_id`
 values from SQLite, uses

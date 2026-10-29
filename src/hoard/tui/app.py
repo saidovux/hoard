@@ -30,6 +30,7 @@ from hoard import __version__
 
 from .ai_dialogs import AIKeyDialog, TelegramAIDialog, TelegramAnalysisDialog
 from .api import HoardAPI, IPCStatusAPI
+from .batch_dialogs import TelegramBatchHistoryDialog
 from .colors import ACCENT, MUTED, TEXT
 from .dialogs import AuthDialog
 from .navigation import (
@@ -44,9 +45,9 @@ from .navigation import (
 from .palette import Command, PaletteScreen
 from .screens import (
     AIWorkspaceScreen,
-    ArchiveScreen,
     HomeScreen,
     TelegramLoginScreen,
+    TelegramMaintenanceScreen,
     TelegramPublicationScreen,
     TelegramSourcesScreen,
     TelegramStatusScreen,
@@ -155,8 +156,8 @@ class HoardApp(App[None]):
     ENABLE_COMMAND_PALETTE = False
     SCREENS: ClassVar[dict[str, type[WorkspaceScreen]]] = {
         "home": HomeScreen,
-        "archive": ArchiveScreen,
         "telegram_status": TelegramStatusScreen,
+        "telegram_maintenance": TelegramMaintenanceScreen,
         "telegram_sources": TelegramSourcesScreen,
         "telegram_web": TelegramWebScreen,
         "telegram_login": TelegramLoginScreen,
@@ -326,7 +327,7 @@ class HoardApp(App[None]):
         if entering_telegram:
             current_section = resolve(str(current or "home"))
             self._telegram_return_section = (
-                current_section if current_section in {"home", "archive", "ai"} else "home"
+                current_section if current_section in {"home", "ai"} else "home"
             )
         if current != section:
             self.switch_screen(section)
@@ -334,7 +335,7 @@ class HoardApp(App[None]):
                 self.run_worker(
                     self.refresh_web_state(), name="telegram-web-initial", exit_on_error=False
                 )
-            if section in {"archive", "telegram_sources"}:
+            if section == "telegram_sources":
                 self.run_worker(
                     self.refresh_status(wait=True),
                     name=f"{section}-details",
@@ -586,6 +587,31 @@ class HoardApp(App[None]):
         self.set_notice(f"Возобновляем наблюдение за группой {batch['id']}…")
         await self._poll_telegram_batch(str(batch["id"]))
 
+    def open_telegram_batch_history(
+        self, *, source_id: int | None = None, title: str | None = None
+    ) -> None:
+        """Open bounded durable batch history without starting or resuming AI work."""
+
+        async def load_catalog(offset: int) -> dict[str, Any]:
+            args: dict[str, Any] = {"limit": 20, "offset": offset}
+            if source_id is not None:
+                args["source_id"] = int(source_id)
+            return await self.api.ai_call("ai_telegram_batch_catalog", args)
+
+        async def load_batch(batch_id: str, offset: int) -> dict[str, Any]:
+            args: dict[str, Any] = {"id": batch_id, "limit": 20, "offset": offset}
+            if source_id is not None:
+                args["source_id"] = int(source_id)
+            return await self.api.ai_call("ai_telegram_batch_get", args)
+
+        self.push_screen(
+            TelegramBatchHistoryDialog(
+                title=title or "История Telegram AI-групп",
+                catalog_loader=load_catalog,
+                batch_loader=load_batch,
+            )
+        )
+
     def open_web_interface(self) -> None:
         # Preparation may take as long as the real HTML build. Keep the TUI
         # responsive and make the waiting state explicit instead of blocking.
@@ -701,6 +727,8 @@ class HoardApp(App[None]):
         if workspace(current) == "telegram":
             if current == "telegram_publication":
                 self.open_section("telegram_sources")
+            elif current == "telegram_maintenance":
+                self.open_section("telegram_status")
             elif current == "telegram_status":
                 self.leave_workspace()
             else:

@@ -112,6 +112,7 @@ class AIWorkspaceScreen(WorkspaceScreen):
                     yield Button("Архивировать", id="ai-archive")
                     yield Button("Активировать", id="ai-activate")
                     yield Button("Повторить", id="ai-retry")
+                    yield Button("Telegram AI-группы", id="ai-batches")
                     yield Button("Настроить ключ", id="ai-config")
                     yield Button("Открыть веб-интерфейс", id="ai-web")
                     yield Button("Обновить", id="ai-refresh")
@@ -431,6 +432,8 @@ class AIWorkspaceScreen(WorkspaceScreen):
             if self.selected_chat:
                 self.history_offset += 30
                 self.run_worker(self._load_history(), exit_on_error=False)
+        elif identifier == "ai-batches":
+            self.hoard_app.open_telegram_batch_history()
         elif identifier == "ai-send":
             self._confirm_send()
 

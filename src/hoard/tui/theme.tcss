@@ -459,42 +459,106 @@ OptionList > .option-list--separator {
     margin-right: 0;
 }
 
-/* ── Archive ────────────────────────────────────────────────────────────── */
-
-#archive-main {
+/* Telegram Status contextual maintenance: one bounded catalog at a time. */
+#maintenance-main {
     height: 1fr;
     min-height: 12;
 }
 
-#archive-table {
+#maintenance-filters {
+    width: 100%;
+    height: 2;
+    margin-bottom: 1;
+}
+
+#maintenance-search {
+    width: 1fr;
+}
+
+#maintenance-job-state, #maintenance-media-sort, #maintenance-psl-mode {
+    width: 24;
+    margin-left: 2;
+}
+
+#maintenance-common-actions {
+    grid-size: 5;
+}
+
+#maintenance-range {
+    width: auto;
+    min-width: 12;
+    height: 1;
+    color: #888888;
+}
+
+#maintenance-table {
+    width: 100%;
     height: 1fr;
     min-height: 3;
 }
 
-/* On short terminals the panel must grow with its controls; a 1fr panel clips the
-   table and lower action rows outside the scrollable workspace. */
-.short #archive-main {
+#maintenance-object, #maintenance-operation-status {
+    width: 100%;
+    height: auto;
+    min-height: 1;
+    margin-top: 1;
+    color: #888888;
+}
+
+#maintenance-profile-actions, #maintenance-operations {
+    width: 100%;
     height: auto;
 }
 
-.short #archive-table {
+#maintenance-media-actions {
+    grid-size: 4;
+}
+
+.short #maintenance-main {
+    height: auto;
+}
+
+.short #maintenance-table, .tiny #maintenance-table {
     height: 4;
 }
 
-.tiny #archive-table {
-    height: 4;
+.medium #maintenance-common-actions, .medium #maintenance-media-actions {
+    grid-size: 3;
 }
 
-#archive-summary, #ai-summary, #ai-statistics, #ai-history,
+.compact #maintenance-modes {
+    layout: grid;
+    grid-size: 2;
+    grid-columns: 1fr 1fr;
+    height: auto;
+}
+
+.compact #maintenance-modes Button {
+    margin-right: 0;
+}
+
+.compact #maintenance-filters {
+    layout: vertical;
+    height: auto;
+}
+
+.compact #maintenance-search,
+.compact #maintenance-job-state,
+.compact #maintenance-media-sort {
+    width: 100%;
+    margin-left: 0;
+}
+
+.compact #maintenance-common-actions,
+.compact #maintenance-media-actions {
+    grid-size: 2;
+}
+
+#ai-summary, #ai-statistics, #ai-history,
 #telegram-ai-photos, #telegram-ai-previous {
     height: auto;
     min-height: 1;
     margin-bottom: 1;
-}
-
-#archive-summary {
-    text-wrap: nowrap;
-    text-overflow: ellipsis;
 }
 
 .table-help {
@@ -563,7 +627,7 @@ Button:disabled {
 }
 
 #telegram-statistics-actions {
-    grid-size: 1;
+    grid-size: 2;
 }
 
 #account-actions {
@@ -583,7 +647,7 @@ Button:disabled {
     grid-size: 3;
 }
 
-#archive-actions, #archive-advanced, #frame-actions, #ai-actions {
+#ai-actions {
     grid-size: 3;
 }
 
@@ -603,7 +667,6 @@ Button:disabled {
     grid-size: 2;
 }
 
-.medium #archive-actions, .medium #archive-advanced, .medium #frame-actions,
 .medium #ai-actions {
     grid-size: 2;
 }
@@ -613,7 +676,6 @@ Button:disabled {
     grid-size: 2;
 }
 
-.compact #archive-actions, .compact #archive-advanced, .compact #frame-actions,
 .compact #ai-actions {
     grid-size: 1;
 }
@@ -643,42 +705,6 @@ Button:disabled {
 .mode-row Button:focus, .mode-row Button.-primary:focus {
     color: #F79646;
     text-style: bold reverse;
-}
-
-#archive-more {
-    color: #888888;
-    margin-right: 0;
-}
-
-#profiles-page-label {
-    width: auto;
-    height: 1;
-    margin-right: 2;
-    color: #888888;
-}
-
-.compact #archive-modes {
-    layout: grid;
-    grid-size: 2;
-    grid-columns: 1fr 1fr;
-    height: auto;
-}
-
-.compact #archive-modes Button {
-    margin-right: 0;
-}
-
-.compact #profile-pages {
-    layout: grid;
-    grid-size: 3;
-    grid-columns: 1fr auto 1fr;
-    grid-gutter: 0 1;
-    height: auto;
-}
-
-.compact #profile-pages Button {
-    margin-right: 0;
-    width: auto;
 }
 
 .narrow .ai-mode-row Button {
@@ -875,6 +901,40 @@ SelectOverlay > .option-list--option-hover {
 
 .telegram-analysis-dialog {
     height: 90%;
+}
+
+.maintenance-detail-dialog {
+    width: 72;
+    max-width: 96%;
+    height: auto;
+    max-height: 90%;
+}
+
+.profile-detail-dialog, .batch-dialog {
+    width: 100;
+    max-width: 96%;
+    height: 90%;
+    padding: 1 2;
+    border: round #F79646;
+}
+
+#profile-detail-summary, #profile-detail-analyses,
+#batch-summary, #batch-safety, #maintenance-detail-content {
+    height: auto;
+    margin-bottom: 1;
+}
+
+#profile-detail-photos, #batch-table {
+    width: 100%;
+    height: 1fr;
+    min-height: 4;
+    margin-bottom: 1;
+}
+
+.compact .profile-detail-dialog, .compact .batch-dialog {
+    width: 98%;
+    height: 96%;
+    padding: 0 1;
 }
 
 #analysis-scroll {

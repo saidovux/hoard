@@ -249,13 +249,31 @@ class AIIPC:
             self.runner.wakeup()
             return {"batch": batch, "message": "Группа Telegram AI поставлена в очередь"}
         if method == "ai_telegram_batch_get":
-            return {
-                "batch": self.storage.telegram_batch(
-                    self._id(args),
-                    limit=args.get("limit", 100),
-                    offset=args.get("offset", 0),
-                )
-            }
+            batch = self.storage.telegram_batch(
+                self._id(args),
+                limit=args.get("limit", 100),
+                offset=args.get("offset", 0),
+            )
+            expected_source = args.get("source_id")
+            if expected_source not in {None, ""}:
+                if self.telegram_storage is None:
+                    raise ValueError("Telegram-хранилище недоступно")
+                source_id = self.telegram_storage.resolve_source_id(expected_source)
+                if int(batch.get("source_id") or 0) != source_id:
+                    raise ValueError("AI-группа не относится к выбранной публикации")
+            return {"batch": batch}
+        if method == "ai_telegram_batch_catalog":
+            source_id = None
+            if args.get("source_id") not in {None, ""}:
+                if self.telegram_storage is None:
+                    raise ValueError("Telegram-хранилище недоступно")
+                source_id = self.telegram_storage.resolve_source_id(args["source_id"])
+            return self.storage.telegram_batch_catalog(
+                active_only=bool(args.get("active_only", False)),
+                limit=args.get("limit", 20),
+                offset=args.get("offset", 0),
+                source_id=source_id,
+            )
         if method == "ai_telegram_batch_list":
             return {
                 "items": self.storage.list_telegram_batches(

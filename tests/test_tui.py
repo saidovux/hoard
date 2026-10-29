@@ -27,12 +27,13 @@ if TYPE_CHECKING:
         VideoFramesDialog,
     )
     from hoard.tui.app import HelpScreen, HoardApp
+    from hoard.tui.batch_dialogs import TelegramBatchHistoryDialog
     from hoard.tui.dialogs import AuthDialog, ConfirmDialog, SourceDialog
     from hoard.tui.screens import (
         AIWorkspaceScreen,
-        ArchiveScreen,
         HomeScreen,
         TelegramLoginScreen,
+        TelegramMaintenanceScreen,
         TelegramPublicationScreen,
         TelegramScreen,
         TelegramSourcesScreen,
@@ -56,13 +57,16 @@ def load_textual_after_existing_async_tests():
     from hoard.tui.ai_dialogs import VideoFramesDialog as VideoFramesDialogClass
     from hoard.tui.app import HelpScreen as HelpScreenClass
     from hoard.tui.app import HoardApp as HoardAppClass
+    from hoard.tui.batch_dialogs import (
+        TelegramBatchHistoryDialog as TelegramBatchHistoryDialogClass,
+    )
     from hoard.tui.dialogs import AuthDialog as AuthDialogClass
     from hoard.tui.dialogs import ConfirmDialog as ConfirmDialogClass
     from hoard.tui.dialogs import SourceDialog as SourceDialogClass
     from hoard.tui.screens import AIWorkspaceScreen as AIWorkspaceScreenClass
-    from hoard.tui.screens import ArchiveScreen as ArchiveScreenClass
     from hoard.tui.screens import HomeScreen as HomeScreenClass
     from hoard.tui.screens import TelegramLoginScreen as TelegramLoginScreenClass
+    from hoard.tui.screens import TelegramMaintenanceScreen as TelegramMaintenanceScreenClass
     from hoard.tui.screens import TelegramPublicationScreen as TelegramPublicationScreenClass
     from hoard.tui.screens import TelegramScreen as TelegramScreenClass
     from hoard.tui.screens import TelegramSourcesScreen as TelegramSourcesScreenClass
@@ -74,7 +78,6 @@ def load_textual_after_existing_async_tests():
     globals().update(
         AIRecordDialog=AIRecordDialogClass,
         AIWorkspaceScreen=AIWorkspaceScreenClass,
-        ArchiveScreen=ArchiveScreenClass,
         AuthDialog=AuthDialogClass,
         Button=ButtonClass,
         ConfirmDialog=ConfirmDialogClass,
@@ -92,11 +95,13 @@ def load_textual_after_existing_async_tests():
         Static=StaticClass,
         TelegramScreen=TelegramScreenClass,
         TelegramLoginScreen=TelegramLoginScreenClass,
+        TelegramMaintenanceScreen=TelegramMaintenanceScreenClass,
         TelegramPublicationScreen=TelegramPublicationScreenClass,
         TelegramSourcesScreen=TelegramSourcesScreenClass,
         TelegramWebScreen=TelegramWebScreenClass,
         TelegramAIDialog=TelegramAIDialogClass,
         TelegramAnalysisDialog=TelegramAnalysisDialogClass,
+        TelegramBatchHistoryDialog=TelegramBatchHistoryDialogClass,
         VideoFramesDialog=VideoFramesDialogClass,
     )
 
@@ -456,12 +461,90 @@ class FakeAPI:
     async def retry_job(self, job_id: int) -> dict:
         return await self._operation("retry_job", {"id": job_id})
 
+    async def jobs_list(
+        self,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+        state: str = "",
+        kind: str = "",
+    ) -> dict[str, Any]:
+        parameters = {
+            "limit": limit,
+            "offset": offset,
+            "state": state,
+            "kind": kind,
+        }
+        queued = self.responses.get("jobs_list", [])
+        if queued:
+            return await self._operation("jobs_list", parameters)
+        items = [
+            dict(item)
+            for item in self.result.get("jobs", [])
+            if (not state or item.get("state") == state)
+            and (not kind or kind.casefold() in str(item.get("kind") or "").casefold())
+        ]
+        for item in items:
+            item.setdefault(
+                "retryable",
+                item.get("state") == "failed"
+                and not str(item.get("kind") or "").startswith("ai."),
+            )
+            item.setdefault("manual_permission_required", False)
+        self.calls.append(("jobs_list", parameters))
+        return {
+            "items": items[offset : offset + limit],
+            "total": len(items),
+            "limit": limit,
+            "offset": offset,
+            "has_more": offset + limit < len(items),
+        }
+
+    async def job_get(self, job_id: int) -> dict[str, Any]:
+        item = next(item for item in self.result.get("jobs", []) if item["id"] == job_id)
+        return await self._operation(
+            "job_get", {"id": job_id}, {"job": {**item, "retryable": True}}
+        )
+
+    async def open_catalog(self) -> dict[str, Any]:
+        return await self._operation(
+            "telegram_catalog_open", default={"message": "HTML-каталог открыт"}
+        )
+
     async def telegram_call(
         self, method: str, args: dict[str, Any] | None = None
     ) -> dict:
         parameters = args or {}
         source = dict(self.result.get("sources", [{}])[0])
         defaults = {
+            "telegram_media_list": {
+                "items": list(self.result.get("downloads") or []),
+                "total": len(self.result.get("downloads") or []),
+                "limit": parameters.get("limit", 50),
+                "offset": parameters.get("offset", 0),
+                "has_more": False,
+            },
+            "telegram_media_get": {
+                "media": {
+                    **next(
+                        (
+                            item
+                            for item in self.result.get("downloads") or []
+                            if int(item.get("message_id") or 0)
+                            == int(parameters.get("message_id") or 0)
+                        ),
+                        {},
+                    ),
+                    "available": True,
+                    "availability_error": "",
+                }
+            },
+            "telegram_media_open": {"opened": True, "message": "Файл открыт"},
+            "telegram_frames_get": {"frames": None, "stats": {}},
+            "telegram_frames_session_status": {
+                "session": None,
+                "processing_mode": "off",
+            },
             "telegram_publication_get": {"publication": source},
             "telegram_publication_downloads_list": {
                 "items": list(self.result.get("downloads") or []),
@@ -552,6 +635,19 @@ class FakeAPI:
                 "timeout": 120,
                 "configured": False,
             },
+            "ai_telegram_profile_get": {
+                "profile": {
+                    "author_id": int((args or {}).get("author_id") or 0),
+                    "photos": [],
+                    "sources": [],
+                    "username_history": [],
+                }
+            },
+            "ai_telegram_analysis_list": {"items": [], "has_more": False},
+            "ai_telegram_batch_catalog": {
+                "items": [], "total": 0, "limit": 20, "offset": 0,
+                "has_more": False,
+            },
         }
         return await self._operation(method, args, defaults.get(method, {"message": "Готово"}))
 
@@ -629,10 +725,10 @@ async def test_round_three_screens_tables_buttons_and_dialogs_remain_strict_blac
         for section in (
             "home",
             "telegram_status",
+            "telegram_maintenance",
             "telegram_sources",
             "telegram_web",
             "telegram_login",
-            "archive",
             "ai",
         ):
             app.open_section(section)
@@ -693,8 +789,8 @@ async def test_keyboard_navigation_enters_and_leaves_telegram_workspace():
     async with app.run_test(size=(80, 24)) as pilot:
         await wait_for_startup(app, pilot)
         base_depth = len(app.screen_stack)
-        # Home, Archive, then the cursor steps over the "ИНСТРУМЕНТЫ" header to Telegram.
-        await pilot.press("j", "j", "enter")
+        # The group heading is disabled, so one move reaches Telegram.
+        await pilot.press("j", "enter")
         await pilot.pause()
         assert isinstance(app.screen, TelegramScreen)
         assert app.screen.section == "telegram_status"
@@ -703,17 +799,16 @@ async def test_keyboard_navigation_enters_and_leaves_telegram_workspace():
         await pilot.pause()
         assert isinstance(app.screen, HomeScreen)
         assert len(app.screen_stack) == base_depth
-        await pilot.press("down", "down", "enter")
+        await pilot.press("down", "enter")
         await pilot.pause()
         assert isinstance(app.screen, TelegramScreen)
         await pilot.press("escape")
         await pilot.pause()
         assert isinstance(app.screen, HomeScreen)
-        # A list page hands the keyboard to its table; "h" still walks back out.
-        await pilot.press("down", "enter")
+        # A global destination still walks back to Home.
+        app.open_section("ai")
         await pilot.pause()
-        assert isinstance(app.screen, ArchiveScreen)
-        assert isinstance(app.focused, DataTable)
+        assert isinstance(app.screen, AIWorkspaceScreen)
         await pilot.press("h")
         await pilot.pause()
         assert isinstance(app.screen, HomeScreen)
@@ -724,7 +819,7 @@ async def test_telegram_sidebar_has_pinned_lower_actions_and_returns_to_origin()
     app = HoardApp(FakeAPI())
     async with app.run_test(size=(80, 24)) as pilot:
         await wait_for_startup(app, pilot)
-        app.open_section("archive")
+        app.open_section("ai")
         await pilot.pause()
         app.open_section("telegram")
         await pilot.pause()
@@ -750,7 +845,7 @@ async def test_telegram_sidebar_has_pinned_lower_actions_and_returns_to_origin()
         assert isinstance(app.screen, TelegramScreen)
         await pilot.press("h")
         await pilot.pause()
-        assert isinstance(app.screen, ArchiveScreen)
+        assert isinstance(app.screen, AIWorkspaceScreen)
 
         app.open_section("telegram")
         await pilot.pause()
@@ -759,7 +854,7 @@ async def test_telegram_sidebar_has_pinned_lower_actions_and_returns_to_origin()
         primary.focus()
         await pilot.press("enter")
         await pilot.pause()
-        assert isinstance(app.screen, ArchiveScreen)
+        assert isinstance(app.screen, AIWorkspaceScreen)
 
 
 @pytest.mark.asyncio
@@ -1005,9 +1100,9 @@ async def test_polling_only_runs_on_home_and_never_overlaps(monkeypatch):
 
         home = app.screen
         assert isinstance(home, HomeScreen)
-        await pilot.press("2")
+        await pilot.press("3")
         await pilot.pause(0.12)
-        assert isinstance(app.screen, ArchiveScreen)
+        assert isinstance(app.screen, AIWorkspaceScreen)
         assert home.poll_timer is None
         stopped_calls = api.status_calls
         await pilot.pause(0.08)
@@ -1761,7 +1856,7 @@ async def test_telegram_status_polling_has_one_request_and_stops_when_hidden(mon
         assert first_timer is not None
         assert api.max_active_calls == 1
 
-        app.open_section("archive")
+        app.open_section("ai")
         await pilot.pause(0.12)
         assert status_screen.poll_timer is None
         hidden_count = api.status_calls
@@ -1911,16 +2006,22 @@ async def test_late_web_probe_cannot_overwrite_newer_command_state():
 
 
 @pytest.mark.asyncio
-async def test_archive_views_real_results_and_reports_failures_without_false_success():
+async def test_maintenance_views_results_and_runs_only_explicit_operations():
     status = status_fixture()
     status["downloads"] = [
         {
+            "source_id": 1,
+            "message_id": 501,
+            "author_id": 99,
             "date": "2026-10-21",
             "author_name": "Alice",
-            "source_name": "sample_channel",
+            "author_username": "alice",
+            "source_username": "sample_channel",
             "post_id": 42,
             "size": 2048,
             "state": "saved",
+            "source_available": 1,
+            "frame_status": "saved",
         }
     ]
     status["profiles"] = [
@@ -1954,33 +2055,61 @@ async def test_archive_views_real_results_and_reports_failures_without_false_suc
     app = HoardApp(api)
     async with app.run_test(size=(100, 30)) as pilot:
         await wait_for_startup(app, pilot)
-        app.open_section("archive")
-        await pilot.pause()
+        app.open_section("telegram_maintenance")
+        await wait_for_condition(
+            pilot,
+            lambda: isinstance(app.screen, TelegramMaintenanceScreen)
+            and app.screen.query_one("#maintenance-table", DataTable).row_count == 1,
+        )
         screen = app.screen
-        assert isinstance(screen, ArchiveScreen)
-        assert "Фото профилей 3" in str(screen.query_one("#archive-summary", Static).content)
+        assert isinstance(screen, TelegramMaintenanceScreen)
+        assert not any(name == "enrich_telegram" for name, _ in api.calls)
+        assert not any(name == "rebuild_catalog" for name, _ in api.calls)
 
-        await pilot.click("#mode-profiles")
+        await pilot.click("#maintenance-mode-profiles")
+        await wait_for_condition(pilot, lambda: screen.mode == "profiles")
         assert screen.mode == "profiles"
-        await pilot.click("#mode-jobs")
+        await pilot.click("#maintenance-mode-jobs")
+        await wait_for_condition(pilot, lambda: screen.mode == "jobs")
         assert screen.mode == "jobs"
-        await pilot.click("#job-retry")
+        await pilot.click("#maintenance-job-retry")
         await wait_for_condition(pilot, lambda: any(name == "retry_job" for name, _ in api.calls))
 
-        await pilot.click("#catalog-build")
+        await pilot.click("#maintenance-mode-operations")
+        await wait_for_condition(
+            pilot,
+            lambda: any(
+                name == "telegram_frames_session_status" for name, _ in api.calls
+            ),
+        )
+        frame_status_calls = sum(
+            name == "telegram_frames_session_status" for name, _ in api.calls
+        )
+        await pilot.pause(1.7)
+        assert sum(
+            name == "telegram_frames_session_status" for name, _ in api.calls
+        ) == frame_status_calls
+        await pilot.click("#maintenance-catalog-build")
         await wait_for_condition(
             pilot,
             lambda: app.notice is not None and "не удалась" in app.notice[0],
         )
         assert app.notice == ("Генерация HTML не удалась", True)
         await wait_for_condition(pilot, lambda: not app._operations)
-        screen.query_one("#catalog-build").press()
+        screen.query_one("#maintenance-catalog-build").press()
         await wait_for_condition(
             pilot,
             lambda: app.notice is not None and app.notice[0] == "HTML-каталог обновлён",
         )
 
-        await pilot.click("#telegram-enrich")
+        await pilot.click("#maintenance-catalog-open")
+        await wait_for_condition(
+            pilot,
+            lambda: any(name == "telegram_catalog_open" for name, _ in api.calls),
+        )
+        assert not any(name in {"start_web", "open_web"} for name, _ in api.calls)
+
+        await pilot.click("#maintenance-enrich")
         await wait_for_condition(
             pilot,
             lambda: isinstance(app.screen, ConfirmDialog)
@@ -1993,6 +2122,137 @@ async def test_archive_views_real_results_and_reports_failures_without_false_suc
 
 
 @pytest.mark.asyncio
+async def test_batch_history_is_read_only_source_scoped_and_pages_participants():
+    api = FakeAPI()
+    api.queue(
+        "ai_telegram_batch_catalog",
+        {
+            "items": [
+                {
+                    "id": "batch-history",
+                    "source_id": 1,
+                    "image_mode": "combined",
+                    "total": 21,
+                    "queued": 0,
+                    "errors": 1,
+                    "terminal": True,
+                    "created_at": "2026-10-29T10:00:00+00:00",
+                }
+            ],
+            "total": 1,
+            "limit": 20,
+            "offset": 0,
+            "has_more": False,
+        },
+    )
+    first_page = [
+        {
+            "author_id": 1000 + index,
+            "display_name": f"Profile {index}",
+            "state": "completed",
+            "result_status": "completed",
+            "analysis_id": f"analysis-{index}",
+            "photo_count": 1,
+        }
+        for index in range(20)
+    ]
+    base = {
+        "id": "batch-history",
+        "source_id": 1,
+        "image_mode": "combined",
+        "total": 21,
+        "queued": 0,
+        "successful": 20,
+        "errors": 1,
+        "insufficient_data": 0,
+        "ineligible": 0,
+        "outcome_unknown": 1,
+        "terminal": True,
+    }
+    api.queue(
+        "ai_telegram_batch_get",
+        {"batch": {**base, "items": first_page, "offset": 0, "has_more": True}},
+        {
+            "batch": {
+                **base,
+                "items": [
+                    {
+                        "author_id": 1099,
+                        "display_name": "Unknown outcome",
+                        "state": "outcome_unknown",
+                        "result_status": None,
+                        "analysis_id": "analysis-unknown",
+                        "photo_count": 1,
+                    }
+                ],
+                "offset": 20,
+                "has_more": False,
+            }
+        },
+    )
+    app = HoardApp(api)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await wait_for_startup(app, pilot)
+        app.open_telegram_batch_history(source_id=1, title="История публикации")
+        await wait_for_condition(
+            pilot,
+            lambda: isinstance(app.screen, TelegramBatchHistoryDialog)
+            and app.screen.query_one("#batch-table", DataTable).row_count == 1,
+        )
+        app.screen.query_one("#batch-open").press()
+        await wait_for_condition(
+            pilot,
+            lambda: isinstance(app.screen, TelegramBatchHistoryDialog)
+            and app.screen.mode == "details"
+            and app.screen.query_one("#batch-table", DataTable).row_count == 20,
+        )
+        app.screen.query_one("#batch-next").press()
+        await wait_for_condition(
+            pilot,
+            lambda: app.screen.batch_offset == 20
+            and app.screen.query_one("#batch-table", DataTable).row_count == 1,
+        )
+        get_calls = [
+            args for name, args in api.calls if name == "ai_telegram_batch_get"
+        ]
+        assert [item["offset"] for item in get_calls] == [0, 20]
+        assert all(item["source_id"] == 1 for item in get_calls)
+        assert not any(name == "ai_telegram_batch_start" for name, _ in api.calls)
+
+
+@pytest.mark.asyncio
+async def test_maintenance_global_profile_selection_keeps_ids_and_has_no_source_scope():
+    status = status_fixture()
+    status["profiles"] = [
+        {
+            "author_id": author_id,
+            "display_name": f"Profile {author_id}",
+            "current_username": f"user{author_id}",
+            "photo_count": 1,
+            "video_count": 1,
+            "source_count": 0,
+        }
+        for author_id in (101, 202, 303)
+    ]
+    app = HoardApp(FakeAPI(status))
+    selectors: list[dict[str, Any]] = []
+    app.open_telegram_analysis = lambda selector: selectors.append(dict(selector))
+    async with app.run_test(size=(100, 30)) as pilot:
+        await wait_for_startup(app, pilot)
+        app.open_section("telegram_maintenance")
+        await pilot.pause()
+        await pilot.click("#maintenance-mode-profiles")
+        await wait_for_condition(pilot, lambda: len(app.screen._row_ids) == 3)
+        app.screen.action_select_visible()
+        assert app.screen.marked_profiles == {101, 202, 303}
+        app.screen.query_one("#maintenance-psl-mode").value = "combined"
+        app.screen._analyze_marked_profiles()
+        assert selectors == [
+            {"author_ids": [101, 202, 303], "image_mode": "combined"}
+        ]
+
+
+@pytest.mark.asyncio
 async def test_context_navigation_keeps_tables_native_and_hidden_sidebar_reachable():
     api = FakeAPI()
     app = HoardApp(api)
@@ -2000,9 +2260,6 @@ async def test_context_navigation_keeps_tables_native_and_hidden_sidebar_reachab
         await wait_for_startup(app, pilot)
         assert app.has_class("sidebar-hidden")
         await pilot.press("]")
-        await pilot.pause()
-        assert isinstance(app.screen, ArchiveScreen)
-        await pilot.press("3")
         await pilot.pause()
         assert isinstance(app.screen, TelegramScreen)
         await pilot.press("2")
@@ -2043,7 +2300,7 @@ async def test_all_round_three_workspaces_survive_supported_sizes(size):
             "telegram_sources",
             "telegram_web",
             "telegram_login",
-            "archive",
+            "telegram_maintenance",
             "ai",
             "home",
         ):
@@ -2055,6 +2312,8 @@ async def test_all_round_three_workspaces_survive_supported_sizes(size):
             for table in app.screen.query(DataTable):
                 assert table.size.width >= 0
                 assert table.size.height >= 0
+                if section == "telegram_maintenance" and table.size.width:
+                    assert table.virtual_size.width <= table.size.width
 
 
 @pytest.mark.asyncio
@@ -2159,14 +2418,14 @@ async def test_telegram_ai_requires_visible_adult_and_external_confirmation():
     app = HoardApp(api)
     async with app.run_test(size=(100, 32)) as pilot:
         await wait_for_startup(app, pilot)
-        app.open_section("archive")
+        app.open_section("telegram_maintenance")
         await pilot.pause()
-        await pilot.click("#mode-profiles")
+        await pilot.click("#maintenance-mode-profiles")
         await wait_for_condition(
             pilot,
-            lambda: bool(getattr(app.screen, "_profile_ids", [])),
+            lambda: bool(getattr(app.screen, "_row_ids", [])),
         )
-        await pilot.click("#telegram-ai")
+        await pilot.click("#maintenance-profile-analyze")
         await wait_for_condition(pilot, lambda: isinstance(app.screen, TelegramAIDialog))
         app.screen.query_one("#telegram-ai-photo-ids", Input).value = "photo-1"
         disclosure = str(app.screen.query_one(".dialog-message", Static).content)
@@ -2254,14 +2513,14 @@ async def test_minimal_telegram_analysis_picker_uses_default_photos_and_one_oper
     app = HoardApp(api)
     async with app.run_test(size=(100, 32)) as pilot:
         await wait_for_startup(app, pilot)
-        app.open_section("archive")
+        app.open_section("telegram_maintenance")
         await pilot.pause()
-        await pilot.click("#mode-profiles")
+        await pilot.click("#maintenance-mode-profiles")
         await wait_for_condition(
             pilot,
-            lambda: bool(getattr(app.screen, "_profile_ids", [])),
+            lambda: bool(getattr(app.screen, "_row_ids", [])),
         )
-        await pilot.click("#telegram-ai")
+        await pilot.click("#maintenance-profile-analyze")
         await wait_for_condition(
             pilot,
             lambda: isinstance(app.screen, TelegramAnalysisDialog),
@@ -2381,20 +2640,24 @@ async def test_navigation_registry_groups_tools_and_nested_telegram_pages():
         workspace,
     )
     keys = [section.key for section in SECTIONS]
-    assert keys == ["home", "archive", "telegram", "ai"]
+    assert keys == ["home", "telegram", "ai"]
     assert len(keys) == len(set(keys))
-    assert {"home", "archive", "ai"} <= set(HoardApp.SCREENS)
+    assert {"home", "ai", "telegram_maintenance"} <= set(HoardApp.SCREENS)
     assert {section.key for section in TELEGRAM_SECTIONS} <= set(HoardApp.SCREENS)
     assert [section.label for section in breadcrumb("telegram")] == ["Telegram", "Статус"]
     assert [section.label for section in breadcrumb("sources")] == ["Telegram", "Источники"]
     assert [section.label for section in breadcrumb("telegram_publication")] == [
         "Telegram", "Источники"
     ]
+    assert [section.label for section in breadcrumb("telegram_maintenance")] == [
+        "Telegram", "Статус", "Обслуживание"
+    ]
     assert [section.label for section in breadcrumb("home")] == ["Главная"]
     assert workspace("telegram_publication") == "telegram"
     assert section_index("telegram_publication") == 1
     assert sections_for("telegram_publication") == TELEGRAM_SECTIONS
     assert "telegram_publication" not in {section.key for section in palette_sections()}
+    assert "telegram_maintenance" not in {section.key for section in palette_sections()}
 
     app = HoardApp(FakeAPI())
     async with app.run_test(size=(100, 30)) as pilot:
@@ -2415,7 +2678,7 @@ def test_legacy_routes_resolve_to_concrete_navigation_levels():
         "home",
         "telegram_sources",
     ]
-    assert navigation.resolve("archive") == "archive"
+    assert navigation.resolve("archive") == "telegram_maintenance"
     assert navigation.resolve("telegram") == "telegram_status"
     assert navigation.section_index("sources") == 1
     assert navigation.section_index("telegram") == 0
@@ -2435,6 +2698,9 @@ async def test_legacy_section_keys_open_the_page_that_absorbed_them():
         app.open_section("activity")
         await pilot.pause()
         assert isinstance(app.screen, HomeScreen)
+        app.open_section("archive")
+        await pilot.pause()
+        assert isinstance(app.screen, TelegramMaintenanceScreen)
 
 
 @pytest.mark.asyncio
@@ -2483,7 +2749,7 @@ async def test_digit_shortcuts_jump_to_sections_and_leave_text_entry_alone():
     app = HoardApp(FakeAPI())
     async with app.run_test(size=(100, 30)) as pilot:
         await wait_for_startup(app, pilot)
-        await pilot.press("3")
+        await pilot.press("2")
         await pilot.pause()
         assert isinstance(app.screen, TelegramScreen)
         await pilot.press("2")
@@ -2599,7 +2865,7 @@ async def test_help_and_palette_describe_and_keep_the_black_theme():
         await pilot.pause()
         text = str(app.screen.query_one("#help-text", Static).content)
         assert __version__ in text
-        assert "1 – 4" in text and "палитра" in text and "ctrl+k" in text
+        assert "1 – 3" in text and "палитра" in text and "ctrl+k" in text
         for node in [app.screen, *app.screen.query("*")]:
             assert node.styles.background.hex == "#000000", repr(node)
         await pilot.press("escape")
@@ -2692,7 +2958,7 @@ async def test_home_carries_the_program_name_and_picks_a_logo_that_fits():
         big, small = app.screen.query_one("#hero-big"), app.screen.query_one("#hero-small")
         assert big.display and not small.display
         text = str(big.content)
-        assert "v0.7.4.4" in text
+        assert "v0.7.4.5" in text
         assert "локальный архив" not in text
         assert "всё хранится" not in text
         assert "сборщик" not in text
@@ -2910,7 +3176,7 @@ async def test_telegram_web_state_is_recovered_on_reopen():
 
 
 @pytest.mark.asyncio
-async def test_archive_frame_controls_open_local_set_and_start_backfill():
+async def test_maintenance_media_opens_frames_and_global_backfill_is_confirmed():
     status = status_fixture()
     status["video_frames"] = {
         "total": 1,
@@ -2929,7 +3195,9 @@ async def test_archive_frame_controls_open_local_set_and_start_backfill():
             "message_id": 10,
             "author_id": 99,
             "author_name": "Alice",
-            "source_name": "sample_channel",
+            "author_username": "alice",
+            "source_username": "sample_channel",
+            "source_available": 1,
             "post_id": 42,
             "date": "2026-10-21",
             "size": 2048,
@@ -2963,15 +3231,13 @@ async def test_archive_frame_controls_open_local_set_and_start_backfill():
     app = HoardApp(api)
     async with app.run_test(size=(100, 30)) as pilot:
         await wait_for_startup(app, pilot)
-        app.open_section("archive")
-        await pilot.pause()
+        app.open_section("telegram_maintenance")
+        await wait_for_condition(pilot, lambda: isinstance(app.screen, TelegramMaintenanceScreen))
         screen = app.screen
-        assert isinstance(screen, ArchiveScreen)
-        assert screen.query_one("#frames-view", Button).display is True
-        assert screen.query_one("#telegram-ai-frames", Button).display is False
-        assert "1 готовы" in str(screen.query_one("#archive-summary", Static).content)
+        await pilot.click("#maintenance-mode-media")
+        await wait_for_condition(pilot, lambda: bool(screen._row_ids))
 
-        screen.query_one("#frames-view").press()
+        screen.query_one("#maintenance-media-frames").press()
         await wait_for_condition(
             pilot, lambda: isinstance(app.screen, VideoFramesDialog)
         )
@@ -2986,15 +3252,13 @@ async def test_archive_frame_controls_open_local_set_and_start_backfill():
         await pilot.press("escape")
         await pilot.pause()
 
-        screen.query_one("#frames-process").press()
-        await wait_for_condition(
-            pilot,
-            lambda: any(name == "telegram_frames_process" for name, _ in api.calls),
-        )
-
-        screen.query_one("#frames-backfill").press()
+        screen.query_one("#maintenance-mode-operations").press()
+        await pilot.pause()
+        screen.query_one("#maintenance-frames-start").press()
         await wait_for_condition(pilot, lambda: isinstance(app.screen, ConfirmDialog))
-        assert "нагружает CPU" in str(app.screen.query_one(".dialog-message", Static).content)
+        assert "весь локальный архив" in str(
+            app.screen.query_one(".dialog-message", Static).content
+        )
         app.screen.query_one("#confirm").press()
         await wait_for_condition(
             pilot,
@@ -3003,11 +3267,9 @@ async def test_archive_frame_controls_open_local_set_and_start_backfill():
             ),
         )
 
-        await pilot.click("#mode-profiles")
+        await pilot.click("#maintenance-mode-profiles")
         assert screen.mode == "profiles"
-        assert screen.query_one("#frames-view", Button).display is False
-        assert screen.query_one("#telegram-ai-frames", Button).display is True
-        assert screen.query_one("#telegram-ai-combined", Button).display is True
+        assert screen.query_one("#maintenance-profile-actions").display is True
 
 
 @pytest.mark.asyncio
@@ -3058,6 +3320,9 @@ async def test_publication_frame_dialog_is_view_only_and_opens_by_stable_id():
         )
         app.screen.query_one("#publication-show-frames").press()
         await wait_for_condition(pilot, lambda: isinstance(app.screen, VideoFramesDialog))
+        await wait_for_condition(
+            pilot, lambda: bool(app.screen.query("#frames-open-2"))
+        )
         assert not list(app.screen.query("#frames-analyze"))
         app.screen.query_one("#frames-open-2").press()
         await wait_for_condition(
@@ -3143,14 +3408,15 @@ async def test_profile_frame_ai_preview_shows_video_and_frame_choice():
     app = HoardApp(api)
     async with app.run_test(size=(100, 30)) as pilot:
         await wait_for_startup(app, pilot)
-        app.open_section("archive")
+        app.open_section("telegram_maintenance")
         await pilot.pause()
-        await pilot.click("#mode-profiles")
+        await pilot.click("#maintenance-mode-profiles")
         await wait_for_condition(
             pilot,
-            lambda: bool(getattr(app.screen, "_profile_ids", [])),
+            lambda: bool(getattr(app.screen, "_row_ids", [])),
         )
-        app.screen.query_one("#telegram-ai-frames").press()
+        app.screen.query_one("#maintenance-psl-mode").value = "frames"
+        app.screen.query_one("#maintenance-profile-analyze").press()
         await wait_for_condition(
             pilot, lambda: isinstance(app.screen, TelegramAnalysisDialog)
         )
@@ -3178,13 +3444,13 @@ async def test_home_polling_keeps_sidebar_selection(monkeypatch):
         navigation = app.screen.query_one(OptionList)
         navigation.focus()
         await pilot.press("j")
-        assert navigation.get_option_at_index(navigation.highlighted).id == "archive"
+        assert navigation.get_option_at_index(navigation.highlighted).id == "telegram"
         await wait_for_condition(pilot, lambda: api.status_calls >= 2)
-        assert navigation.get_option_at_index(navigation.highlighted).id == "archive"
+        assert navigation.get_option_at_index(navigation.highlighted).id == "telegram"
 
 
 @pytest.mark.asyncio
-async def test_archive_preserves_cursor_across_refresh_resize_and_profile_toggle():
+async def test_maintenance_preserves_cursor_across_resize_and_profile_toggle():
     status = status_fixture()
     status["downloads"] = [
         {
@@ -3192,7 +3458,8 @@ async def test_archive_preserves_cursor_across_refresh_resize_and_profile_toggle
             "message_id": 100 + index,
             "date": f"2026-10-21T10:{index:02d}:00+00:00",
             "author_name": f"Author {index}",
-            "source_name": "sample_channel",
+            "source_username": "sample_channel",
+            "source_available": 1,
             "post_id": 42,
             "size": 1024,
             "frame_status": "saved",
@@ -3218,9 +3485,11 @@ async def test_archive_preserves_cursor_across_refresh_resize_and_profile_toggle
     app = HoardApp(FakeAPI(status))
     async with app.run_test(size=(120, 35)) as pilot:
         await wait_for_startup(app, pilot)
-        app.open_section("archive")
+        app.open_section("telegram_maintenance")
         await pilot.pause()
-        table = app.screen.query_one("#archive-table", DataTable)
+        await pilot.click("#maintenance-mode-media")
+        await wait_for_condition(pilot, lambda: len(app.screen._row_ids) == 6)
+        table = app.screen.query_one("#maintenance-table", DataTable)
         table.move_cursor(row=4, scroll=False)
         app.set_notice("refresh")
         await pilot.pause()
@@ -3228,17 +3497,17 @@ async def test_archive_preserves_cursor_across_refresh_resize_and_profile_toggle
 
         await pilot.resize_terminal(100, 30)
         await pilot.pause()
-        table = app.screen.query_one("#archive-table", DataTable)
+        table = app.screen.query_one("#maintenance-table", DataTable)
         assert table.cursor_row == 4
 
-        await pilot.click("#mode-profiles")
-        await wait_for_condition(pilot, lambda: len(app.screen._profile_ids) == 6)
-        table = app.screen.query_one("#archive-table", DataTable)
+        await pilot.click("#maintenance-mode-profiles")
+        await wait_for_condition(pilot, lambda: len(app.screen._row_ids) == 6)
+        table = app.screen.query_one("#maintenance-table", DataTable)
         table.move_cursor(row=3, scroll=False)
-        app.screen._toggle_profile_selection()
+        app.screen.action_toggle_profile()
         await pilot.pause()
         assert table.cursor_row == 3
-        assert 1003 in app.screen._selected_profiles
+        assert 1003 in app.screen.marked_profiles
 
 
 @pytest.mark.asyncio
@@ -3340,27 +3609,19 @@ async def test_ai_opens_chat_with_visible_focus_and_returns_to_table():
 
 
 @pytest.mark.asyncio
-async def test_archive_actions_fit_and_advanced_actions_are_opt_in():
+async def test_maintenance_actions_fit_supported_width():
     app = HoardApp(FakeAPI())
     async with app.run_test(size=(100, 30)) as pilot:
         await wait_for_startup(app, pilot)
-        app.open_section("archive")
+        app.open_section("telegram_maintenance")
         await pilot.pause()
         screen = app.screen
-        assert screen.query_one("#archive-advanced").display is False
-        for mode in ("downloads", "profiles", "jobs"):
-            await pilot.click(f"#mode-{mode}")
+        for mode in ("jobs", "profiles", "media", "operations"):
+            await pilot.click(f"#maintenance-mode-{mode}")
             await pilot.pause()
             for button in screen.query(Button):
                 if button.display and button.region.width:
                     assert button.region.right <= app.size.width, (mode, button.id)
-        await pilot.click("#mode-profiles")
-        await pilot.click("#archive-more")
-        await pilot.pause()
-        assert screen.query_one("#archive-advanced").display is True
-        for button in screen.query(Button):
-            if button.display and button.region.width:
-                assert button.region.right <= app.size.width, button.id
 
 
 @pytest.mark.asyncio
@@ -3472,6 +3733,74 @@ async def test_publication_selection_actions_keep_stable_ids_and_source_scope():
         assert selectors == [
             {"source_id": 1, "author_ids": [101], "image_mode": "combined"}
         ]
+
+
+@pytest.mark.asyncio
+async def test_publication_labels_mixed_results_and_cannot_stop_foreign_session():
+    api = FakeAPI(status_fixture())
+    foreign = {
+        "session_id": "foreign-session",
+        "session_type": "source",
+        "source_id": 2,
+        "state": "running",
+        "selected_count": 10,
+        "completed": 10,
+        "successful": 8,
+        "errors": 2,
+        "waiting": 0,
+        "queued": 0,
+        "running": 0,
+    }
+    api.queue(
+        "telegram_frames_session_status",
+        {"session": foreign, "processing_mode": "single"},
+    )
+    app = HoardApp(api)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await wait_for_startup(app, pilot)
+        app.open_section("telegram_sources")
+        await wait_for_condition(pilot, lambda: bool(getattr(app.screen, "_items", [])))
+        await pilot.press("enter")
+        await wait_for_condition(
+            pilot,
+            lambda: isinstance(app.screen, TelegramPublicationScreen)
+            and app.screen._frame_session is not None,
+        )
+        screen = app.screen
+        rendered = str(screen.query_one("#publication-frame-status", Static).content)
+        assert "Завершено 10 из 10" in rendered
+        assert "успешно 8" in rendered and "ошибки 2" in rendered
+        assert "Обслуживание" in rendered
+        assert screen.query_one("#publication-frames-stop", Button).disabled is True
+
+        own = {**foreign, "session_id": "own-session", "source_id": 1}
+        api.queue(
+            "telegram_frames_session_status",
+            {"session": own, "processing_mode": "single"},
+        )
+        screen._request_work_state()
+        await wait_for_condition(
+            pilot,
+            lambda: screen._frame_session is not None
+            and screen._frame_session.get("session_id") == "own-session",
+        )
+        assert screen.query_one("#publication-frames-stop", Button).disabled is False
+        screen.query_one("#publication-frames-stop").press()
+        await wait_for_condition(
+            pilot,
+            lambda: any(
+                name == "telegram_frames_backfill_pause" for name, _ in api.calls
+            ),
+        )
+        stop_args = next(
+            args
+            for name, args in api.calls
+            if name == "telegram_frames_backfill_pause"
+        )
+        assert stop_args == {
+            "expected_session_id": "own-session",
+            "expected_source_id": 1,
+        }
 
 
 @pytest.mark.asyncio

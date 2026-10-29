@@ -1,6 +1,6 @@
 """Small declarative registry for Hoard and tool-local navigation.
 
-The outer level remains the four Hoard destinations.  A tool may replace that
+The outer level remains the three Hoard destinations.  A tool may replace that
 menu with its own workspace navigation; Telegram is the first and currently
 the only workspace.  Every consumer (sidebar, digits, section cycling,
 breadcrumbs and palette) reads the same registry.
@@ -38,7 +38,6 @@ SECTIONS = (
         CORE,
         keywords=("обзор", "активность", "очередь", "прогресс", "события", "overview"),
     ),
-    Section("archive", "Архив", CORE, keywords=("кружки", "профили", "задания", "каталог")),
     Section(
         "telegram",
         "Telegram",
@@ -85,13 +84,25 @@ ALL_SECTIONS = (*SECTIONS, *TELEGRAM_SECTIONS)
 
 # Context screens inherit a real navigation entry without becoming a fifth
 # sidebar/palette destination. Dynamic object labels stay in the screen state.
-CONTEXT_PARENTS = {"telegram_publication": "telegram_sources"}
+CONTEXT_PARENTS = {
+    "telegram_publication": "telegram_sources",
+    "telegram_maintenance": "telegram_status",
+}
+CONTEXT_SECTIONS = {
+    "telegram_maintenance": Section(
+        "telegram_maintenance",
+        "Обслуживание",
+        TOOLS,
+        parent="telegram_status",
+    ),
+}
 
 # Retired public route keys.  The outer ``telegram`` entry is handled by its
 # target so callers using ``open_section('telegram')`` keep working too.
 ALIASES = {
     "overview": "home",
     "activity": "home",
+    "archive": "telegram_maintenance",
     "sources": "telegram_sources",
 }
 
@@ -140,11 +151,14 @@ def section_index(key: str) -> int:
 
 def breadcrumb(key: str) -> tuple[Section, ...]:
     """The concrete section preceded by its workspace, outermost first."""
+    resolved = resolve(key)
     section = get_section(key)
     if section is None:
         return ()
     parent = _find(section.parent) if section.parent else None
-    return (parent, section) if parent else (section,)
+    crumbs = (parent, section) if parent else (section,)
+    contextual = CONTEXT_SECTIONS.get(resolved)
+    return (*crumbs, contextual) if contextual is not None else crumbs
 
 
 def palette_sections() -> tuple[Section, ...]:
@@ -162,6 +176,7 @@ __all__ = [
     "ALIASES",
     "ALL_SECTIONS",
     "CONTEXT_PARENTS",
+    "CONTEXT_SECTIONS",
     "CORE",
     "GROUP_TITLES",
     "SECTIONS",

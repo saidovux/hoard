@@ -1,4 +1,43 @@
-# Hoard 0.3.0 review notes
+# Hoard review notes
+
+## 0.7.4.5 Archive retirement gate
+
+Round 7 removes the old global `ArchiveScreen` only after moving every reachable workflow to an
+owned contextual route. The global navigation is now exactly Home / Telegram / AI; the legacy
+`archive` key remains a route alias for **Telegram → Status → Maintenance**, not a sidebar item.
+
+| Former Archive scenario | Current owner | Bounded daemon contract | Regression coverage |
+| --- | --- | --- | --- |
+| Downloaded video-note list and details | Maintenance → Media | `telegram_media_list/get/open` with opaque stable IDs | Round 7 backend media pagination/validation and TUI media viewer tests |
+| Global and legacy/unlinked profiles | Maintenance → Profiles | paginated `ai_telegram_profile_list`, existing saved-photo preview contracts | global multi-profile TUI test and backend legacy-profile test |
+| Job list, details and safe retry | Maintenance → Jobs | `jobs_list`, `job_get`, `job_retry`; paid AI is never generically retried | Round 7 jobs pagination/idempotency tests and explicit TUI retry test |
+| Build and open offline catalog | Maintenance → Operations | `telegram_report` and validated `catalog_open` | explicit-operation TUI test and catalog security suites |
+| Profile/publication enrichment | Maintenance → Operations | existing explicit `telegram_enrich` mutation | confirmation/no-automatic-work TUI test |
+| Selected/publication frame extraction | Telegram Sources → Publication | source-owned selected/publication FFmpeg IPC | Round 6 publication and manual-frame policy suites |
+| Whole-archive frame backfill, retry and hard stop | Maintenance → Operations | bounded backfill/retry/status and session-ID/scope-checked stop | Round 7 stop-race test and manual-frame policy suites |
+| Single and multi-profile PSL | Maintenance → Profiles or Publication | existing preview/start APIs with saved-photo/frame validation | profile selector and publication PSL TUI suites |
+| Active and historical AI groups | AI, Publication or Maintenance → batch history | paginated `ai_telegram_batch_catalog/get` and participant pages | source-scoped batch-history TUI test and aggregate-status backend test |
+
+No separate export workflow existed in `ArchiveScreen`; the autonomous HTML catalog remains the
+portable export. The equivalence gate also verifies stable selection, empty/error states, short
+terminal layouts, contextual back navigation and absence of automatic Telegram, FFmpeg, Web or
+paid-AI work. `src/hoard/tui/screens/archive.py` and all imports were deleted only after these routes
+and tests were in place.
+
+The frame-session summary now distinguishes `completed` (all terminal outcomes) from `successful`
+and `errors`. A stop request carries the session identity and optional publication scope; the daemon
+checks both under the transition lock, so a stale publication cannot stop a replacement or global
+session. AI group history returns the complete paginated catalog, while PSL result fields are
+displayed only for completed, eligible adult results.
+
+The final local synthetic SQLite check used compact page size 50 (batch size 20) and measured one
+warm-process query plus IPC encoding. Results were: media 10 — 2.34 ms / 3,164 bytes; media 1,000 —
+13.66 ms / 15,608 bytes; media 10,000 — 73.30 ms / 15,610 bytes; profiles 1,000 — 31.61 ms /
+11,665 bytes; jobs 5,000 — 10.87 ms / 8,927 bytes; AI batches 2,000 with 10,000 participant rows —
+31.79 ms / 5,016 bytes. The temporary database contained synthetic metadata only; the media list
+regression separately forbids filesystem `stat()` calls while paging.
+
+## 0.3.0 review notes
 
 ## UX and reliability changes
 
