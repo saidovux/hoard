@@ -77,8 +77,14 @@ neutral when state cannot be established.
 * Table columns are fitted to the actual page width. Secondary columns are shortened or dropped
   rather than creating a horizontal scrollbar; the same rule applies to Maintenance and AI lists.
 * Maintenance has four compact tabs. Jobs, Profiles and Media request one server-paginated page
-  only on entry, filter change or explicit refresh. Operations keeps HTML, enrichment, global
+  only on entry, filter change or explicit refresh. Each catalog retains its own search draft,
+  offset, filters and condition-keyed confirmed snapshot. Switching modes immediately installs the
+  correct columns and either that snapshot or a loading/error row; rows and actions from another
+  query or page are never reused under new conditions. Operations keeps HTML, enrichment, global
   FFmpeg and read-only batch history explicit; simply opening the page starts no work.
+* Read-only AI batch history keeps catalog and participant offsets confirmed until their response
+  succeeds. Back and Close invalidate pending participant generations, so a late response cannot
+  reopen details, replace a newer batch or release the newer request's loading state.
 * A table is auto-focused only when it is fully visible. On short terminals the page opens at the
   top (summary and actions first); `Ctrl+PageUp` and `Ctrl+PageDown` scroll the page even while a
   table or the sidebar owns the keyboard.

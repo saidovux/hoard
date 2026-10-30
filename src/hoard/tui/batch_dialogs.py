@@ -39,6 +39,9 @@ class TelegramBatchHistoryDialog(ModalScreen[None]):
         self.batch: dict[str, Any] | None = None
         self.batch_offset = 0
         self._loading = False
+        self._request_id = 0
+        self._loading_owner: int | None = None
+        self._intent: tuple[object, ...] = ("catalog", 0)
 
     def compose(self) -> ComposeResult:
         with Vertical(classes="dialog batch-dialog"):
@@ -64,7 +67,11 @@ class TelegramBatchHistoryDialog(ModalScreen[None]):
         self._request_catalog()
 
     def action_close(self) -> None:
+        self._invalidate_request()
         self.dismiss(None)
+
+    def on_unmount(self) -> None:
+        self._invalidate_request()
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         identifier = str(event.button.id)
@@ -77,8 +84,10 @@ class TelegramBatchHistoryDialog(ModalScreen[None]):
         elif identifier == "batch-open":
             self._open_selected_batch()
         elif identifier == "batch-back":
+            self._invalidate_request()
             self.mode = "catalog"
             self.batch = None
+            self._intent = ("catalog", self.catalog_offset)
             self._render_catalog()
         elif identifier == "batch-analysis":
             self._show_selected_analysis()
@@ -97,37 +106,79 @@ class TelegramBatchHistoryDialog(ModalScreen[None]):
         if self.mode == "catalog":
             target = max(0, self.catalog_offset + direction * self.PAGE_SIZE)
             if target != self.catalog_offset and (direction < 0 or target < self.total):
-                self.catalog_offset = target
-                self._request_catalog()
+                self._request_catalog(target)
             return
         batch = self.batch or {}
         target = max(0, self.batch_offset + direction * self.PAGE_SIZE)
         total = int(batch.get("total") or 0)
         if target != self.batch_offset and (direction < 0 or target < total):
-            self.batch_offset = target
-            self._request_batch(str(batch.get("id") or ""))
+            self._request_batch(str(batch.get("id") or ""), target)
 
-    def _request_catalog(self) -> None:
+    def _begin_request(self, intent: tuple[object, ...]) -> int:
+        self._request_id += 1
+        token = self._request_id
+        self._loading_owner = token
+        self._loading = True
+        self._intent = intent
+        return token
+
+    def _finish_request(self, token: int) -> None:
+        if self._loading_owner == token:
+            self._loading_owner = None
+            self._loading = False
+
+    def _invalidate_request(self) -> None:
+        self._request_id += 1
+        self._loading_owner = None
+        self._loading = False
+
+    def _current_request(self, token: int, intent: tuple[object, ...]) -> bool:
+        return (
+            self.is_mounted
+            and self.app.screen is self
+            and token == self._request_id
+            and self._loading_owner == token
+            and self._intent == intent
+        )
+
+    def _request_catalog(self, offset: int | None = None) -> None:
         if self._loading:
             return
-        self._loading = True
-        self.run_worker(self._load_catalog(), name="batch-catalog", exit_on_error=False)
+        requested_offset = self.catalog_offset if offset is None else offset
+        intent = ("catalog", requested_offset)
+        token = self._begin_request(intent)
+        if self.items:
+            self._render_catalog(loading=True)
+        self.run_worker(
+            self._load_catalog(token, requested_offset, intent),
+            name="batch-catalog",
+            exit_on_error=False,
+        )
 
-    async def _load_catalog(self) -> None:
+    async def _load_catalog(
+        self,
+        token: int,
+        offset: int,
+        intent: tuple[object, ...],
+    ) -> None:
         try:
-            page = await self.catalog_loader(self.catalog_offset)
+            page = await self.catalog_loader(offset)
         except Exception as exc:
-            if self.is_mounted:
-                self.query_one("#batch-summary", Static).update(
-                    str(exc) or type(exc).__name__
-                )
+            if self._current_request(token, intent):
+                message = str(exc) or type(exc).__name__
+                self._finish_request(token)
+                self._intent = ("catalog", self.catalog_offset)
+                self._render_catalog(error=message)
         else:
-            if self.is_mounted and self.mode == "catalog":
+            if self._current_request(token, intent) and self.mode == "catalog":
+                self._finish_request(token)
                 self.items = list(page.get("items") or [])
                 self.total = int(page.get("total") or 0)
+                self.catalog_offset = offset
+                self._intent = ("catalog", offset)
                 self._render_catalog()
         finally:
-            self._loading = False
+            self._finish_request(token)
 
     def _selected_catalog(self) -> dict[str, Any] | None:
         row = self.query_one("#batch-table", DataTable).cursor_row
@@ -139,32 +190,53 @@ class TelegramBatchHistoryDialog(ModalScreen[None]):
         item = self._selected_catalog()
         if item is None:
             return
-        self.batch_offset = 0
-        self._request_batch(str(item.get("id") or ""))
+        self._request_batch(str(item.get("id") or ""), 0)
 
-    def _request_batch(self, batch_id: str) -> None:
+    def _request_batch(self, batch_id: str, offset: int | None = None) -> None:
         if self._loading or not batch_id:
             return
-        self._loading = True
+        requested_offset = self.batch_offset if offset is None else offset
+        intent = ("details", batch_id, requested_offset)
+        token = self._begin_request(intent)
+        if self.mode == "details":
+            self._render_batch(loading=True)
         self.run_worker(
-            self._load_batch(batch_id), name="batch-participants", exit_on_error=False
+            self._load_batch(token, batch_id, requested_offset, intent),
+            name="batch-participants",
+            exit_on_error=False,
         )
 
-    async def _load_batch(self, batch_id: str) -> None:
+    async def _load_batch(
+        self,
+        token: int,
+        batch_id: str,
+        offset: int,
+        intent: tuple[object, ...],
+    ) -> None:
         try:
-            result = await self.batch_loader(batch_id, self.batch_offset)
+            result = await self.batch_loader(batch_id, offset)
         except Exception as exc:
-            if self.is_mounted:
-                self.query_one("#batch-summary", Static).update(
-                    str(exc) or type(exc).__name__
-                )
+            if self._current_request(token, intent):
+                message = str(exc) or type(exc).__name__
+                self._finish_request(token)
+                if self.mode == "details" and self.batch is not None:
+                    current_id = str(self.batch.get("id") or "")
+                    self._intent = ("details", current_id, self.batch_offset)
+                    self._render_batch(error=message)
+                else:
+                    self.mode = "catalog"
+                    self._intent = ("catalog", self.catalog_offset)
+                    self._render_catalog(error=message)
         else:
-            if self.is_mounted:
+            if self._current_request(token, intent):
+                self._finish_request(token)
                 self.mode = "details"
                 self.batch = dict(result.get("batch") or result)
+                self.batch_offset = offset
+                self._intent = ("details", batch_id, offset)
                 self._render_batch()
         finally:
-            self._loading = False
+            self._finish_request(token)
 
     @staticmethod
     def _reset_table(table: DataTable, columns: tuple[str, ...]) -> None:
@@ -172,7 +244,7 @@ class TelegramBatchHistoryDialog(ModalScreen[None]):
         for column in columns:
             table.add_column(column)
 
-    def _render_catalog(self) -> None:
+    def _render_catalog(self, *, loading: bool = False, error: str = "") -> None:
         table = self.query_one("#batch-table", DataTable)
         self._reset_table(table, ("ID", "Источник", "Режим", "Всего", "Статус", "Создана"))
         for item in self.items:
@@ -191,16 +263,23 @@ class TelegramBatchHistoryDialog(ModalScreen[None]):
             table.add_row("—", "—", "—", "0", "Групп пока нет", "—")
         first = self.catalog_offset + 1 if self.items else 0
         last = self.catalog_offset + len(self.items)
-        self.query_one("#batch-summary", Static).update(
-            f"Группы {first}–{last} из {self.total}"
-        )
+        summary = f"Группы {first}–{last} из {self.total}"
+        if loading:
+            summary += " · загрузка следующей страницы…"
+        elif error:
+            summary += f" · ошибка: {error}"
+        self.query_one("#batch-summary", Static).update(summary)
         self.query_one("#batch-back", Button).display = False
         self.query_one("#batch-open", Button).display = True
         self.query_one("#batch-analysis", Button).display = False
-        self.query_one("#batch-prev", Button).disabled = self.catalog_offset <= 0
-        self.query_one("#batch-next", Button).disabled = last >= self.total
+        self.query_one("#batch-prev", Button).disabled = loading or self.catalog_offset <= 0
+        self.query_one("#batch-next", Button).disabled = loading or last >= self.total
+        self.query_one("#batch-open", Button).disabled = loading or not self.items
+        self.query_one("#batch-safety", Static).update(
+            "Только локальный просмотр: открытие группы не запускает AI, resume или retry."
+        )
 
-    def _render_batch(self) -> None:
+    def _render_batch(self, *, loading: bool = False, error: str = "") -> None:
         batch = self.batch or {}
         table = self.query_one("#batch-table", DataTable)
         self._reset_table(table, ("Автор", "Состояние", "Причина", "Изображения", "Анализ"))
@@ -223,7 +302,7 @@ class TelegramBatchHistoryDialog(ModalScreen[None]):
             table.add_row("—", "—", "Участников на странице нет", "0", "—")
         successful = int(batch.get("successful") or 0)
         errors = int(batch.get("errors") or 0)
-        self.query_one("#batch-summary", Static).update(
+        summary = (
             f"Группа {batch.get('id')} · source {batch.get('source_id') or 'global'} · "
             f"{batch.get('image_mode') or 'photos'}\n"
             f"Всего {batch.get('total', 0)} · очередь {batch.get('queued', 0)} · "
@@ -231,14 +310,21 @@ class TelegramBatchHistoryDialog(ModalScreen[None]):
             f"не подходит {batch.get('ineligible', 0)} · outcome_unknown "
             f"{batch.get('outcome_unknown', 0)} · ошибки {errors}"
         )
+        if loading:
+            summary += " · загрузка следующей страницы…"
+        elif error:
+            summary += f" · ошибка: {error}"
+        self.query_one("#batch-summary", Static).update(summary)
         first = self.batch_offset + 1 if items else 0
         last = self.batch_offset + len(items)
         total = int(batch.get("total") or 0)
         self.query_one("#batch-back", Button).display = True
+        self.query_one("#batch-back", Button).disabled = False
         self.query_one("#batch-open", Button).display = False
         self.query_one("#batch-analysis", Button).display = True
-        self.query_one("#batch-prev", Button).disabled = self.batch_offset <= 0
-        self.query_one("#batch-next", Button).disabled = last >= total
+        self.query_one("#batch-analysis", Button).disabled = loading
+        self.query_one("#batch-prev", Button).disabled = loading or self.batch_offset <= 0
+        self.query_one("#batch-next", Button).disabled = loading or last >= total
         self.query_one("#batch-safety", Static).update(
             f"Участники {first}–{last} из {total} · только read-only локальные данные"
         )

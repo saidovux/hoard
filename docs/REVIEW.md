@@ -1,5 +1,21 @@
 # Hoard review notes
 
+## 0.7.4.6 post-Round 7 TUI stabilization
+
+Maintenance now owns independent Jobs, Profiles and Media search drafts and caches every successful
+page against its complete query, offset and relevant filter/sort key. Mode switches synchronously
+replace columns and rows, debounce drafts survive tab/screen suspension, and Media → Author issues
+one profile query without changing the other searches. Failed next pages retain a coherent
+confirmed range, row set, selection and action state; results from superseded generations are
+ignored.
+
+The read-only AI batch-history dialog now uses monotonic request tokens plus batch/offset intents.
+Back and Close invalidate participant work, stale `finally` blocks cannot release a newer lock, and
+catalog/participant page failures leave their previous confirmed snapshot intact. Deterministic
+Textual Pilot regressions cover delayed success/error ordering, screen suspension, foreign-row
+suppression, both A/B completion orders, failed pagination and close-during-load without invoking
+AI mutation APIs.
+
 ## 0.7.4.5 Archive retirement gate
 
 Round 7 removes the old global `ArchiveScreen` only after moving every reachable workflow to an

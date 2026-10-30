@@ -24,7 +24,7 @@ background service.
   reusable widgets and TCSS remain separate. The package imports neither storage nor Telethon, and
   never creates a Telegram client. See `docs/TUI.md`.
 - `ipc.py` starts the daemon detached when required and sends one JSON request per private
-  Unix-socket connection. Client and daemon must both report Hoard 0.7.4.5 and IPC protocol `1`.
+  Unix-socket connection. Client and daemon must both report Hoard 0.7.4.6 and IPC protocol `1`.
   A held instance lock with no ready socket means initialization is in progress, so the client
   waits for that owner instead of spawning a second daemon.
 - `service.py` owns the database, three independently limited job runners and the sole

@@ -2221,6 +2221,578 @@ async def test_batch_history_is_read_only_source_scoped_and_pages_participants()
 
 
 @pytest.mark.asyncio
+async def test_maintenance_keeps_searches_independent_and_media_author_uses_one_query():
+    status = status_fixture()
+    status["jobs"] = [
+        {
+            "id": 7,
+            "kind": "telegram.scan",
+            "state": "failed",
+            "attempts": 1,
+            "updated_at": "2026-10-30",
+        }
+    ]
+    status["profiles"] = [
+        {
+            "author_id": 99,
+            "display_name": "Alice",
+            "current_username": "alice",
+            "photo_count": 1,
+            "video_count": 1,
+            "source_count": 1,
+        }
+    ]
+    status["downloads"] = [
+        {
+            "source_id": 1,
+            "message_id": 501,
+            "author_id": 99,
+            "author_name": "Alice",
+            "source_username": "sample_channel",
+            "post_id": 42,
+            "source_available": 1,
+            "size": 2048,
+            "state": "saved",
+            "frame_status": "saved",
+            "date": "2026-10-30",
+        }
+    ]
+    api = FakeAPI(status)
+    app = HoardApp(api)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await wait_for_startup(app, pilot)
+        app.open_section("telegram_maintenance")
+        await wait_for_condition(
+            pilot,
+            lambda: isinstance(app.screen, TelegramMaintenanceScreen)
+            and bool(app.screen.pages["jobs"]["loaded"]),
+        )
+        screen = app.screen
+        search = screen.query_one("#maintenance-search", Input)
+
+        await pilot.click("#maintenance-mode-profiles")
+        await wait_for_condition(pilot, lambda: bool(screen.pages["profiles"]["loaded"]))
+        search.value = "alice"
+        await wait_for_condition(
+            pilot,
+            lambda: any(
+                name == "ai_telegram_profile_list" and args.get("query") == "alice"
+                for name, args in api.calls
+            ),
+        )
+
+        await pilot.click("#maintenance-mode-jobs")
+        search.value = "telegram"
+        await wait_for_condition(
+            pilot,
+            lambda: any(
+                name == "jobs_list" and args.get("kind") == "telegram"
+                for name, args in api.calls
+            ),
+        )
+        profile_calls = sum(
+            name == "ai_telegram_profile_list" for name, _ in api.calls
+        )
+        await pilot.click("#maintenance-mode-profiles")
+        await pilot.pause()
+        assert search.value == "alice"
+        assert sum(
+            name == "ai_telegram_profile_list" for name, _ in api.calls
+        ) == profile_calls
+
+        await pilot.click("#maintenance-mode-media")
+        search.value = "source"
+        await wait_for_condition(
+            pilot,
+            lambda: any(
+                name == "telegram_media_list" and args.get("query") == "source"
+                for name, args in api.calls
+            ),
+        )
+        profile_calls = sum(
+            name == "ai_telegram_profile_list" for name, _ in api.calls
+        )
+        screen.query_one("#maintenance-media-author", Button).press()
+        await wait_for_condition(
+            pilot,
+            lambda: screen.mode == "profiles"
+            and any(
+                name == "ai_telegram_profile_list" and args.get("query") == "99"
+                for name, args in api.calls
+            ),
+        )
+        await pilot.pause(0.3)
+        assert screen.queries == {"jobs": "telegram", "profiles": "99", "media": "source"}
+        assert sum(
+            name == "ai_telegram_profile_list" for name, _ in api.calls
+        ) == profile_calls + 1
+
+
+@pytest.mark.asyncio
+async def test_maintenance_preserves_debounce_draft_without_hidden_query():
+    api = FakeAPI()
+    app = HoardApp(api)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await wait_for_startup(app, pilot)
+        app.open_section("telegram_maintenance")
+        await wait_for_condition(
+            pilot,
+            lambda: isinstance(app.screen, TelegramMaintenanceScreen)
+            and bool(app.screen.pages["jobs"]["loaded"]),
+        )
+        screen = app.screen
+        await pilot.click("#maintenance-mode-profiles")
+        await wait_for_condition(pilot, lambda: bool(screen.pages["profiles"]["loaded"]))
+        screen.query_one("#maintenance-search", Input).value = "draft-alice"
+        screen.query_one("#maintenance-mode-jobs", Button).press()
+        await wait_for_condition(pilot, lambda: screen.mode == "jobs")
+        await pilot.pause(0.3)
+        assert not any(
+            name == "ai_telegram_profile_list" and args.get("query") == "draft-alice"
+            for name, args in api.calls
+        )
+        assert not any(
+            name == "jobs_list" and args.get("kind") == "draft-alice"
+            for name, args in api.calls
+        )
+
+        await pilot.click("#maintenance-mode-profiles")
+        await wait_for_condition(
+            pilot,
+            lambda: any(
+                name == "ai_telegram_profile_list" and args.get("query") == "draft-alice"
+                for name, args in api.calls
+            ),
+        )
+        assert screen.query_one("#maintenance-search", Input).value == "draft-alice"
+
+
+@pytest.mark.asyncio
+async def test_maintenance_clears_foreign_rows_while_new_mode_loads():
+    class DelayedProfilesAPI(FakeAPI):
+        def __init__(self) -> None:
+            status = status_fixture()
+            status["jobs"] = [
+                {
+                    "id": 7,
+                    "kind": "telegram.scan",
+                    "state": "failed",
+                    "attempts": 1,
+                    "updated_at": "2026-10-30",
+                }
+            ]
+            super().__init__(status)
+            self.profile_started = asyncio.Event()
+            self.profile_release = asyncio.Event()
+
+        async def ai_call(
+            self, method: str, args: dict[str, Any] | None = None
+        ) -> dict:
+            if method != "ai_telegram_profile_list":
+                return await super().ai_call(method, args)
+            self.calls.append((method, args or {}))
+            self.profile_started.set()
+            await self.profile_release.wait()
+            return {
+                "items": [
+                    {
+                        "author_id": 88,
+                        "display_name": "Delayed profile",
+                        "current_username": "delayed",
+                    }
+                ],
+                "total": 1,
+                "limit": 50,
+                "offset": 0,
+            }
+
+    api = DelayedProfilesAPI()
+    app = HoardApp(api)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await wait_for_startup(app, pilot)
+        app.open_section("telegram_maintenance")
+        await wait_for_condition(
+            pilot,
+            lambda: isinstance(app.screen, TelegramMaintenanceScreen)
+            and app.screen._row_ids == [7],
+        )
+        screen = app.screen
+        await pilot.click("#maintenance-mode-profiles")
+        await asyncio.wait_for(api.profile_started.wait(), timeout=1)
+        await pilot.pause()
+        assert screen.mode == "profiles"
+        assert screen._row_ids == []
+        assert screen.query_one("#maintenance-details", Button).disabled
+        assert screen.query_one("#maintenance-profile-analyze", Button).disabled
+        api.profile_release.set()
+        await wait_for_condition(pilot, lambda: screen._row_ids == [88])
+
+
+@pytest.mark.asyncio
+async def test_maintenance_preserves_search_draft_across_screen_suspend():
+    api = FakeAPI()
+    app = HoardApp(api)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await wait_for_startup(app, pilot)
+        app.open_section("telegram_maintenance")
+        await wait_for_condition(
+            pilot,
+            lambda: isinstance(app.screen, TelegramMaintenanceScreen)
+            and bool(app.screen.pages["jobs"]["loaded"]),
+        )
+        screen = app.screen
+        screen.query_one("#maintenance-search", Input).value = "draft-job"
+        app.open_section("home")
+        await wait_for_condition(pilot, lambda: isinstance(app.screen, HomeScreen))
+        await pilot.pause(0.3)
+        assert not any(
+            name == "jobs_list" and args.get("kind") == "draft-job"
+            for name, args in api.calls
+        )
+
+        app.open_section("telegram_maintenance")
+        await wait_for_condition(
+            pilot,
+            lambda: app.screen is screen
+            and any(
+                name == "jobs_list" and args.get("kind") == "draft-job"
+                for name, args in api.calls
+            ),
+        )
+        assert screen.query_one("#maintenance-search", Input).value == "draft-job"
+
+
+@pytest.mark.asyncio
+async def test_maintenance_late_search_error_cannot_replace_new_results():
+    class ReorderedProfilesAPI(FakeAPI):
+        def __init__(self) -> None:
+            super().__init__()
+            self.old_started = asyncio.Event()
+            self.old_release = asyncio.Event()
+
+        async def ai_call(
+            self, method: str, args: dict[str, Any] | None = None
+        ) -> dict:
+            if method != "ai_telegram_profile_list":
+                return await super().ai_call(method, args)
+            parameters = args or {}
+            query = str(parameters.get("query") or "")
+            self.calls.append((method, parameters))
+            if query == "old":
+                self.old_started.set()
+                await self.old_release.wait()
+                raise RuntimeError("late old failure")
+            author_id = 202 if query == "new" else 101
+            return {
+                "items": [{"author_id": author_id, "display_name": query or "initial"}],
+                "total": 1,
+                "offset": 0,
+            }
+
+    api = ReorderedProfilesAPI()
+    app = HoardApp(api)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await wait_for_startup(app, pilot)
+        app.open_section("telegram_maintenance")
+        await wait_for_condition(
+            pilot, lambda: isinstance(app.screen, TelegramMaintenanceScreen)
+        )
+        screen = app.screen
+        await pilot.click("#maintenance-mode-profiles")
+        await wait_for_condition(pilot, lambda: screen._row_ids == [101])
+        search = screen.query_one("#maintenance-search", Input)
+        search.value = "old"
+        await asyncio.wait_for(api.old_started.wait(), timeout=1)
+        search.value = "new"
+        await wait_for_condition(pilot, lambda: screen._row_ids == [202])
+        api.old_release.set()
+        await pilot.pause()
+        assert screen._row_ids == [202]
+        assert "late old failure" not in str(
+            screen.query_one("#maintenance-range", Static).content
+        )
+
+
+@pytest.mark.asyncio
+async def test_maintenance_page_error_restores_confirmed_page_snapshot():
+    class FailedSecondJobsPageAPI(FakeAPI):
+        async def jobs_list(
+            self,
+            *,
+            limit: int = 50,
+            offset: int = 0,
+            state: str = "",
+            kind: str = "",
+        ) -> dict[str, Any]:
+            parameters = {
+                "limit": limit,
+                "offset": offset,
+                "state": state,
+                "kind": kind,
+            }
+            self.calls.append(("jobs_list", parameters))
+            if offset == 50:
+                raise RuntimeError("page two failed")
+            return {
+                "items": [
+                    {
+                        "id": index,
+                        "kind": "telegram.scan",
+                        "state": "done",
+                        "attempts": 1,
+                    }
+                    for index in range(1, 51)
+                ],
+                "total": 51,
+                "offset": 0,
+            }
+
+    app = HoardApp(FailedSecondJobsPageAPI())
+    async with app.run_test(size=(100, 30)) as pilot:
+        await wait_for_startup(app, pilot)
+        app.open_section("telegram_maintenance")
+        await wait_for_condition(
+            pilot,
+            lambda: isinstance(app.screen, TelegramMaintenanceScreen)
+            and len(app.screen._row_ids) == 50,
+        )
+        screen = app.screen
+        screen.query_one("#maintenance-next", Button).press()
+        await wait_for_condition(
+            pilot,
+            lambda: "page two failed"
+            in str(screen.query_one("#maintenance-range", Static).content),
+        )
+        assert screen.pages["jobs"]["offset"] == 0
+        assert screen.pages["jobs"]["requested_offset"] == 0
+        assert screen._row_ids == list(range(1, 51))
+        assert str(screen.query_one("#maintenance-range", Static).content).startswith(
+            "1–50 из 51"
+        )
+        assert not screen.query_one("#maintenance-next", Button).disabled
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("release_old_first", [True, False])
+async def test_batch_back_invalidates_pending_page_and_allows_another_batch(
+    release_old_first: bool,
+):
+    class DelayedBatchAPI(FakeAPI):
+        def __init__(self) -> None:
+            super().__init__()
+            self.a_page_two_started = asyncio.Event()
+            self.a_page_two_release = asyncio.Event()
+            self.b_started = asyncio.Event()
+            self.b_release = asyncio.Event()
+
+        async def ai_call(
+            self, method: str, args: dict[str, Any] | None = None
+        ) -> dict:
+            parameters = args or {}
+            if method == "ai_telegram_batch_catalog":
+                self.calls.append((method, parameters))
+                return {
+                    "items": [
+                        {"id": "batch-a", "source_id": 1, "total": 21, "terminal": True},
+                        {"id": "batch-b", "source_id": 1, "total": 1, "terminal": True},
+                    ],
+                    "total": 2,
+                }
+            if method == "ai_telegram_batch_get":
+                self.calls.append((method, parameters))
+                batch_id = str(parameters.get("batch_id") or parameters.get("id") or "")
+                offset = int(parameters.get("offset") or 0)
+                if batch_id == "batch-a" and offset == 20:
+                    self.a_page_two_started.set()
+                    await self.a_page_two_release.wait()
+                elif batch_id == "batch-b":
+                    self.b_started.set()
+                    await self.b_release.wait()
+                item = {
+                    "author_id": 200 if batch_id == "batch-b" else 100 + offset,
+                    "display_name": batch_id,
+                    "state": "completed",
+                }
+                return {
+                    "batch": {
+                        "id": batch_id,
+                        "source_id": 1,
+                        "total": 1 if batch_id == "batch-b" else 21,
+                        "terminal": True,
+                        "items": [item],
+                        "offset": offset,
+                    }
+                }
+            return await super().ai_call(method, args)
+
+    api = DelayedBatchAPI()
+    app = HoardApp(api)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await wait_for_startup(app, pilot)
+        app.open_telegram_batch_history(source_id=1, title="История публикации")
+        await wait_for_condition(
+            pilot,
+            lambda: isinstance(app.screen, TelegramBatchHistoryDialog)
+            and app.screen.query_one("#batch-table", DataTable).row_count == 2,
+        )
+        dialog = app.screen
+        dialog.query_one("#batch-open", Button).press()
+        await wait_for_condition(
+            pilot, lambda: dialog.mode == "details" and dialog.batch["id"] == "batch-a"
+        )
+        dialog.query_one("#batch-next", Button).press()
+        await asyncio.wait_for(api.a_page_two_started.wait(), timeout=1)
+        dialog.query_one("#batch-back", Button).press()
+        await wait_for_condition(pilot, lambda: dialog.mode == "catalog")
+        dialog.query_one("#batch-table", DataTable).move_cursor(row=1)
+        dialog.query_one("#batch-open", Button).press()
+        await asyncio.wait_for(api.b_started.wait(), timeout=1)
+        if release_old_first:
+            api.a_page_two_release.set()
+            await pilot.pause()
+            assert dialog.mode == "catalog"
+            assert dialog._loading
+            api.b_release.set()
+        else:
+            api.b_release.set()
+        await wait_for_condition(
+            pilot, lambda: dialog.mode == "details" and dialog.batch["id"] == "batch-b"
+        )
+        if not release_old_first:
+            api.a_page_two_release.set()
+        await pilot.pause()
+        assert dialog.mode == "details"
+        assert dialog.batch["id"] == "batch-b"
+        assert "batch-b" in str(
+            dialog.query_one("#batch-table", DataTable).get_row_at(0)
+        )
+        assert not any(
+            name in {"ai_telegram_batch_start", "ai_telegram_psl_start"}
+            for name, _ in api.calls
+        )
+
+
+@pytest.mark.asyncio
+async def test_batch_page_errors_keep_confirmed_offsets_and_rows():
+    class FailedBatchPagesAPI(FakeAPI):
+        async def ai_call(
+            self, method: str, args: dict[str, Any] | None = None
+        ) -> dict:
+            parameters = args or {}
+            self.calls.append((method, parameters))
+            if method == "ai_telegram_batch_catalog":
+                offset = int(parameters.get("offset") or 0)
+                if offset == 20:
+                    raise RuntimeError("catalog page failed")
+                return {
+                    "items": [
+                        {
+                            "id": f"batch-{index}",
+                            "source_id": 1,
+                            "total": 21 if index == 0 else 1,
+                            "terminal": True,
+                        }
+                        for index in range(20)
+                    ],
+                    "total": 21,
+                    "offset": 0,
+                }
+            if method == "ai_telegram_batch_get":
+                offset = int(parameters.get("offset") or 0)
+                if offset == 20:
+                    raise RuntimeError("participant page failed")
+                batch_id = str(parameters.get("id") or "")
+                return {
+                    "batch": {
+                        "id": batch_id,
+                        "source_id": 1,
+                        "total": 21,
+                        "items": [
+                            {
+                                "author_id": 10,
+                                "display_name": "page-one",
+                                "state": "completed",
+                            }
+                        ],
+                    }
+                }
+            return await super().ai_call(method, args)
+
+    api = FailedBatchPagesAPI()
+    app = HoardApp(api)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await wait_for_startup(app, pilot)
+        app.open_telegram_batch_history(source_id=1, title="История публикации")
+        await wait_for_condition(
+            pilot,
+            lambda: isinstance(app.screen, TelegramBatchHistoryDialog)
+            and app.screen.query_one("#batch-table", DataTable).row_count == 20,
+        )
+        dialog = app.screen
+        dialog.query_one("#batch-next", Button).press()
+        await wait_for_condition(
+            pilot,
+            lambda: "catalog page failed"
+            in str(dialog.query_one("#batch-summary", Static).content),
+        )
+        assert dialog.catalog_offset == 0
+        assert "batch-0" in str(dialog.query_one("#batch-table", DataTable).get_row_at(0))
+        assert not dialog.query_one("#batch-next", Button).disabled
+
+        dialog.query_one("#batch-open", Button).press()
+        await wait_for_condition(
+            pilot,
+            lambda: dialog.mode == "details"
+            and "page-one"
+            in str(dialog.query_one("#batch-table", DataTable).get_row_at(0))
+            and not dialog.query_one("#batch-next", Button).disabled,
+        )
+        dialog.query_one("#batch-next", Button).press()
+        await wait_for_condition(
+            pilot,
+            lambda: "participant page failed"
+            in str(dialog.query_one("#batch-summary", Static).content),
+        )
+        assert dialog.batch_offset == 0
+        assert "page-one" in str(dialog.query_one("#batch-table", DataTable).get_row_at(0))
+        assert "Участники 1–1 из 21" in str(
+            dialog.query_one("#batch-safety", Static).content
+        )
+        assert not dialog.query_one("#batch-next", Button).disabled
+
+
+@pytest.mark.asyncio
+async def test_batch_close_invalidates_pending_request():
+    class ClosingBatchAPI(FakeAPI):
+        def __init__(self) -> None:
+            super().__init__()
+            self.catalog_started = asyncio.Event()
+            self.catalog_release = asyncio.Event()
+
+        async def ai_call(
+            self, method: str, args: dict[str, Any] | None = None
+        ) -> dict:
+            if method == "ai_telegram_batch_catalog":
+                self.catalog_started.set()
+                await self.catalog_release.wait()
+                return {"items": [], "total": 0}
+            return await super().ai_call(method, args)
+
+    api = ClosingBatchAPI()
+    app = HoardApp(api)
+    async with app.run_test(size=(100, 30)) as pilot:
+        await wait_for_startup(app, pilot)
+        app.open_telegram_batch_history(title="История")
+        await asyncio.wait_for(api.catalog_started.wait(), timeout=1)
+        dialog = app.screen
+        dialog.action_close()
+        await wait_for_condition(pilot, lambda: app.screen is not dialog)
+        api.catalog_release.set()
+        await pilot.pause()
+        assert app.is_running
+
+
+@pytest.mark.asyncio
 async def test_maintenance_global_profile_selection_keeps_ids_and_has_no_source_scope():
     status = status_fixture()
     status["profiles"] = [
@@ -2958,7 +3530,7 @@ async def test_home_carries_the_program_name_and_picks_a_logo_that_fits():
         big, small = app.screen.query_one("#hero-big"), app.screen.query_one("#hero-small")
         assert big.display and not small.display
         text = str(big.content)
-        assert "v0.7.4.5" in text
+        assert "v0.7.4.6" in text
         assert "локальный архив" not in text
         assert "всё хранится" not in text
         assert "сборщик" not in text

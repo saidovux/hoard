@@ -54,17 +54,29 @@ class TelegramMaintenanceScreen(
         super().__init__()
         self.mode = "jobs"
         self.pages: dict[str, dict[str, Any]] = {
-            name: {"items": [], "total": 0, "offset": 0, "loaded": False, "error": ""}
+            name: {
+                "items": [],
+                "total": 0,
+                "offset": 0,
+                "requested_offset": 0,
+                "loaded": False,
+                "key": None,
+                "error": "",
+                "error_key": None,
+            }
             for name in ("jobs", "profiles", "media")
         }
         self.selected: dict[str, object | None] = {name: None for name in MODES}
         self.marked_profiles: set[int] = set()
-        self._query = ""
+        self.queries = {name: "" for name in ("jobs", "profiles", "media")}
         self.job_state = ""
         self.media_sort = "newest"
         self._request_ids = {name: 0 for name in MODES}
         self._loading: set[str] = set()
+        self._loading_keys: dict[str, tuple[object, ...]] = {}
+        self._loading_generations: dict[str, int] = {}
         self._entry_generation = 0
+        self._search_revision = 0
         self._search_timer: Timer | None = None
         self._work_timer: Timer | None = None
         self._work_polling = False
@@ -176,10 +188,12 @@ class TelegramMaintenanceScreen(
             # when that snapshot confirms an active FFmpeg session.
             self._pause_work_timer()
             self._request_operations()
-        elif not self.pages[self.mode]["loaded"]:
-            self._request_page(self.mode)
+        else:
+            self._sync_search_input(self.mode)
+            self._ensure_page(self.mode)
 
     def on_screen_suspend(self) -> None:
+        self._save_search_draft()
         self._entry_generation += 1
         self._cancel_search()
         self._pause_work_timer()
@@ -193,6 +207,8 @@ class TelegramMaintenanceScreen(
     def _activate_mode(self, mode: str, *, force: bool = False) -> None:
         if mode not in MODES:
             return
+        self._save_search_draft()
+        self._cancel_search()
         self.mode = mode
         self._entry_generation += 1
         self._table_layout = None
@@ -206,10 +222,8 @@ class TelegramMaintenanceScreen(
             self._request_operations()
         else:
             self._pause_work_timer()
-            if force or not self.pages[mode]["loaded"]:
-                self._request_page(mode)
-            else:
-                self._render_table()
+            self._sync_search_input(mode)
+            self._ensure_page(mode, force=force)
 
     def _render_visibility(self) -> None:
         jobs = self.mode == "jobs"
@@ -292,56 +306,213 @@ class TelegramMaintenanceScreen(
             self._reset_and_request("media")
 
     def on_input_changed(self, event: Input.Changed) -> None:
-        if event.input.id != "maintenance-search" or self.mode == "operations":
+        mode = self.mode
+        if event.input.id != "maintenance-search" or mode not in self.pages:
+            return
+        # Textual may deliver a programmatic Input.Changed after another mode
+        # has already replaced the field.  Such an event must not become the
+        # new mode's draft.
+        if event.value != event.input.value:
+            return
+        value = self._normalize_query(event.value)
+        if value == self.queries[mode]:
             return
         self._cancel_search()
-        self._search_timer = self.set_timer(0.25, self._apply_search)
+        self._set_mode_query(mode, value)
+        revision = self._search_revision
+        self._render_table()
+        self._search_timer = self.set_timer(
+            0.25,
+            lambda: self._apply_search(mode, revision, value),
+        )
 
     def _cancel_search(self) -> None:
+        self._search_revision += 1
         if self._search_timer is not None:
             self._search_timer.stop()
             self._search_timer = None
 
-    def _apply_search(self) -> None:
-        self._search_timer = None
-        value = self.query_one("#maintenance-search", Input).value.strip()
-        if value == self._query:
+    @staticmethod
+    def _normalize_query(value: object) -> str:
+        return str(value or "").strip()
+
+    def _sync_search_input(self, mode: str) -> None:
+        search = self.query_one("#maintenance-search", Input)
+        value = self.queries[mode]
+        if search.value != value:
+            search.value = value
+
+    def _save_search_draft(self) -> None:
+        mode = self.mode
+        if mode not in self.pages or not self.is_mounted:
             return
-        self._query = value
-        if self.mode in self.pages:
-            self._reset_and_request(self.mode)
+        value = self._normalize_query(
+            self.query_one("#maintenance-search", Input).value
+        )
+        if value != self.queries[mode]:
+            self._set_mode_query(mode, value)
+
+    def _apply_search(self, mode: str, revision: int, value: str) -> None:
+        self._search_timer = None
+        if (
+            revision != self._search_revision
+            or self.mode != mode
+            or self.queries[mode] != value
+            or self._normalize_query(
+                self.query_one("#maintenance-search", Input).value
+            )
+            != value
+        ):
+            return
+        self._request_page(mode)
+
+    def _set_mode_query(self, mode: str, value: str, *, force: bool = False) -> None:
+        value = self._normalize_query(value)
+        page = self.pages[mode]
+        if not force and value == self.queries[mode] and int(
+            page["requested_offset"]
+        ) == 0:
+            return
+        self.queries[mode] = value
+        page.update(
+            requested_offset=0,
+            loaded=False,
+            error="",
+            error_key=None,
+        )
+        self.selected[mode] = None
 
     def _reset_and_request(self, mode: str) -> None:
-        self.pages[mode].update(offset=0, loaded=False)
+        self.pages[mode].update(
+            requested_offset=0,
+            loaded=False,
+            error="",
+            error_key=None,
+        )
         self.selected[mode] = None
         if self.mode == mode:
+            self._render_table()
             self._request_page(mode)
 
-    def _request_page(self, mode: str) -> None:
+    def _page_key(
+        self,
+        mode: str,
+        *,
+        offset: int | None = None,
+        query: str | None = None,
+        job_state: str | None = None,
+        media_sort: str | None = None,
+    ) -> tuple[object, ...]:
+        page = self.pages[mode]
+        actual_offset = (
+            int(page["requested_offset"]) if offset is None else int(offset)
+        )
+        actual_query = self.queries[mode] if query is None else query
+        if mode == "jobs":
+            return (
+                mode,
+                actual_query,
+                actual_offset,
+                self.job_state if job_state is None else job_state,
+            )
+        if mode == "media":
+            return (
+                mode,
+                actual_query,
+                actual_offset,
+                self.media_sort if media_sort is None else media_sort,
+            )
+        return (mode, actual_query, actual_offset)
+
+    @staticmethod
+    def _same_page_conditions(
+        first: tuple[object, ...] | None,
+        second: tuple[object, ...],
+    ) -> bool:
+        return bool(
+            first
+            and len(first) == len(second)
+            and first[:2] == second[:2]
+            and first[3:] == second[3:]
+        )
+
+    def _has_current_snapshot(self, mode: str) -> bool:
+        page = self.pages[mode]
+        return bool(page["loaded"] and page["key"] == self._page_key(mode))
+
+    def _visible_items(self, mode: str | None = None) -> list[dict[str, Any]]:
+        actual_mode = self.mode if mode is None else mode
+        if actual_mode not in self.pages or not self._has_current_snapshot(actual_mode):
+            return []
+        return list(self.pages[actual_mode]["items"])
+
+    def _ensure_page(self, mode: str, *, force: bool = False) -> None:
+        self._render_table()
+        if force or not self._has_current_snapshot(mode):
+            self._request_page(mode, force=force)
+
+    def _request_page(self, mode: str, *, force: bool = False) -> None:
         if mode not in self.pages or not self.is_mounted:
+            return
+        page = self.pages[mode]
+        offset = int(page["requested_offset"])
+        query = self.queries[mode]
+        job_state = self.job_state
+        media_sort = self.media_sort
+        key = self._page_key(
+            mode,
+            offset=offset,
+            query=query,
+            job_state=job_state,
+            media_sort=media_sort,
+        )
+        if (
+            not force
+            and mode in self._loading
+            and self._loading_keys.get(mode) == key
+            and self._loading_generations.get(mode) == self._entry_generation
+        ):
             return
         self._request_ids[mode] += 1
         request_id = self._request_ids[mode]
         generation = self._entry_generation
-        offset = int(self.pages[mode]["offset"])
-        query = self._query
         self._loading.add(mode)
-        self._render_pagination()
+        self._loading_keys[mode] = key
+        self._loading_generations[mode] = generation
+        if self.mode == mode:
+            self._render_table()
         self.run_worker(
-            self._load_page(mode, request_id, generation, offset, query),
+            self._load_page(
+                mode,
+                request_id,
+                generation,
+                key,
+                offset,
+                query,
+                job_state,
+                media_sort,
+            ),
             name=f"maintenance-{mode}-page",
             exit_on_error=False,
         )
 
     async def _load_page(
-        self, mode: str, request_id: int, generation: int, offset: int, query: str
+        self,
+        mode: str,
+        request_id: int,
+        generation: int,
+        key: tuple[object, ...],
+        offset: int,
+        query: str,
+        job_state: str,
+        media_sort: str,
     ) -> None:
         try:
             if mode == "jobs":
                 result = await self.hoard_app.api.jobs_list(
                     limit=PAGE_SIZE,
                     offset=offset,
-                    state=self.job_state,
+                    state=job_state,
                     kind=query,
                 )
             elif mode == "profiles":
@@ -356,23 +527,39 @@ class TelegramMaintenanceScreen(
                         "limit": PAGE_SIZE,
                         "offset": offset,
                         "query": query,
-                        "sort": self.media_sort,
+                        "sort": media_sort,
                     },
                 )
         except Exception as exc:
             if self._current(mode, request_id, generation):
-                self.pages[mode]["error"] = str(exc) or type(exc).__name__
+                page = self.pages[mode]
+                message = str(exc) or type(exc).__name__
+                if self._same_page_conditions(page["key"], key):
+                    page.update(
+                        requested_offset=int(page["offset"]),
+                        loaded=True,
+                        error=message,
+                        error_key=page["key"],
+                    )
+                else:
+                    page.update(loaded=False, error=message, error_key=key)
         else:
             if self._current(mode, request_id, generation):
                 self.pages[mode].update(
                     items=list(result.get("items") or []),
                     total=int(result.get("total") or 0),
+                    offset=offset,
+                    requested_offset=offset,
                     loaded=True,
+                    key=key,
                     error="",
+                    error_key=None,
                 )
         finally:
             if request_id == self._request_ids[mode]:
                 self._loading.discard(mode)
+                self._loading_keys.pop(mode, None)
+                self._loading_generations.pop(mode, None)
             if self._current(mode, request_id, generation):
                 self._render_table()
 
@@ -386,22 +573,29 @@ class TelegramMaintenanceScreen(
         )
 
     def _move_page(self, direction: int) -> None:
+        if self.mode not in self.pages or not self._has_current_snapshot(self.mode):
+            return
         page = self.pages[self.mode]
         target = max(0, int(page["offset"]) + direction * PAGE_SIZE)
         if target == int(page["offset"]):
             return
         if direction > 0 and target >= int(page["total"]):
             return
-        page.update(offset=target, loaded=False)
+        page.update(
+            requested_offset=target,
+            loaded=False,
+            error="",
+            error_key=None,
+        )
         self.selected[self.mode] = None
+        self._render_table()
         self._request_page(self.mode)
 
     def action_refresh_maintenance(self) -> None:
         if self.mode == "operations":
             self._request_operations()
         else:
-            self.pages[self.mode]["loaded"] = False
-            self._request_page(self.mode)
+            self._request_page(self.mode, force=True)
 
     def _layout(self) -> tuple[tuple[str, ...], tuple[int, ...], tuple[int, ...]]:
         compact = self.hoard_app.has_class("compact")
@@ -441,7 +635,13 @@ class TelegramMaintenanceScreen(
         if self.mode not in self.pages or not self.is_mounted:
             return
         page = self.pages[self.mode]
-        items = list(page["items"])
+        items = self._visible_items()
+        desired_key = self._page_key(self.mode)
+        error = (
+            str(page["error"])
+            if page["error"] and page["error_key"] == desired_key
+            else ""
+        )
         table = self.query_one("#maintenance-table", DataTable)
         columns, keep, weights = self._layout()
         table_width = max(
@@ -497,7 +697,14 @@ class TelegramMaintenanceScreen(
             self._row_ids.append(identifier)
             table.add_row(*(cells[index] for index in keep))
         if not items:
-            table.add_row(*("—" for _ in keep))
+            placeholder = (
+                "Ошибка загрузки"
+                if error
+                else "Загрузка…"
+                if self.mode in self._loading or not self._has_current_snapshot(self.mode)
+                else "—"
+            )
+            table.add_row(placeholder, *("—" for _ in keep[1:]))
         selected_id = self.selected[self.mode]
         if selected_id in self._row_ids:
             table.move_cursor(row=self._row_ids.index(selected_id), scroll=False)
@@ -514,19 +721,34 @@ class TelegramMaintenanceScreen(
         if self.mode not in self.pages or not self.is_mounted:
             return
         page = self.pages[self.mode]
-        items = list(page["items"])
-        first = int(page["offset"]) + 1 if items else 0
-        last = int(page["offset"]) + len(items)
-        label = f"{first}–{last} из {page['total']}"
+        desired_key = self._page_key(self.mode)
+        valid = self._has_current_snapshot(self.mode)
+        items = self._visible_items()
+        error = (
+            str(page["error"])
+            if page["error"] and page["error_key"] == desired_key
+            else ""
+        )
+        if valid:
+            first = int(page["offset"]) + 1 if items else 0
+            last = int(page["offset"]) + len(items)
+            label = f"{first}–{last} из {page['total']}"
+        else:
+            first = last = 0
+            label = f"Ошибка загрузки: {error}" if error else "Загрузка…"
         if self.mode == "profiles" and self.marked_profiles:
             label += f" · выбрано {len(self.marked_profiles)}"
-        if page["error"]:
-            label += " · данные устарели: " + str(page["error"])
-        elif self.mode in self._loading:
+        if valid and error:
+            label += " · ошибка обновления: " + error
+        elif valid and self.mode in self._loading:
             label += " · обновляется…"
         self.query_one("#maintenance-range", Static).update(label)
-        self.query_one("#maintenance-prev", Button).disabled = int(page["offset"]) <= 0
-        self.query_one("#maintenance-next", Button).disabled = last >= int(page["total"])
+        self.query_one("#maintenance-prev", Button).disabled = (
+            not valid or self.mode in self._loading or int(page["offset"]) <= 0
+        )
+        self.query_one("#maintenance-next", Button).disabled = (
+            not valid or self.mode in self._loading or last >= int(page["total"])
+        )
 
     def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
         if event.data_table.id != "maintenance-table" or self.mode not in self.pages:
@@ -552,7 +774,7 @@ class TelegramMaintenanceScreen(
         if 0 <= row < len(self._row_ids):
             self.selected[self.mode] = self._row_ids[row]
         identifier = self.selected[self.mode]
-        for item in self.pages[self.mode]["items"]:
+        for item in self._visible_items():
             if self.mode == "jobs" and int(item.get("id") or 0) == identifier:
                 return item
             if self.mode == "profiles" and int(item.get("author_id") or 0) == identifier:

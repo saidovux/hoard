@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from textual.widgets import Input, Select
+from textual.widgets import Select
 
 from ..ai_dialogs import VideoFramesDialog
 from ..maintenance_dialogs import (
@@ -162,7 +162,7 @@ class MaintenanceActionsMixin:
             return
         visible = {
             int(item.get("author_id") or 0)
-            for item in self.pages["profiles"]["items"]
+            for item in self._visible_items("profiles")
             if int(item.get("author_id") or 0) > 0
         }
         combined = self.marked_profiles | visible
@@ -282,10 +282,8 @@ class MaintenanceActionsMixin:
         if author_id <= 0:
             self.hoard_app.set_notice("Автор кружка не определён.", error=True)
             return
-        self._query = str(author_id)
-        self.query_one("#maintenance-search", Input).value = self._query
-        self.pages["profiles"].update(offset=0, loaded=False)
-        self._activate_mode("profiles", force=True)
+        self._set_mode_query("profiles", str(author_id), force=True)
+        self._activate_mode("profiles")
 
 
 __all__ = ["MaintenanceActionsMixin"]
